@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -239,11 +240,33 @@ impl OnnxLens {
         fastembed_runtime::from_model_with_policy(name, model_name, cache_dir, provider_policy)
     }
 
+    pub fn from_model_name_with_policy(
+        name: impl Into<String>,
+        model_name: &str,
+        cache_dir: PathBuf,
+        provider_policy: OnnxProviderPolicy,
+    ) -> Result<Self> {
+        fastembed_runtime::from_model_name_with_policy(name, model_name, cache_dir, provider_policy)
+    }
+
     pub fn from_files(spec: OnnxFileSpec) -> Result<Self> {
         custom::from_files(spec)
     }
 
     pub fn from_lens_spec(spec: &LensSpec) -> Result<Self> {
+        let LensRuntime::Onnx { model_id, files } = &spec.runtime else {
+            return Err(config_invalid("LensSpec runtime is not onnx"));
+        };
+        if is_fastembed_manifest(model_id, files) {
+            let lens = fastembed_runtime::from_model_name_with_policy(
+                spec.name.clone(),
+                model_id,
+                fastembed_runtime::default_cache_root(),
+                OnnxProviderPolicy::CudaFailLoud,
+            )?;
+            ensure_fastembed_spec_match(&lens, spec)?;
+            return Ok(lens);
+        }
         Self::from_files(OnnxFileSpec::from_lens_spec(spec)?)
     }
 
@@ -325,6 +348,30 @@ impl OnnxLens {
             excluded_from_dedup: false,
         }
     }
+}
+
+fn is_fastembed_manifest(model_id: &str, files: &[PathBuf]) -> bool {
+    fastembed_runtime::model_from_name(model_id).is_ok()
+        && files.iter().any(|path| {
+            path.components()
+                .any(|component| component.as_os_str() == OsStr::new("fastembed-artifacts"))
+        })
+}
+
+fn ensure_fastembed_spec_match(lens: &OnnxLens, spec: &LensSpec) -> Result<()> {
+    if lens.contract().shape() != spec.output {
+        return Err(CalyxError::lens_dim_mismatch(format!(
+            "fastembed ONNX output shape {:?} != declared {:?}",
+            lens.contract().shape(),
+            spec.output
+        )));
+    }
+    if lens.contract().weights_sha256() != spec.weights_sha256 {
+        return Err(CalyxError::lens_frozen_violation(
+            "fastembed ONNX artifact hash does not match LensSpec",
+        ));
+    }
+    Ok(())
 }
 
 impl Lens for OnnxLens {

@@ -1,10 +1,12 @@
-//! DiskANN on-disk graph format: header, page-aligned node blocks, writer,
+//! DiskANN on-disk graph format: header, compact node blocks, writer,
 //! mmap reader (PH68 T01). Construction lives in [`super::build`].
 //!
-//! Layout: one page-aligned header block (`CLXDA001`), then one page-aligned
-//! block per node holding `[raw f32 vector | neighbor_count: u32 | neighbors:
-//! [u32; m_max] zero-padded]` so a single read fetches a node's full search
-//! state. Node `id` lives at byte offset `HEADER + id * node_block_size`.
+//! Layout: one page-aligned header block (`CLXDA001`), then one fixed-size
+//! block per node holding `[vector payload | neighbor_count: u32 | neighbors:
+//! [u32; m_max] zero-padded]` so a single offset calculation fetches a node's
+//! full search state. v1/v2 payloads are f32; v3 payloads are signed int8
+//! directional vectors. Node `id` lives at byte offset
+//! `HEADER + id * node_block_size`.
 //!
 //! Server-only: embedded vaults keep the in-RAM HNSW from PH23.
 
@@ -21,19 +23,56 @@ use crate::error::{
 
 /// File magic at offset 0 of every `graph.cda`.
 pub const DISKANN_MAGIC: [u8; 8] = *b"CLXDA001";
-/// On-disk format version written into the header.
-pub const DISKANN_FORMAT_VERSION: u32 = 1;
-/// Every block (header and node) is padded to a multiple of this.
+/// On-disk format version written into the header for new unit/cosine graphs.
+pub const DISKANN_FORMAT_VERSION: u32 = 3;
+/// Compact f32 node records written for raw-L2 graphs and kept readable.
+pub const DISKANN_F32_FORMAT_VERSION: u32 = 2;
+/// Legacy v1 node records were padded to 4 KiB.
+pub const DISKANN_LEGACY_FORMAT_VERSION: u32 = 1;
+/// The header remains one 4 KiB page for mmap/old-reader stability.
 pub const DISKANN_BLOCK_ALIGN: usize = 4096;
+/// v2 node records are cache-line aligned instead of page padded.
+pub const DISKANN_NODE_ALIGN: usize = 64;
 /// Upper bound on vector dimensionality accepted by the format.
 pub const DISKANN_MAX_DIM: usize = 8192;
 /// Upper bound on `m_max` (graph out-degree capacity) accepted by the format.
 pub const DISKANN_MAX_M: usize = 512;
 
 /// Size in bytes of one node block: vector + count + padded neighbor list,
-/// rounded up to the next `DISKANN_BLOCK_ALIGN` boundary (4 KiB minimum).
+/// rounded up to the v2 compact node alignment.
 pub const fn node_block_size(dim: usize, m_max: usize) -> usize {
+    compact_i8_node_block_size(dim, m_max)
+}
+
+const fn compact_f32_node_block_size(dim: usize, m_max: usize) -> usize {
+    (dim * 4 + 4 + m_max * 4).div_ceil(DISKANN_NODE_ALIGN) * DISKANN_NODE_ALIGN
+}
+
+const fn compact_i8_node_block_size(dim: usize, m_max: usize) -> usize {
+    (i8_payload_len(dim) + 4 + m_max * 4).div_ceil(DISKANN_NODE_ALIGN) * DISKANN_NODE_ALIGN
+}
+
+const fn i8_payload_len(dim: usize) -> usize {
+    dim.div_ceil(4) * 4
+}
+
+const fn legacy_node_block_size(dim: usize, m_max: usize) -> usize {
     (dim * 4 + 4 + m_max * 4).div_ceil(DISKANN_BLOCK_ALIGN) * DISKANN_BLOCK_ALIGN
+}
+
+const fn node_block_size_for_header(header: &DiskAnnHeader) -> usize {
+    match header.format_version {
+        DISKANN_LEGACY_FORMAT_VERSION => {
+            legacy_node_block_size(header.dim as usize, header.m_max as usize)
+        }
+        DISKANN_F32_FORMAT_VERSION => {
+            compact_f32_node_block_size(header.dim as usize, header.m_max as usize)
+        }
+        DISKANN_FORMAT_VERSION => {
+            compact_i8_node_block_size(header.dim as usize, header.m_max as usize)
+        }
+        _ => 0,
+    }
 }
 
 fn corrupt(detail: impl std::fmt::Display) -> calyx_core::CalyxError {
@@ -94,7 +133,10 @@ impl DiskAnnHeader {
             entry_point_id: le_u32(24),
             node_count: u64::from_le_bytes(block[28..36].try_into().expect("8B")),
         };
-        if header.format_version != DISKANN_FORMAT_VERSION {
+        if !matches!(
+            header.format_version,
+            DISKANN_LEGACY_FORMAT_VERSION | DISKANN_F32_FORMAT_VERSION | DISKANN_FORMAT_VERSION
+        ) {
             return Err(corrupt(format!("format_version {}", header.format_version)));
         }
         if header.dim == 0 || header.dim as usize > DISKANN_MAX_DIM {
@@ -159,7 +201,7 @@ impl DiskAnnGraphWriter {
             tmp_path,
             final_path: path.to_path_buf(),
             header,
-            block: node_block_size(header.dim as usize, header.m_max as usize),
+            block: node_block_size_for_header(&header),
             next_id: 0,
         })
     }
@@ -200,10 +242,7 @@ impl DiskAnnGraphWriter {
             .out
             .as_mut()
             .ok_or_else(|| invalid("writer already finished"))?;
-        for v in vector {
-            out.write_all(&v.to_le_bytes())
-                .map_err(|e| io_err("write vector", e))?;
-        }
+        let payload_len = write_vector_payload(out, self.header.format_version, vector)?;
         let count = u32::try_from(neighbors.len()).expect("<= m_max <= 512");
         out.write_all(&count.to_le_bytes())
             .map_err(|e| io_err("write count", e))?;
@@ -211,7 +250,7 @@ impl DiskAnnGraphWriter {
             out.write_all(&n.to_le_bytes())
                 .map_err(|e| io_err("write neighbors", e))?;
         }
-        let pad = self.block - (vector.len() * 4 + 4 + neighbors.len() * 4);
+        let pad = self.block - (payload_len + 4 + neighbors.len() * 4);
         out.write_all(&vec![0_u8; pad])
             .map_err(|e| io_err("write pad", e))?;
         self.next_id += 1;
@@ -249,11 +288,74 @@ impl Drop for DiskAnnGraphWriter {
     }
 }
 
+fn write_vector_payload(
+    out: &mut BufWriter<File>,
+    format_version: u32,
+    vector: &[f32],
+) -> Result<usize> {
+    match format_version {
+        DISKANN_LEGACY_FORMAT_VERSION | DISKANN_F32_FORMAT_VERSION => {
+            for v in vector {
+                out.write_all(&v.to_le_bytes())
+                    .map_err(|e| io_err("write vector", e))?;
+            }
+            Ok(vector.len() * 4)
+        }
+        DISKANN_FORMAT_VERSION => {
+            let row = quantize_direction_i8(vector);
+            let bytes = row.iter().map(|value| *value as u8).collect::<Vec<_>>();
+            out.write_all(&bytes)
+                .map_err(|e| io_err("write i8 vector", e))?;
+            let payload = i8_payload_len(vector.len());
+            let pad = payload - vector.len();
+            if pad > 0 {
+                out.write_all(&vec![0_u8; pad])
+                    .map_err(|e| io_err("write i8 vector pad", e))?;
+            }
+            Ok(payload)
+        }
+        other => Err(invalid(format!("unsupported graph format {other}"))),
+    }
+}
+
+fn quantize_direction_i8(vector: &[f32]) -> Vec<i8> {
+    let max_abs = vector
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f32, f32::max);
+    if max_abs == 0.0 {
+        return vec![0; vector.len()];
+    }
+    let scale = 127.0 / max_abs;
+    vector
+        .iter()
+        .map(|value| (value * scale).round().clamp(-127.0, 127.0) as i8)
+        .collect()
+}
+
 /// Zero-copy view of one node inside the mapped graph file.
 #[derive(Debug)]
 pub struct DiskAnnNodeRef<'a> {
-    pub vector: &'a [f32],
+    pub vector: DiskAnnVectorRef<'a>,
     pub neighbors: &'a [u32],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DiskAnnVectorRef<'a> {
+    F32(&'a [f32]),
+    I8(&'a [i8]),
+}
+
+impl DiskAnnVectorRef<'_> {
+    pub fn to_vec(self) -> Vec<f32> {
+        match self {
+            Self::F32(values) => values.to_vec(),
+            Self::I8(values) => values
+                .iter()
+                .map(|value| f32::from(*value))
+                .collect::<Vec<_>>(),
+        }
+    }
 }
 
 /// mmap-backed reader. The file is published atomically by the writer and
@@ -282,7 +384,7 @@ impl DiskAnnGraphReader {
         // an external violation of the vault's exclusive index ownership.
         let mmap = unsafe { Mmap::map(&file).map_err(|e| io_err("mmap graph file", e))? };
         let header = DiskAnnHeader::decode(&mmap[..DISKANN_BLOCK_ALIGN])?;
-        let block = node_block_size(header.dim as usize, header.m_max as usize);
+        let block = node_block_size_for_header(&header);
         let expected = DISKANN_BLOCK_ALIGN as u64 + header.node_count * block as u64;
         if len != expected {
             return Err(corrupt(format!(
@@ -329,8 +431,17 @@ impl DiskAnnGraphReader {
         let dim = self.header.dim as usize;
         let start = DISKANN_BLOCK_ALIGN + id as usize * self.block;
         let bytes = &self.mmap[start..start + self.block];
-        let vector = cast_le_slice::<f32>(&bytes[..dim * 4], "vector")?;
-        let count_at = dim * 4;
+        let (vector, count_at) = match self.header.format_version {
+            DISKANN_LEGACY_FORMAT_VERSION | DISKANN_F32_FORMAT_VERSION => {
+                let vector = cast_le_slice::<f32>(&bytes[..dim * 4], "vector")?;
+                (DiskAnnVectorRef::F32(vector), dim * 4)
+            }
+            DISKANN_FORMAT_VERSION => {
+                let vector = cast_le_slice::<i8>(&bytes[..dim], "i8 vector")?;
+                (DiskAnnVectorRef::I8(vector), i8_payload_len(dim))
+            }
+            other => return Err(corrupt(format!("format_version {other}"))),
+        };
         let count =
             u32::from_le_bytes(bytes[count_at..count_at + 4].try_into().expect("4B")) as usize;
         if count > self.header.m_max as usize {
@@ -362,3 +473,7 @@ fn cast_le_slice<'a, T>(bytes: &'a [u8], what: &str) -> Result<&'a [T]> {
 pub fn open_diskann_graph(path: &Path) -> Result<DiskAnnGraphReader> {
     DiskAnnGraphReader::open(path)
 }
+
+#[cfg(test)]
+#[path = "graph_tests.rs"]
+mod graph_tests;
