@@ -9,6 +9,7 @@ use serde_json::Value;
 use super::data;
 use super::lens;
 use super::request::CorpusBuildRequest;
+use super::worker;
 use super::write;
 
 #[test]
@@ -41,11 +42,11 @@ fn corpus_build_measures_algorithmic_code_and_sparse_lenses() {
         batch_size: 7,
         cost_override_json: None,
         embedding_model_id: Some("calyx-algorithmic-code+sparse".to_string()),
+        worker_report: None,
     };
 
     let rows = data::load_rows(&request).unwrap();
-    let lenses = lens::load_lenses(&request).unwrap();
-    let measured = lens::measure_lenses(&request, &rows, lenses).unwrap();
+    let measured = lens::measure_requested_lenses(&request, &rows).unwrap();
     let evidence = write::write_outputs(&request, &rows, &measured).unwrap();
 
     assert_eq!(evidence.n_samples, 60);
@@ -105,7 +106,13 @@ fn corpus_build_accepts_source_rows_with_string_labels() {
                 "source": format!("ag_news://train.parquet#row={idx}"),
                 "row": idx,
                 "text": format!("real news row {idx} with enough lexical content"),
-                "label": (idx % 2).to_string()
+                "label": (idx % 2).to_string(),
+                "anchor_audit": {
+                    "anchor_leaks_into_input": true,
+                    "trivial_anchor": true,
+                    "grounded_gate_eligible": false,
+                    "reason": "fixture label is present in input text"
+                }
             })
         ));
     }
@@ -123,6 +130,46 @@ fn corpus_build_accepts_source_rows_with_string_labels() {
         loaded.rows[0].temporal_inactive_reason.as_deref(),
         Some("source_missing_created_at")
     );
+    assert!(loaded.anchor_audit.anchor_leaks_into_input);
+    assert!(loaded.anchor_audit.trivial_anchor);
+    assert!(!loaded.anchor_audit.grounded_gate_eligible);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn corpus_build_worker_writes_single_lens_report() {
+    let root = temp_root("assay-corpus-worker");
+    let rows = root.join("rows.jsonl");
+    let report = root.join("worker.json");
+    write_code_rows(&rows, 60);
+    let manifest = write_manifest(
+        &root,
+        "code-ast.json",
+        "code-ast-style",
+        "algorithmic:ast-style",
+        8,
+    );
+    let request = CorpusBuildRequest {
+        rows_jsonl: rows,
+        out_dir: root.join("out"),
+        dataset: "worker-fixture".to_string(),
+        target_class: 0,
+        manifests: vec![manifest],
+        limit_per_class: None,
+        batch_size: 7,
+        cost_override_json: None,
+        embedding_model_id: None,
+        worker_report: Some(report.clone()),
+    };
+
+    worker::run_worker(&request).unwrap();
+
+    let persisted: lens::MeasuredLens =
+        serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(persisted.name, "code-ast-style");
+    assert_eq!(persisted.vectors.len(), 60);
+    assert_eq!(persisted.vectors[0].len(), 8);
+    assert_eq!(persisted.worker_pid, Some(std::process::id()));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -214,6 +261,7 @@ fn rows_request(rows_jsonl: &Path, out_dir: &Path) -> CorpusBuildRequest {
         batch_size: 8,
         cost_override_json: None,
         embedding_model_id: None,
+        worker_report: None,
     }
 }
 

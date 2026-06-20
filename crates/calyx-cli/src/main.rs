@@ -1,4 +1,5 @@
 //! Calyx command-line entry point.
+mod a35_signal;
 mod anneal_ab_log;
 mod anneal_autotune_report;
 mod anneal_bandit_readback;
@@ -20,12 +21,15 @@ mod anneal_replay_readback;
 mod anneal_soak;
 mod anneal_soak_report;
 mod anneal_status;
+mod assay_anchor_audit;
 mod assay_bits_validation;
 mod assay_corpus_build;
 mod assay_ensemble_card;
 mod assay_fbin_export;
 mod assay_gdelt_rows;
+mod assay_i8bin_ensemble_card;
 mod assay_stream_fbin;
+mod assay_verdict_metadata;
 mod budget_readback;
 mod cf_read;
 mod cli_support;

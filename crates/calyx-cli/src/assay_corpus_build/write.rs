@@ -8,6 +8,8 @@ use calyx_core::SlotShape;
 use serde::Serialize;
 use serde_json::json;
 
+use crate::assay_anchor_audit::AnchorAudit;
+
 use super::data::BuildRows;
 use super::lens::MeasuredLens;
 use super::request::CorpusBuildRequest;
@@ -22,6 +24,7 @@ pub(crate) struct CorpusBuildEvidence {
     pub(crate) batch_size: usize,
     pub(crate) label_counts: BTreeMap<String, usize>,
     pub(crate) temporal: TemporalEvidence,
+    pub(crate) anchor_audit: AnchorAudit,
     pub(crate) lenses: Vec<LensEvidence>,
 }
 
@@ -45,6 +48,17 @@ pub(crate) struct LensEvidence {
     pub(crate) vram_mb: f32,
     pub(crate) ram_mb: f32,
     pub(crate) ms_per_input: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_report_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_stderr_path: Option<String>,
+}
+
+pub(crate) fn ensure_fresh_output(request: &CorpusBuildRequest) -> Result<(), String> {
+    fail_if_final_exists(&request.out_dir)?;
+    fail_if_final_exists(&staging_dir(&request.out_dir))
 }
 
 pub(crate) fn write_outputs(
@@ -53,9 +67,8 @@ pub(crate) fn write_outputs(
     lenses: &[MeasuredLens],
 ) -> Result<CorpusBuildEvidence, String> {
     validate_measurements(rows, lenses)?;
-    fail_if_final_exists(&request.out_dir)?;
+    ensure_fresh_output(request)?;
     let staging = staging_dir(&request.out_dir);
-    fail_if_final_exists(&staging)?;
     if let Some(parent) = request.out_dir.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -100,6 +113,7 @@ fn write_all_files(
         batch_size: request.batch_size,
         label_counts: rows.label_counts.clone(),
         temporal: temporal_evidence(rows),
+        anchor_audit: rows.anchor_audit.clone(),
         lenses: lenses.iter().map(lens_evidence).collect(),
     };
     fs::write(
@@ -128,6 +142,10 @@ fn write_manifest(
         "label_counts": rows.label_counts,
         "target_class": request.target_class,
         "temporal": temporal_evidence(rows),
+        "anchor_leaks_into_input": rows.anchor_audit.anchor_leaks_into_input,
+        "trivial_anchor": rows.anchor_audit.trivial_anchor,
+        "grounded_gate_eligible": rows.anchor_audit.grounded_gate_eligible,
+        "anchor_audit": rows.anchor_audit.clone(),
         "lenses": manifest_lenses
     });
     fs::write(
@@ -155,6 +173,8 @@ fn write_vectors(rows: &BuildRows, lenses: &[MeasuredLens], path: &Path) -> Resu
             "temporal_inactive_reason": row.temporal_inactive_reason,
             "source_sequence": row.source_sequence,
             "source_sequence_index": row.source_sequence_index,
+            "anchor_leaks_into_input": row.anchor_audit.anchor_leaks_into_input,
+            "anchor_audit": row.anchor_audit.clone(),
             "lenses": lens_map
         });
         serde_json::to_writer(&mut writer, &line).map_err(json_error)?;
@@ -216,12 +236,15 @@ fn lens_evidence(lens: &MeasuredLens) -> LensEvidence {
         name: lens.name.clone(),
         runtime: lens.runtime.clone(),
         output_shape: shape_text(lens.output),
-        assay_projection: lens.assay_projection.to_string(),
+        assay_projection: lens.assay_projection.clone(),
         manifest: display(&lens.manifest),
         max_batch: lens.max_batch,
         vram_mb: lens.cost.vram_mb,
         ram_mb: lens.cost.ram_mb,
         ms_per_input: lens.cost.ms_per_input,
+        worker_pid: lens.worker_pid,
+        worker_report_path: lens.worker_report_path.as_ref().map(|path| display(path)),
+        worker_stderr_path: lens.worker_stderr_path.as_ref().map(|path| display(path)),
     }
 }
 

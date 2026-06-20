@@ -7,7 +7,13 @@ use crate::lens_commands::flags::value;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CommissionRuntime {
     OnnxInt8,
+    OnnxFp32,
     FastembedOnnx,
+    FastembedSparse,
+    FastembedBgem3Dense,
+    FastembedBgem3Sparse,
+    FastembedBgem3Colbert,
+    FastembedReranker,
     CandleFp16,
     Tei,
 }
@@ -16,11 +22,19 @@ impl CommissionRuntime {
     pub(super) fn parse(raw: &str) -> CliResult<Self> {
         match raw {
             "onnx-int8" => Ok(Self::OnnxInt8),
+            "onnx-fp32" | "onnx" => Ok(Self::OnnxFp32),
             "fastembed-onnx" | "onnx-fastembed" => Ok(Self::FastembedOnnx),
+            "fastembed-sparse" => Ok(Self::FastembedSparse),
+            "fastembed-bgem3-dense" | "fastembed-bge-m3-dense" => Ok(Self::FastembedBgem3Dense),
+            "fastembed-bgem3-sparse" | "fastembed-bge-m3-sparse" => Ok(Self::FastembedBgem3Sparse),
+            "fastembed-bgem3-colbert" | "fastembed-bge-m3-colbert" => {
+                Ok(Self::FastembedBgem3Colbert)
+            }
+            "fastembed-reranker" => Ok(Self::FastembedReranker),
             "candle-fp16" => Ok(Self::CandleFp16),
             "tei" | "tei-http" | "tei_http" => Ok(Self::Tei),
             other => Err(CliError::usage(format!(
-                "unsupported --runtime {other}; expected onnx-int8, fastembed-onnx, candle-fp16, or tei"
+                "unsupported --runtime {other}; expected onnx-int8, onnx-fp32, fastembed-onnx, fastembed-sparse, fastembed-bgem3-*, fastembed-reranker, candle-fp16, or tei"
             ))),
         }
     }
@@ -28,7 +42,13 @@ impl CommissionRuntime {
     pub(super) const fn manifest_runtime(self) -> &'static str {
         match self {
             Self::OnnxInt8 => "onnx-int8",
+            Self::OnnxFp32 => "onnx",
             Self::FastembedOnnx => "onnx-fastembed",
+            Self::FastembedSparse => "fastembed-sparse",
+            Self::FastembedBgem3Dense => "fastembed-bgem3-dense",
+            Self::FastembedBgem3Sparse => "fastembed-bgem3-sparse",
+            Self::FastembedBgem3Colbert => "fastembed-bgem3-colbert",
+            Self::FastembedReranker => "fastembed-reranker",
             Self::CandleFp16 => "candle-fp16",
             Self::Tei => "tei",
         }
@@ -37,8 +57,25 @@ impl CommissionRuntime {
     pub(super) const fn default_dtype(self) -> &'static str {
         match self {
             Self::OnnxInt8 => "int8",
-            Self::FastembedOnnx | Self::Tei => "f32",
+            Self::OnnxFp32 => "f32",
+            Self::FastembedOnnx
+            | Self::FastembedSparse
+            | Self::FastembedBgem3Dense
+            | Self::FastembedBgem3Sparse
+            | Self::FastembedBgem3Colbert
+            | Self::FastembedReranker
+            | Self::Tei => "f32",
             Self::CandleFp16 => "f16",
+        }
+    }
+
+    pub(super) const fn default_norm(self) -> &'static str {
+        match self {
+            Self::FastembedSparse
+            | Self::FastembedBgem3Sparse
+            | Self::FastembedBgem3Colbert
+            | Self::FastembedReranker => "finite",
+            _ => "unit",
         }
     }
 }
@@ -55,7 +92,9 @@ pub(super) struct CommissionFlags {
     pub(super) non_commercial: bool,
     pub(super) pooling: String,
     pub(super) norm: String,
+    norm_explicit: bool,
     pub(super) quant_target: String,
+    pub(super) max_batch: Option<usize>,
 }
 
 impl CommissionFlags {
@@ -71,7 +110,9 @@ impl CommissionFlags {
         let mut non_commercial = false;
         let mut pooling = "mean".to_string();
         let mut norm = "unit".to_string();
+        let mut norm_explicit = false;
         let mut quant_target = "avx2".to_string();
+        let mut max_batch = None;
         let mut idx = 0;
         while idx < args.len() {
             match args[idx].as_str() {
@@ -118,10 +159,18 @@ impl CommissionFlags {
                 "--norm" => {
                     idx += 1;
                     norm = value(args, idx, "--norm")?.to_string();
+                    norm_explicit = true;
                 }
                 "--quant-target" => {
                     idx += 1;
                     quant_target = value(args, idx, "--quant-target")?.to_string();
+                }
+                "--max-batch" => {
+                    idx += 1;
+                    max_batch = Some(parse_positive_usize(
+                        value(args, idx, "--max-batch")?,
+                        "--max-batch",
+                    )?);
                 }
                 other => {
                     return Err(CliError::usage(format!(
@@ -146,7 +195,9 @@ impl CommissionFlags {
             non_commercial,
             pooling,
             norm,
+            norm_explicit,
             quant_target,
+            max_batch,
         })
     }
 
@@ -188,6 +239,14 @@ impl CommissionFlags {
             None
         }
     }
+
+    pub(super) fn manifest_norm(&self) -> String {
+        if self.norm_explicit {
+            self.norm.clone()
+        } else {
+            self.runtime.default_norm().to_string()
+        }
+    }
 }
 
 fn require_nonempty(value: Option<String>, flag: &str) -> CliResult<String> {
@@ -205,6 +264,16 @@ fn validate_quant_target(raw: &str) -> CliResult {
             "--quant-target {other} is unsupported"
         ))),
     }
+}
+
+fn parse_positive_usize(raw: &str, flag: &str) -> CliResult<usize> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|err| CliError::usage(format!("{flag} must be an integer: {err}")))?;
+    if value == 0 {
+        return Err(CliError::usage(format!("{flag} must be > 0")));
+    }
+    Ok(value)
 }
 
 fn sanitize_path_token(raw: &str) -> String {

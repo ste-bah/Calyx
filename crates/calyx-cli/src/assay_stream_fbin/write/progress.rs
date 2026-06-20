@@ -5,7 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::assay_corpus_build::lens::BuildLens;
 use crate::error::{CliError, CliResult};
 
 use super::super::args::Args;
@@ -26,6 +25,18 @@ pub(super) struct ProgressLog {
     state: ProgressState,
     sequence: u64,
     last_snapshot_row: usize,
+}
+
+pub(super) struct LensProgressMeta {
+    pub(super) slot: usize,
+    pub(super) name: String,
+    pub(super) lens_id: String,
+    pub(super) weights_sha256: String,
+    pub(super) bits_about: f32,
+    pub(super) dim: usize,
+    pub(super) max_batch: Option<usize>,
+    pub(super) effective_batch_size: usize,
+    pub(super) manifest: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,24 +155,18 @@ impl ProgressLog {
         Ok(log)
     }
 
-    pub(super) fn lens_started(
-        &mut self,
-        slot: usize,
-        lens: &BuildLens,
-        bits_about: f32,
-        effective_batch_size: usize,
-    ) -> CliResult {
+    pub(super) fn lens_started(&mut self, lens: &LensProgressMeta) -> CliResult {
         let started_unix_ms = unix_ms()?;
         self.state.current_lens = Some(LensProgress {
-            slot: u16::try_from(slot).map_err(|_| CliError::usage("slot exceeds u16"))?,
-            name: lens.name().to_string(),
-            lens_id: lens.lens_id(),
-            weights_sha256: lens.weights_sha256_hex(),
-            bits_about,
-            dim: lens.dim(),
-            max_batch: lens.max_batch(),
-            effective_batch_size,
-            manifest: display(lens.manifest()),
+            slot: u16::try_from(lens.slot).map_err(|_| CliError::usage("slot exceeds u16"))?,
+            name: lens.name.clone(),
+            lens_id: lens.lens_id.clone(),
+            weights_sha256: lens.weights_sha256.clone(),
+            bits_about: lens.bits_about,
+            dim: lens.dim,
+            max_batch: lens.max_batch,
+            effective_batch_size: lens.effective_batch_size,
+            manifest: lens.manifest.clone(),
             started_unix_ms,
             elapsed_ms: None,
             corpus_rows_written: 0,
@@ -183,13 +188,16 @@ impl ProgressLog {
             lens.query_rows_written = query_rows_written;
             lens.last_row_idx = Some(last_row_idx);
         }
-        if corpus_rows_written == self.state.rows_total
-            || corpus_rows_written.saturating_sub(self.last_snapshot_row) >= SNAPSHOT_ROW_INTERVAL
-        {
+        if self.snapshot_due(corpus_rows_written) {
             self.last_snapshot_row = corpus_rows_written;
             self.write_snapshot("batch_written")?;
         }
         Ok(())
+    }
+
+    pub(super) fn snapshot_due(&self, corpus_rows_written: usize) -> bool {
+        corpus_rows_written == self.state.rows_total
+            || corpus_rows_written.saturating_sub(self.last_snapshot_row) >= SNAPSHOT_ROW_INTERVAL
     }
 
     pub(super) fn lens_finished(
@@ -313,4 +321,48 @@ fn sync_parent_dir(path: &Path) -> CliResult {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> CliResult {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_due_only_at_interval_or_lens_end() {
+        let mut log = ProgressLog {
+            path: PathBuf::new(),
+            tmp_path: PathBuf::new(),
+            published_path: PathBuf::new(),
+            state: ProgressState {
+                state: "running",
+                dataset: "unit".to_string(),
+                rows_jsonl: "rows.jsonl".to_string(),
+                out_dir: "out".to_string(),
+                staging_dir: "staging".to_string(),
+                rows_total: 25_000,
+                query_count: 100,
+                batch_size: 64,
+                min_bits: 0.05,
+                vector_format: "i8bin",
+                vector_storage_contract: "contract",
+                streaming_fbin_source: true,
+                temporal_counts_toward_a35: false,
+                temporal_lane_role: TEMPORAL_LANE_ROLE,
+                lens_total: 10,
+                lenses_completed: 0,
+                completed_corpus_rows: 0,
+                completed_query_rows: 0,
+                current_lens: None,
+            },
+            sequence: 0,
+            last_snapshot_row: 10_000,
+        };
+
+        assert!(!log.snapshot_due(19_999));
+        assert!(log.snapshot_due(20_000));
+        assert!(log.snapshot_due(25_000));
+
+        log.last_snapshot_row = 25_000;
+        assert!(!log.snapshot_due(25_001));
+    }
 }

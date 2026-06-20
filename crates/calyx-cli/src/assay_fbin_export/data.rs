@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use calyx_registry::lens_spec_from_manifest_path;
 use serde::Deserialize;
 
+use crate::a35_signal::{require_countable_content_signal_kind, runtime_signal_kind_name};
+use crate::assay_anchor_audit::AnchorAudit;
 use crate::error::CliResult;
 
 use super::timeline::{TimelineScan, TimelineScanBuilder, timeline_row};
@@ -21,6 +23,7 @@ pub(super) struct VectorScan {
 pub(super) struct LensMeta {
     pub(super) lens_id: String,
     pub(super) weights_sha256: String,
+    pub(super) signal_kind: String,
 }
 
 #[derive(Debug)]
@@ -93,12 +96,20 @@ struct BuildLensRef {
 #[derive(Debug, Deserialize)]
 struct BitsReport {
     lenses: Option<Vec<BitsLens>>,
+    anchor_audit: Option<AnchorAudit>,
+    anchor_leaks_into_input: Option<bool>,
+    trivial_anchor: Option<bool>,
+    grounded_gate_eligible: Option<bool>,
     report: Option<BitsReportInner>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BitsReportInner {
     lenses: Vec<BitsLens>,
+    anchor_audit: Option<AnchorAudit>,
+    anchor_leaks_into_input: Option<bool>,
+    trivial_anchor: Option<bool>,
+    grounded_gate_eligible: Option<bool>,
 }
 
 pub(super) fn scan_vectors(path: &Path) -> CliResult<VectorScan> {
@@ -251,6 +262,7 @@ fn lens_meta(corpus_dir: &Path, lens: &BuildLensRef) -> CliResult<LensMeta> {
     Ok(LensMeta {
         lens_id: spec.lens_id().to_string(),
         weights_sha256: hex32(&spec.weights_sha256),
+        signal_kind: runtime_signal_kind_name(&spec.runtime).to_string(),
     })
 }
 
@@ -269,6 +281,7 @@ pub(super) fn load_bits_report(path: &Path) -> CliResult<BTreeMap<String, BitsLe
             "pass a valid assay bits report with per-lens bits_about",
         )
     })?;
+    report_anchor_audit(&report).require_gate_eligible("assay export-fbin grounded anchor gate")?;
     let lenses = report
         .lenses
         .or_else(|| report.report.map(|inner| inner.lenses))
@@ -285,18 +298,45 @@ pub(super) fn load_bits_report(path: &Path) -> CliResult<BTreeMap<String, BitsLe
         .collect())
 }
 
+fn report_anchor_audit(report: &BitsReport) -> AnchorAudit {
+    let inner = report.report.as_ref();
+    AnchorAudit::from_parts(
+        report
+            .anchor_audit
+            .clone()
+            .or_else(|| inner.and_then(|value| value.anchor_audit.clone())),
+        report
+            .anchor_leaks_into_input
+            .or_else(|| inner.and_then(|value| value.anchor_leaks_into_input)),
+        report
+            .trivial_anchor
+            .or_else(|| inner.and_then(|value| value.trivial_anchor)),
+        report
+            .grounded_gate_eligible
+            .or_else(|| inner.and_then(|value| value.grounded_gate_eligible)),
+    )
+}
+
 pub(super) fn selected_lenses(
     lens_order: &[String],
     meta: &BTreeMap<String, LensMeta>,
     bits: &BTreeMap<String, BitsLens>,
     min_bits: f32,
 ) -> CliResult<Vec<String>> {
-    let selected = lens_order
-        .iter()
-        .filter(|name| meta.contains_key(*name))
-        .filter(|name| admitted(bits.get(*name), min_bits))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    for name in lens_order {
+        let Some(lens_meta) = meta.get(name) else {
+            continue;
+        };
+        if admitted(bits.get(name), min_bits) {
+            require_countable_content_signal_kind(
+                name,
+                &lens_meta.signal_kind,
+                "assay-fbin-export A35 gate",
+            )?;
+            selected.push(name.clone());
+        }
+    }
     if selected.len() < MIN_A35_LENSES {
         return Err(local_error(
             "CALYX_FSV_ASSAY_FBIN_EXPORT_PANEL_TOO_SMALL",

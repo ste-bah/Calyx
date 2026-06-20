@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use calyx_core::{Input, Lens, Placement, SlotShape, SlotVector};
 use calyx_registry::{
-    AlgorithmicLens, CandleLens, LensRuntime, LensSpec as RegistryLensSpec, OnnxLens,
-    StaticLookupLens, TeiHttpLens, lens_spec_from_manifest_path,
+    CandleLens, LensRuntime, LensSpec as RegistryLensSpec, OnnxLens, StaticLookupLens, TeiHttpLens,
+    lens_spec_from_manifest_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,21 +16,31 @@ use crate::lens_commands::support::{dim, runtime_name, validate_vector_contract}
 use super::data::BuildRows;
 use super::request::CorpusBuildRequest;
 
+mod algorithmic;
 mod progress;
+mod projection;
 mod stream;
 
+use algorithmic::algorithmic_lens;
+use projection::{project_multi, project_sparse};
 pub(crate) use stream::measure_text_batch;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct MeasuredLens {
     pub(crate) name: String,
     pub(crate) manifest: PathBuf,
     pub(crate) runtime: String,
     pub(crate) output: SlotShape,
     pub(crate) max_batch: Option<usize>,
-    pub(crate) assay_projection: &'static str,
+    pub(crate) assay_projection: String,
     pub(crate) vectors: Vec<Vec<f32>>,
     pub(crate) cost: LensCost,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_report_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_stderr_path: Option<PathBuf>,
 }
 
 pub(crate) struct BuildLens {
@@ -62,8 +72,31 @@ struct RuntimeCostBasis<'a> {
 }
 
 pub(crate) fn load_lenses(request: &CorpusBuildRequest) -> Result<Vec<BuildLens>, String> {
+    load_unique_specs(request)?
+        .into_iter()
+        .map(|(manifest, spec)| build_lens(manifest, spec))
+        .collect()
+}
+
+pub(crate) fn measure_requested_lenses(
+    request: &CorpusBuildRequest,
+    rows: &BuildRows,
+) -> Result<Vec<MeasuredLens>, String> {
+    let specs = load_unique_specs(request)?;
+    let overrides = load_cost_overrides(request)?;
+    let mut measured = Vec::with_capacity(specs.len());
+    for (manifest, spec) in specs {
+        let lens = build_lens(manifest, spec)?;
+        measured.push(measure_one_lens(request, rows, lens, &overrides)?);
+    }
+    Ok(measured)
+}
+
+fn load_unique_specs(
+    request: &CorpusBuildRequest,
+) -> Result<Vec<(PathBuf, RegistryLensSpec)>, String> {
     let mut names = BTreeMap::new();
-    let mut lenses = Vec::with_capacity(request.manifests.len());
+    let mut specs = Vec::with_capacity(request.manifests.len());
     for manifest in &request.manifests {
         let spec = lens_spec_from_manifest_path(manifest).map_err(|error| {
             format!(
@@ -80,50 +113,49 @@ pub(crate) fn load_lenses(request: &CorpusBuildRequest) -> Result<Vec<BuildLens>
                 manifest.display()
             ));
         }
-        lenses.push(build_lens(manifest.clone(), spec)?);
+        specs.push((manifest.clone(), spec));
     }
-    Ok(lenses)
+    Ok(specs)
 }
 
-pub(crate) fn measure_lenses(
+fn measure_one_lens(
     request: &CorpusBuildRequest,
     rows: &BuildRows,
-    lenses: Vec<BuildLens>,
-) -> Result<Vec<MeasuredLens>, String> {
-    let overrides = load_cost_overrides(request)?;
-    let mut measured = Vec::with_capacity(lenses.len());
-    for lens in lenses {
-        let inputs = rows
-            .rows
-            .iter()
-            .map(|row| Input::new(lens.spec.modality, row.text.as_bytes().to_vec()))
-            .collect::<Vec<_>>();
-        progress::emit_start(request, rows, &lens);
-        let started = Instant::now();
-        let slots = measure_batches(&lens, &inputs, request.batch_size)?;
-        let total_ms = started.elapsed().as_secs_f64() as f32 * 1000.0;
-        let ms_per_input = total_ms / inputs.len() as f32;
-        if !ms_per_input.is_finite() || ms_per_input <= 0.0 {
-            return Err(format!(
-                "CALYX_FSV_ASSAY_CORPUS_BUILD_INVALID_COST: lens={} measured ms_per_input={} must be finite and > 0",
-                lens.name, ms_per_input
-            ));
-        }
-        let (vectors, assay_projection) = assay_vectors(&lens, slots)?;
-        let cost = lens_cost(&lens, overrides.get(&lens.name).copied(), ms_per_input)?;
-        progress::emit_finish(request, rows, &lens, total_ms, &cost);
-        measured.push(MeasuredLens {
-            name: lens.name,
-            manifest: lens.manifest,
-            runtime: lens.runtime_name,
-            output: lens.spec.output,
-            max_batch: lens.spec.max_batch,
-            assay_projection,
-            vectors,
-            cost,
-        });
+    lens: BuildLens,
+    overrides: &BTreeMap<String, CostOverride>,
+) -> Result<MeasuredLens, String> {
+    let inputs = rows
+        .rows
+        .iter()
+        .map(|row| Input::new(lens.spec.modality, row.text.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    progress::emit_start(request, rows, &lens);
+    let started = Instant::now();
+    let slots = measure_batches(&lens, &inputs, request.batch_size)?;
+    let total_ms = started.elapsed().as_secs_f64() as f32 * 1000.0;
+    let ms_per_input = total_ms / inputs.len() as f32;
+    if !ms_per_input.is_finite() || ms_per_input <= 0.0 {
+        return Err(format!(
+            "CALYX_FSV_ASSAY_CORPUS_BUILD_INVALID_COST: lens={} measured ms_per_input={} must be finite and > 0",
+            lens.name, ms_per_input
+        ));
     }
-    Ok(measured)
+    let (vectors, assay_projection) = assay_vectors(&lens, slots)?;
+    let cost = lens_cost(&lens, overrides.get(&lens.name).copied(), ms_per_input)?;
+    progress::emit_finish(request, rows, &lens, total_ms, &cost);
+    Ok(MeasuredLens {
+        name: lens.name,
+        manifest: lens.manifest,
+        runtime: lens.runtime_name,
+        output: lens.spec.output,
+        max_batch: lens.spec.max_batch,
+        assay_projection: assay_projection.to_string(),
+        vectors,
+        cost,
+        worker_pid: None,
+        worker_report_path: None,
+        worker_stderr_path: None,
+    })
 }
 
 fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<BuildLens, String> {
@@ -268,77 +300,29 @@ fn assay_vectors(
                     dim(lens.spec.output)
                 ));
             }
+            SlotVector::Multi { token_dim, tokens } if token_dim == dim(lens.spec.output) => {
+                projection.get_or_insert("multi_mean_dense");
+                vectors.push(project_multi(&lens.name, idx, token_dim, tokens)?);
+            }
+            SlotVector::Multi {
+                token_dim,
+                tokens: _,
+            } => {
+                return Err(format!(
+                    "CALYX_FSV_ASSAY_CORPUS_BUILD_DIM_MISMATCH: lens={} row={idx} token_dim={token_dim} expected={}",
+                    lens.name,
+                    dim(lens.spec.output)
+                ));
+            }
             other => {
                 return Err(format!(
-                    "CALYX_FSV_ASSAY_CORPUS_BUILD_UNSUPPORTED_VECTOR_SHAPE: lens={} row={idx} shape {:?} must be dense or sparse",
+                    "CALYX_FSV_ASSAY_CORPUS_BUILD_UNSUPPORTED_VECTOR_SHAPE: lens={} row={idx} shape {:?} must be dense, sparse, or multi",
                     lens.name, other
                 ));
             }
         }
     }
     Ok((vectors, projection.unwrap_or("native_dense")))
-}
-
-fn project_sparse(
-    lens: &str,
-    row_idx: usize,
-    sparse_dim: u32,
-    entries: Vec<calyx_core::SparseEntry>,
-) -> Result<Vec<f32>, String> {
-    let mut data = vec![0.0_f32; sparse_dim as usize];
-    for entry in entries {
-        let Some(value) = data.get_mut(entry.idx as usize) else {
-            return Err(format!(
-                "CALYX_FSV_ASSAY_CORPUS_BUILD_SPARSE_INDEX_OUT_OF_RANGE: lens={lens} row={row_idx} idx={} dim={sparse_dim}",
-                entry.idx
-            ));
-        };
-        *value = entry.val;
-    }
-    Ok(data)
-}
-
-fn algorithmic_lens(spec: &RegistryLensSpec, kind: &str) -> Result<AlgorithmicLens, String> {
-    let lens = match kind {
-        "byte" | "byte-features" | "byte_features" => {
-            AlgorithmicLens::byte_features(&spec.name, spec.modality)
-        }
-        "scalar" => AlgorithmicLens::scalar(&spec.name, spec.modality),
-        "ast-style" | "ast_style" => AlgorithmicLens::ast_style(&spec.name, spec.modality),
-        value if value.starts_with("one-hot:") || value.starts_with("one_hot:") => {
-            let buckets = parse_kind_dim(value)?;
-            AlgorithmicLens::one_hot(&spec.name, spec.modality, buckets)
-        }
-        "sparse" | "sparse-keywords" | "sparse_keywords" => {
-            AlgorithmicLens::sparse_keywords(&spec.name, spec.modality, dim(spec.output))
-        }
-        value if value.starts_with("sparse-keywords:") || value.starts_with("sparse_keywords:") => {
-            let parsed = parse_kind_dim(value)?;
-            AlgorithmicLens::sparse_keywords(&spec.name, spec.modality, parsed)
-        }
-        other => {
-            return Err(format!(
-                "CALYX_FSV_ASSAY_CORPUS_BUILD_UNSUPPORTED_ALGORITHMIC_LENS: lens={} kind={other}",
-                spec.name
-            ));
-        }
-    };
-    if lens.shape() != spec.output {
-        return Err(format!(
-            "CALYX_FSV_ASSAY_CORPUS_BUILD_ALGORITHMIC_SHAPE_MISMATCH: lens={} runtime_shape={:?} manifest_shape={:?}",
-            spec.name,
-            lens.shape(),
-            spec.output
-        ));
-    }
-    Ok(lens)
-}
-
-fn parse_kind_dim(kind: &str) -> Result<u32, String> {
-    kind.split_once(':')
-        .and_then(|(_, value)| value.parse::<u32>().ok())
-        .filter(|dim| *dim > 0)
-        .ok_or_else(|| format!("CALYX_FSV_ASSAY_CORPUS_BUILD_INVALID_ALGORITHMIC_DIM: kind={kind}"))
 }
 
 fn lens_cost(

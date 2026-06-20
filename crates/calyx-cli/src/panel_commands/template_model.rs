@@ -4,7 +4,7 @@ use calyx_core::{
     Asymmetry, CalyxError, LensCost, LensId, Modality, Panel, Placement, QuantPolicy, Slot, SlotId,
     SlotKey, SlotResource, SlotShape, SlotState, content_address,
 };
-use calyx_registry::{LensHealth, lens_spec_from_manifest_path};
+use calyx_registry::{LensHealth, lens_spec_metadata_from_manifest_path};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, CliResult};
@@ -14,8 +14,10 @@ pub(super) const MIN_CONTENT_LENSES: usize = 10;
 pub(super) const CATALOG_VERSION: u16 = 1;
 pub(super) const OBJECT_VERSION: u16 = 1;
 pub(super) const CARD_VERSION: u16 = 1;
+pub(super) const A37_ADMISSION_VERSION: u16 = 1;
 pub(super) const TEMPLATE_INVALID: &str = "CALYX_PANEL_TEMPLATE_INVALID";
 pub(super) const TEMPLATE_NOT_FOUND: &str = "CALYX_PANEL_TEMPLATE_NOT_FOUND";
+pub(super) const TEMPLATE_A37_GATE_REFUSED: &str = "CALYX_PANEL_TEMPLATE_A37_GATE_REFUSED";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct PanelTemplateCatalog {
@@ -91,6 +93,10 @@ pub(super) struct TemplateEnsembleCard {
     pub total_ram_bytes: u64,
     pub mean_ms_per_input: f32,
     pub card_refs: Vec<CapabilityCardRef>,
+    #[serde(default)]
+    pub a37_admission: TemplateA37Admission,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a37_ensemble_card_ref: Option<TemplateA37CardRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,6 +108,37 @@ pub(super) struct CapabilityCardRef {
     pub coverage_rate: f32,
     pub failed: usize,
     pub health: LensHealth,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct TemplateA37Admission {
+    pub schema_version: u16,
+    pub source: String,
+    pub gate_eligible: bool,
+    pub status: String,
+    pub verdict: String,
+    pub content_lens_count: usize,
+    pub temporal_sidecar_count: usize,
+    pub temporal_counts_toward_content_floor: bool,
+    pub association_family_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_eff: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_pairwise_corr: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_pairwise_nmi: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sum_unique_pid_bits: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct TemplateA37CardRef {
+    pub path: String,
+    pub blake3_hex: String,
+    pub card_schema_version: u32,
+    pub card_source: String,
+    pub panel_lens_count: usize,
+    pub status: String,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +185,32 @@ impl SavedPanelTemplate {
         }
         validate_lenses(self)?;
         validate_time_controls(self)
+    }
+
+    pub(super) fn a37_admission(&self) -> TemplateA37Admission {
+        self.ensemble_card
+            .as_ref()
+            .map(|card| card.a37_admission.clone())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn a37_gate_eligible(&self) -> bool {
+        self.a37_admission().gate_eligible
+    }
+
+    pub(super) fn require_a37_gate(&self) -> CliResult {
+        let admission = self.a37_admission();
+        if admission.gate_eligible {
+            return Ok(());
+        }
+        Err(template_error(
+            TEMPLATE_A37_GATE_REFUSED,
+            format!(
+                "template {} is not A37 gate eligible: {}",
+                self.name, admission.verdict
+            ),
+            "profile the template with an Assay EnsembleCard whose A37 status is gate_passed",
+        ))
     }
 
     pub(super) fn to_target_panel(&self, created_at: u64) -> Panel {
@@ -203,6 +266,26 @@ impl SavedPanelTemplate {
     }
 }
 
+impl Default for TemplateA37Admission {
+    fn default() -> Self {
+        Self {
+            schema_version: A37_ADMISSION_VERSION,
+            source: "missing_assay_ensemble_card".to_string(),
+            gate_eligible: false,
+            status: "missing_a37_ensemble_card".to_string(),
+            verdict: "A37 gate not evaluated; template has no Assay EnsembleCard".to_string(),
+            content_lens_count: 0,
+            temporal_sidecar_count: 0,
+            temporal_counts_toward_content_floor: false,
+            association_family_count: 0,
+            n_eff: None,
+            mean_pairwise_corr: None,
+            mean_pairwise_nmi: None,
+            sum_unique_pid_bits: None,
+        }
+    }
+}
+
 pub(super) fn default_time_controls() -> Vec<TemplateTimeControl> {
     vec![
         time_control("E2_recency", "temporal_recent", SlotShape::Dense(1)),
@@ -212,7 +295,7 @@ pub(super) fn default_time_controls() -> Vec<TemplateTimeControl> {
 }
 
 pub(super) fn lens_ref_from_catalog(entry: &super::LensCatalogEntry) -> CliResult<TemplateLensRef> {
-    let spec = lens_spec_from_manifest_path(&entry.manifest)?;
+    let spec = lens_spec_metadata_from_manifest_path(&entry.manifest)?;
     Ok(TemplateLensRef {
         slot_key: slug(&entry.name),
         lens_name: entry.name.clone(),
@@ -338,39 +421,4 @@ fn slug(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::lens_commands::support::hex_from_bytes;
-
-    #[test]
-    fn rejects_sub_ten_content_templates() {
-        let template = SavedPanelTemplate {
-            schema_version: OBJECT_VERSION,
-            name: "too-small".to_string(),
-            version: 1,
-            notes: String::new(),
-            min_content_lenses: MIN_CONTENT_LENSES,
-            lenses: Vec::new(),
-            time_controls: default_time_controls(),
-            ensemble_card: None,
-        };
-
-        let error = template.validate().unwrap_err();
-        assert_eq!(error.code(), TEMPLATE_INVALID);
-    }
-
-    #[test]
-    fn temporal_controls_never_count_toward_a35() {
-        for control in default_time_controls() {
-            assert!(!control.counts_toward_a35);
-        }
-    }
-
-    #[test]
-    fn hash_from_bytes_stays_lower_hex() {
-        assert_eq!(
-            hex_from_bytes(&[0xabu8; 32]),
-            "abababababababababababababababababababababababababababababababab"
-        );
-    }
-}
+mod tests;

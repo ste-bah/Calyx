@@ -194,6 +194,7 @@ fn report(path: &Path, bytes: &[u8], card: &EnsembleCard) -> Value {
         "panel_bits": card.panel_bits,
         "panel_ci": card.panel_ci,
         "n_eff": card.n_eff,
+        "a37_diversity": card.a37_diversity,
         "panel_sufficiency": card.sufficiency,
         "sufficient": card.sufficient,
         "deficit_bits": card.deficit_bits,
@@ -291,7 +292,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use calyx_assay::sufficiency::PanelSufficiency;
-    use calyx_assay::{EnsembleDecision, EnsembleLensValue, EnsemblePairValue, PidBits, TrustTag};
+    use calyx_assay::{
+        EnsembleConfig, EnsembleDecision, EnsembleLensValue, EnsemblePairValue, PidBits, TrustTag,
+        a37_diversity_gate,
+    };
     use calyx_core::SlotId;
 
     use super::super::PlanSlot;
@@ -394,6 +398,7 @@ mod tests {
             name: Some(format!("lens-{slot}")),
             lens_id: Some(format!("{:032x}", slot + 1)),
             weights_sha256: Some(format!("{:064x}", slot + 1)),
+            signal_kind: Some("learned_encoder".to_string()),
             bits_about: Some(0.1),
             vault: PathBuf::from(format!("vault-{slot}")),
             queries: PathBuf::from(format!("queries-{slot}.i8bin")),
@@ -411,6 +416,7 @@ mod tests {
                 pairs.push(pair_value(a + slot_offset, b + slot_offset));
             }
         }
+        let a37_diversity = a37_diversity_gate(&lenses, &pairs, 8.5, &EnsembleConfig::default());
         EnsembleCard {
             schema_version: 1,
             source: "unit-test".to_string(),
@@ -423,15 +429,19 @@ mod tests {
             n_eff: 8.5,
             sufficient: false,
             deficit_bits: 0.5,
+            a37_diversity,
             deficit_proposal: None,
             sufficiency: PanelSufficiency {
                 panel_bits: 0.5,
+                sufficiency_basis_bits: 0.5,
                 anchor_entropy_bits: 1.0,
                 observation_scope: None,
                 sufficient: false,
                 deficit_bits: 0.5,
                 deficits: Vec::new(),
                 trust: TrustTag::Provisional,
+                estimate_bound: calyx_assay::EstimateBound::LowerBound,
+                power_calibration: None,
             },
             lenses,
             pairs,

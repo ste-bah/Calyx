@@ -39,6 +39,7 @@ pub(super) struct LensEvidence {
     pub(super) name: String,
     pub(super) lens_id: String,
     pub(super) weights_sha256: String,
+    pub(super) signal_kind: String,
     pub(super) bits_about: f32,
     pub(super) dim: usize,
     pub(super) corpus_path: String,
@@ -55,6 +56,7 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
 }
 
 fn export_fbin(args: &Args) -> CliResult<ExportEvidence> {
+    write::ensure_fresh_output(args)?;
     let vectors_path = args.corpus_dir.join("vectors.jsonl");
     let scan = data::scan_vectors(&vectors_path)?;
     if args.query_count > scan.rows {

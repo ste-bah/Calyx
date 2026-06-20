@@ -6,11 +6,12 @@ use crate::attribution::per_sensor_attribution;
 use crate::estimate::TrustTag;
 use crate::formulas::marginal_value;
 use crate::ksg::MIN_ASSAY_SAMPLES;
-use crate::logistic::logistic_probe_mi_multiseed;
+use crate::logistic::{logistic_probe_mi_multiseed, logistic_probe_mi_multiseed_calibrated};
 use crate::n_eff::stable_rank;
 use crate::nmi::partitioned_histogram_nmi;
-use crate::sufficiency::{PanelSufficiency, entropy_bits, panel_sufficiency};
+use crate::sufficiency::{PanelSufficiency, entropy_bits, panel_sufficiency_from_estimate};
 
+use super::a37::a37_diversity_gate;
 use super::model::{
     DeficitProposal, ENSEMBLE_CARD_PID_METHOD, ENSEMBLE_CARD_SCHEMA_VERSION, EnsembleCard,
     EnsembleConfig, EnsembleDecision, EnsembleLensInput, EnsembleLensValue, EnsemblePairValue,
@@ -81,12 +82,13 @@ pub fn ensemble_card(
         .iter()
         .map(|lens| (lens.slot, lens.marginal_bits))
         .collect::<Vec<_>>();
-    let sufficiency = panel_sufficiency(
-        panel.estimate.bits,
+    let a37_diversity = a37_diversity_gate(&lens_values, &pairs, n_eff, config);
+    let sufficiency = panel_sufficiency_from_estimate(
+        &panel.estimate,
         entropy_bits(labels),
         &per_sensor_attribution(&slot_bits, config.min_marginal_bits),
         TrustTag::Provisional,
-    );
+    )?;
     let (keep_count, park_count, retire_count) = decision_counts(&lens_values);
     Ok(EnsembleCard {
         schema_version: ENSEMBLE_CARD_SCHEMA_VERSION,
@@ -100,6 +102,7 @@ pub fn ensemble_card(
         n_eff,
         sufficient: sufficiency.sufficient,
         deficit_bits: sufficiency.deficit_bits,
+        a37_diversity,
         deficit_proposal: deficit_proposal(&sufficiency, &lens_values),
         sufficiency,
         lenses: lens_values,
@@ -220,7 +223,7 @@ fn lens_estimates(
 ) -> Result<Vec<crate::LogisticProbeReport>> {
     lenses
         .iter()
-        .map(|lens| logistic_probe_mi_multiseed(&lens.vectors, labels, groups))
+        .map(|lens| logistic_probe_mi_multiseed_calibrated(&lens.vectors, labels, groups))
         .collect()
 }
 
@@ -229,7 +232,7 @@ fn estimate_panel(
     labels: &[bool],
     groups: Option<&[String]>,
 ) -> Result<crate::LogisticProbeReport> {
-    logistic_probe_mi_multiseed(&concat_lenses(lenses, None), labels, groups)
+    logistic_probe_mi_multiseed_calibrated(&concat_lenses(lenses, None), labels, groups)
 }
 
 fn estimate_panel_without(

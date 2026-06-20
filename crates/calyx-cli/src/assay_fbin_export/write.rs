@@ -21,6 +21,11 @@ struct FbinSink {
     query_written: usize,
 }
 
+pub(super) fn ensure_fresh_output(args: &Args) -> CliResult {
+    fail_if_exists(&args.out_dir)?;
+    fail_if_exists(&staging_dir(&args.out_dir))
+}
+
 pub(super) fn write_export(
     args: &Args,
     vectors_path: &Path,
@@ -30,8 +35,7 @@ pub(super) fn write_export(
     selected: &[String],
 ) -> CliResult<ExportEvidence> {
     let staging = staging_dir(&args.out_dir);
-    fail_if_exists(&args.out_dir)?;
-    fail_if_exists(&staging)?;
+    ensure_fresh_output(args)?;
     create_parent(&args.out_dir)?;
     fs::create_dir(&staging).map_err(io_error)?;
     let result = write_export_staged(args, vectors_path, scan, meta, bits, selected, &staging);
@@ -244,6 +248,7 @@ fn finish_sinks(
             name: name.clone(),
             lens_id: meta[name].lens_id.clone(),
             weights_sha256: meta[name].weights_sha256.clone(),
+            signal_kind: meta[name].signal_kind.clone(),
             bits_about: bits[name].bits_about,
             dim: dims[name],
             corpus_path: display_final(args, &format!("fbin/{prefix}_corpus.fbin")),
@@ -265,6 +270,7 @@ fn write_plan(path: &Path, timeline_path: &str, lenses: &[LensEvidence]) -> CliR
                 "name": lens.name,
                 "lens_id": lens.lens_id,
                 "weights_sha256": lens.weights_sha256,
+                "signal_kind": lens.signal_kind,
                 "bits_about": lens.bits_about,
                 "vault": lens.vault_path,
                 "queries": lens.queries_path,

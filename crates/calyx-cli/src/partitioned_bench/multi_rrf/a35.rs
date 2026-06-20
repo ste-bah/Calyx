@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use calyx_core::CalyxError;
 use serde_json::{Value, json};
 
-use super::{OpenSlot, Plan};
+use super::{OpenSlot, Plan, report};
+use crate::a35_signal::require_recorded_countable_content_signal_kind;
 use crate::error::{CliError, CliResult};
 
 const MIN_LENSES: usize = 10;
@@ -22,6 +23,12 @@ pub(super) fn validate_plan(plan: &Plan) -> CliResult {
     }
     let mut lens_ids = BTreeSet::new();
     for slot in &plan.slots {
+        let name = slot.name.as_deref().unwrap_or("<unnamed>");
+        require_recorded_countable_content_signal_kind(
+            name,
+            slot.signal_kind.as_deref(),
+            "partitioned-rrf A35 gate",
+        )?;
         let lens_id = required(slot.lens_id.as_deref(), slot.slot, "lens_id")?;
         let weights = required(slot.weights_sha256.as_deref(), slot.slot, "weights_sha256")?;
         if !hex_len(lens_id, 32) {
@@ -78,6 +85,7 @@ pub(super) fn lens_roster(slots: &[OpenSlot]) -> Vec<Value> {
                 "name": slot.spec.name.as_deref(),
                 "lens_id": slot.spec.lens_id.as_deref().expect("A35 validated"),
                 "weights_sha256": slot.spec.weights_sha256.as_deref().expect("A35 validated"),
+                "signal_kind": slot.spec.signal_kind.as_deref().expect("A35 validated"),
             })
         })
         .collect()
@@ -91,6 +99,7 @@ pub(super) fn per_lens_bits(slots: &[OpenSlot]) -> Vec<Value> {
                 "slot": slot.spec.slot,
                 "name": slot.spec.name.as_deref(),
                 "lens_id": slot.spec.lens_id.as_deref().expect("A35 validated"),
+                "signal_kind": slot.spec.signal_kind.as_deref().expect("A35 validated"),
                 "bits_about": slot.spec.bits_about.expect("A35 validated"),
             })
         })
@@ -104,6 +113,11 @@ pub(super) fn fused_result(
 ) -> Value {
     json!({
         "fusion": "rrf",
+        "metric_class": report::METRIC_CLASS,
+        "metric_scope": report::METRIC_SCOPE,
+        "truth_reference_class": report::TRUTH_REFERENCE_CLASS,
+        "valid_real_outcome": false,
+        "grounded_phase_exit_eligible": false,
         "ground_truth_recall_at_k": fused_recall,
         "latency_us": latency_us,
         "sample_fused_top_k": sample_readback
@@ -188,12 +202,80 @@ mod tests {
         validate_plan(&plan).unwrap();
     }
 
+    #[test]
+    fn accepts_deterministic_content_feature_signal_kind() {
+        let mut slots = (0..10).map(slot).collect::<Vec<_>>();
+        slots[3].signal_kind = Some("deterministic_content_feature".to_string());
+        let plan = Plan {
+            timeline: None,
+            slots,
+        };
+
+        validate_plan(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_signal_kind() {
+        let mut slots = (0..10).map(slot).collect::<Vec<_>>();
+        slots[0].signal_kind = None;
+        let plan = Plan {
+            timeline: None,
+            slots,
+        };
+
+        let err = validate_plan(&plan).unwrap_err();
+
+        assert_eq!(err.code(), "CALYX_FSV_A35_SIGNAL_KIND_REQUIRED");
+        assert!(err.message().contains("lens-0"));
+    }
+
+    #[test]
+    fn rejects_legacy_algorithmic_signal_kind() {
+        let mut slots = (0..10).map(slot).collect::<Vec<_>>();
+        slots[3].signal_kind = Some("algorithmic".to_string());
+        let plan = Plan {
+            timeline: None,
+            slots,
+        };
+
+        let err = validate_plan(&plan).unwrap_err();
+
+        assert_eq!(err.code(), "CALYX_FSV_A35_NON_LEARNED_LENS");
+        assert!(err.message().contains("lens-3"));
+    }
+
+    #[test]
+    fn rejects_temporal_sidecar_as_countable_content() {
+        let mut slots = (0..10).map(slot).collect::<Vec<_>>();
+        slots[3].name = Some("temporal-as-of-time-manipulation-sidecar".to_string());
+        slots[3].signal_kind = Some("deterministic_content_feature".to_string());
+        let plan = Plan {
+            timeline: None,
+            slots,
+        };
+
+        let err = validate_plan(&plan).unwrap_err();
+
+        assert_eq!(err.code(), "CALYX_FSV_A35_TEMPORAL_SIDECAR_NOT_CONTENT");
+        assert!(err.message().contains("temporal-as-of"));
+    }
+
+    #[test]
+    fn fused_result_marks_recall_as_ann_correctness_only() {
+        let result = fused_result(Some(0.9), &json!({"p99": 25}), &[]);
+
+        assert_eq!(result["metric_class"], report::METRIC_CLASS);
+        assert_eq!(result["valid_real_outcome"], false);
+        assert_eq!(result["grounded_phase_exit_eligible"], false);
+    }
+
     fn slot(idx: u16) -> PlanSlot {
         PlanSlot {
             slot: idx,
             name: Some(format!("lens-{idx}")),
             lens_id: Some(format!("{:032x}", idx + 1)),
             weights_sha256: Some(format!("{:064x}", idx + 1)),
+            signal_kind: Some("learned_encoder".to_string()),
             bits_about: Some(0.05 + f32::from(idx) * 0.01),
             vault: PathBuf::from(format!("vault-{idx}")),
             queries: PathBuf::from(format!("queries-{idx}.fbin")),

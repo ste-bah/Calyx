@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use calyx_assay::{PanelResourceBudget, admit_lens, logistic_probe_mi};
 
@@ -7,8 +7,8 @@ use super::cost::LensCostMap;
 use super::data::AssayCorpus;
 use super::engine::evaluate_corpus;
 use super::metrics::write_metric_outputs;
-use super::request::AssayBitsRequest;
 use super::selection::compute_signal_density;
+use super::test_support::{request_for, temp_root, write_synthetic_corpus};
 
 const DIM: usize = 16;
 
@@ -78,12 +78,76 @@ fn synthetic_three_lens_admits_real_rejects_redundant() {
     assert!(report.panel.ci_95[0].is_finite());
     assert!(report.panel.ci_95[1].is_finite());
     assert!(report.panel.ci_95[1] >= report.panel.ci_95[0]);
+    assert_eq!(report.panel.estimate_bound, "lower_bound");
+    assert_eq!(
+        report.panel.power_calibration_status.as_deref(),
+        Some("passed")
+    );
+    let panel_recovery = report
+        .panel
+        .power_recovery_ratio
+        .expect("panel power recovery");
+    assert!(panel_recovery >= 0.5, "panel recovery {panel_recovery}");
+    for lens in &report.lenses {
+        assert_eq!(lens.estimate_bound, "lower_bound");
+        assert_eq!(
+            lens.power_calibration_status.as_deref(),
+            Some("passed"),
+            "{}",
+            lens.name
+        );
+        let recovery = lens.power_recovery_ratio.expect("lens power recovery");
+        assert!(recovery >= 0.5, "{} recovery {recovery}", lens.name);
+    }
     assert!(!report.strata.is_empty());
     assert_eq!(report.assay_cf_rows_persisted, 3);
     assert_eq!(report.assay_cf_rows_readback, 3);
     assert!(Path::new(&evidence.abundance_path).exists());
     assert!(Path::new(&evidence.bits_per_lens_path).exists());
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn leaked_anchor_bits_report_is_flagged_but_still_measurable_control() {
+    let root = temp_root("assay-bits-leaked-anchor");
+    let corpus = root.join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    write_synthetic_corpus(&corpus, 200);
+    let manifest_path = corpus.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["anchor_audit"] = serde_json::json!({
+        "anchor_leaks_into_input": true,
+        "trivial_anchor": true,
+        "grounded_gate_eligible": false,
+        "label_recoverable_from_input": true,
+        "reason": "fixture label is recoverable from text"
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let request = request_for(&root);
+    let data = AssayCorpus::load(&request).unwrap();
+
+    let report = evaluate_corpus(&data, &request, None, None).unwrap();
+    let evidence = write_metric_outputs(&request, &report).unwrap();
+
+    assert!(report.anchor_leaks_into_input);
+    assert!(report.trivial_anchor);
+    assert!(!report.grounded_gate_eligible);
+    assert!(
+        report
+            .lenses
+            .iter()
+            .all(|lens| lens.anchor_leaks_into_input)
+    );
+    let readback: serde_json::Value =
+        serde_json::from_slice(&fs::read(&evidence.abundance_path).unwrap()).unwrap();
+    assert_eq!(readback["anchor_audit"]["grounded_gate_eligible"], false);
+    assert_eq!(readback["lenses"][0]["anchor_leaks_into_input"], true);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -392,94 +456,4 @@ fn invalid_cost_rejected() {
             .starts_with("CALYX_FSV_ASSAY_INVALID_COST")
     );
     let _ = fs::remove_dir_all(root);
-}
-
-fn request_for(root: &Path) -> AssayBitsRequest {
-    let metrics = root.join("metrics");
-    AssayBitsRequest {
-        corpus_dir: root.join("corpus"),
-        metrics_dir: metrics.clone(),
-        cf_root: metrics.join("assay_cf"),
-        min_bits: 0.05,
-        max_corr: 0.6,
-        target_class: 0,
-        domain: "ag_news_test".to_string(),
-        cost_json: None,
-        panel_budget_json: None,
-    }
-}
-
-/// Writes a deterministic three-lens fixture (seed=42).
-fn write_synthetic_corpus(dir: &Path, rows: usize) {
-    let seed = 42_u64;
-    let mut lines = String::new();
-    for i in 0..rows {
-        let label = i % 2; // binary anchor class 0 vs 1
-        let is_zero = label == 0;
-        let real_a = lens_real_a(seed, i as u64, is_zero);
-        let redundant: Vec<f32> = real_a
-            .iter()
-            .enumerate()
-            .map(|(d, v)| v + 0.001 * jitter(seed ^ 0xAB, i as u64, d as u64))
-            .collect();
-        let real_b = lens_real_b(seed, i as u64, is_zero);
-        lines.push_str(&format!(
-            "{{\"id\":\"s{i}\",\"split\":\"train\",\"label\":{label},\"lenses\":{{\"real_a\":{},\"real_b\":{},\"redundant\":{}}}}}\n",
-            vec_json(&real_a),
-            vec_json(&real_b),
-            vec_json(&redundant)
-        ));
-    }
-    fs::write(dir.join("vectors.jsonl"), lines).unwrap();
-
-    let manifest = format!(
-        "{{\"dataset\":\"synthetic\",\"embedding_model_id\":\"test-embed\",\"n_samples\":{rows},\"label_counts\":{{\"0\":{half},\"1\":{half}}},\"lenses\":[{{\"name\":\"real_a\",\"redundant\":false}},{{\"name\":\"real_b\",\"redundant\":false}},{{\"name\":\"redundant\",\"redundant\":true}}],\"target_class\":0}}\n",
-        half = rows / 2
-    );
-    fs::write(dir.join("manifest.json"), manifest).unwrap();
-}
-
-fn lens_real_a(seed: u64, i: u64, is_zero: bool) -> Vec<f32> {
-    let offset = if is_zero { 1.0 } else { -1.0 };
-    (0..DIM)
-        .map(|d| {
-            let base = if d < DIM / 2 { offset } else { 0.0 };
-            base + 0.15 * jitter(seed, i, d as u64)
-        })
-        .collect()
-}
-
-fn lens_real_b(seed: u64, i: u64, is_zero: bool) -> Vec<f32> {
-    let offset = if is_zero { -1.0 } else { 1.0 };
-    (0..DIM)
-        .map(|d| {
-            let base = if d >= DIM / 2 { offset } else { 0.0 };
-            base + 0.15 * jitter(seed ^ 0xCD, i, d as u64)
-        })
-        .collect()
-}
-
-/// Deterministic pseudo-random jitter in [-1, 1] from a hashed seed/index/dim.
-fn jitter(seed: u64, i: u64, d: u64) -> f32 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&seed.to_be_bytes());
-    hasher.update(&i.to_be_bytes());
-    hasher.update(&d.to_be_bytes());
-    let bytes = hasher.finalize();
-    let raw = u32::from_be_bytes([
-        bytes.as_bytes()[0],
-        bytes.as_bytes()[1],
-        bytes.as_bytes()[2],
-        bytes.as_bytes()[3],
-    ]);
-    (raw as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn vec_json(values: &[f32]) -> String {
-    let parts: Vec<String> = values.iter().map(|v| format!("{v:.6}")).collect();
-    format!("[{}]", parts.join(","))
-}
-
-fn temp_root(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
 }

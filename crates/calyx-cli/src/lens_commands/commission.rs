@@ -8,6 +8,7 @@ use serde_json::json;
 
 mod artifact;
 mod fastembed;
+mod fastembed_special;
 mod log;
 mod options;
 
@@ -78,8 +79,19 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         CommissionRuntime::OnnxInt8 => {
             CommissionOutput::new(commission_onnx_int8(&flags, &out, &mut log)?)
         }
+        CommissionRuntime::OnnxFp32 => {
+            CommissionOutput::new(commission_onnx_fp32(&flags, &out, &mut log)?)
+        }
         CommissionRuntime::FastembedOnnx => {
             let commissioned = fastembed::commission(&flags, &out, &mut log)?;
+            CommissionOutput::with_dim(commissioned.artifacts, commissioned.dim)
+        }
+        CommissionRuntime::FastembedSparse
+        | CommissionRuntime::FastembedBgem3Dense
+        | CommissionRuntime::FastembedBgem3Sparse
+        | CommissionRuntime::FastembedBgem3Colbert
+        | CommissionRuntime::FastembedReranker => {
+            let commissioned = fastembed_special::commission(&flags, &out, &mut log)?;
             CommissionOutput::with_dim(commissioned.artifacts, commissioned.dim)
         }
     };
@@ -194,23 +206,9 @@ fn commission_onnx_int8(
     out: &Path,
     log: &mut ConversionLog,
 ) -> CliResult<Vec<Artifact>> {
-    let export_dir = out.join("onnx-export");
+    let export_dir = export_onnx(flags, out, log)?;
     let quant_dir = out.join("onnx-int8");
-    fs::create_dir_all(&export_dir)?;
     fs::create_dir_all(&quant_dir)?;
-    run_command(
-        log,
-        "optimum-cli",
-        &[
-            "export",
-            "onnx",
-            "--model",
-            &flags.hf,
-            "--task",
-            "feature-extraction",
-            &export_dir.display().to_string(),
-        ],
-    )?;
     let target_flag = format!("--{}", flags.quant_target);
     run_command(
         log,
@@ -246,6 +244,54 @@ fn commission_onnx_int8(
         export_dir.join("special_tokens_map.json"),
     )?;
     Ok(artifacts)
+}
+
+fn commission_onnx_fp32(
+    flags: &CommissionFlags,
+    out: &Path,
+    log: &mut ConversionLog,
+) -> CliResult<Vec<Artifact>> {
+    let export_dir = export_onnx(flags, out, log)?;
+    let model = find_preferred(&export_dir, &["model.onnx"], "onnx")?;
+    let tokenizer = require_named(&export_dir, "tokenizer.json")?;
+    let config = require_named(&export_dir, "config.json")?;
+    let dim = flags.dim.unwrap_or(read_hidden_size(&config)?);
+    log.event(json!({"event": "onnx_fp32_artifacts_ready", "dim": dim}))?;
+    let mut artifacts = vec![
+        artifact("model", model)?,
+        artifact("tokenizer", tokenizer)?,
+        artifact("config", config)?,
+    ];
+    add_optional(
+        &mut artifacts,
+        "tokenizer_config",
+        export_dir.join("tokenizer_config.json"),
+    )?;
+    add_optional(
+        &mut artifacts,
+        "special_tokens_map",
+        export_dir.join("special_tokens_map.json"),
+    )?;
+    Ok(artifacts)
+}
+
+fn export_onnx(flags: &CommissionFlags, out: &Path, log: &mut ConversionLog) -> CliResult<PathBuf> {
+    let export_dir = out.join("onnx-export");
+    fs::create_dir_all(&export_dir)?;
+    run_command(
+        log,
+        "optimum-cli",
+        &[
+            "export",
+            "onnx",
+            "--model",
+            &flags.hf,
+            "--task",
+            "feature-extraction",
+            &export_dir.display().to_string(),
+        ],
+    )?;
+    Ok(export_dir)
 }
 
 fn write_manifest(
@@ -287,7 +333,7 @@ fn write_manifest(
         artifact_set_sha256: Some(artifact_set_sha256(artifacts)?),
         files: manifest_files(out, artifacts)?,
         pooling: flags.pooling.clone(),
-        norm: flags.norm.clone(),
+        norm: flags.manifest_norm(),
         source_hf_id: flags.hf.clone(),
         endpoint: flags.endpoint_for_manifest(),
         license: flags.license.clone(),
@@ -295,7 +341,7 @@ fn write_manifest(
         quant_default: QuantPolicy::turboquant_default(),
         truncate_dim: None,
         recall_delta: calyx_registry::spec::default_recall_delta(),
-        max_batch: None,
+        max_batch: flags.max_batch,
     };
     let path = out.join(MANIFEST_NAME);
     write_json_file(&path, &manifest)?;

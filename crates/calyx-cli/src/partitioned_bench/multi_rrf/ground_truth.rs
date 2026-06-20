@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::Plan;
+use super::{Plan, report};
 use crate::error::{CliError, CliResult};
 
 const FORMAT: &str = "calyx-partitioned-rrf-ground-truth-v1";
@@ -53,6 +53,8 @@ struct TruthSlot {
     slot: u16,
     lens_id: String,
     weights_sha256: String,
+    #[serde(default)]
+    signal_kind: String,
 }
 
 impl PrecomputedTruth {
@@ -84,6 +86,11 @@ impl PrecomputedTruth {
         let rows = load_rows(&matrix, &ctx)?;
         let source = json!({
             "mode": "precomputed_fused_rrf_i32bin",
+            "metric_class": report::METRIC_CLASS,
+            "metric_scope": report::METRIC_SCOPE,
+            "truth_reference_class": report::TRUTH_REFERENCE_CLASS,
+            "valid_real_outcome": false,
+            "grounded_phase_exit_eligible": false,
             "format": FORMAT,
             "file": ctx.truth_file,
             "file_sha256": truth_sha256,
@@ -144,6 +151,11 @@ pub(super) fn write(rows: &[Vec<u64>], ctx: Context<'_>) -> CliResult<Value> {
     write_atomic(ctx.manifest_file, &manifest_bytes)?;
     Ok(json!({
         "mode": "generated_fused_rrf_i32bin",
+        "metric_class": report::METRIC_CLASS,
+        "metric_scope": report::METRIC_SCOPE,
+        "truth_reference_class": report::TRUTH_REFERENCE_CLASS,
+        "valid_real_outcome": false,
+        "grounded_phase_exit_eligible": false,
         "format": FORMAT,
         "file": ctx.truth_file,
         "file_sha256": truth_sha256,
@@ -305,6 +317,7 @@ fn plan_slots(plan: &Plan) -> Vec<TruthSlot> {
             slot: slot.slot,
             lens_id: slot.lens_id.clone().unwrap_or_default(),
             weights_sha256: slot.weights_sha256.clone().unwrap_or_default(),
+            signal_kind: slot.signal_kind.clone().unwrap_or_default(),
         })
         .collect()
 }
@@ -424,6 +437,9 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.row_ids(0), &[0, 2]);
         assert_eq!(loaded.source()["mode"], "precomputed_fused_rrf_i32bin");
+        assert_eq!(loaded.source()["metric_class"], report::METRIC_CLASS);
+        assert_eq!(loaded.source()["valid_real_outcome"], false);
+        assert_eq!(loaded.source()["grounded_phase_exit_eligible"], false);
 
         write_plan(&plan_path, 2);
         let changed_plan = load_plan(&plan_path).unwrap();
@@ -446,7 +462,7 @@ mod tests {
         let slots = (0..4)
             .map(|idx| {
                 format!(
-                    r#"{{"slot":{idx},"lens_id":"{:032x}","weights_sha256":"{:064x}","bits_about":0.1,"vault":"vault-{idx}","queries":"queries-{idx}.fbin","corpus":"corpus-{idx}.fbin"}}"#,
+                    r#"{{"slot":{idx},"lens_id":"{:032x}","weights_sha256":"{:064x}","signal_kind":"learned_encoder","bits_about":0.1,"vault":"vault-{idx}","queries":"queries-{idx}.fbin","corpus":"corpus-{idx}.fbin"}}"#,
                     idx + offset,
                     idx + offset
                 )

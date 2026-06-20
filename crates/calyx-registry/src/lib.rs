@@ -26,7 +26,8 @@ pub use calyx_core::{Input, Lens};
 pub use commission::{
     CommissionRequest, CommissionedLens, CommissionedLensArtifact, LensForgeFile,
     LensForgeManifest, commission_lens, lens_spec_from_manifest, lens_spec_from_manifest_path,
-    lens_spec_from_manifest_with_license_override, register_commissioned,
+    lens_spec_from_manifest_with_license_override, lens_spec_metadata_from_manifest,
+    lens_spec_metadata_from_manifest_path, register_commissioned,
 };
 pub use compression::{
     CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
@@ -86,13 +87,14 @@ pub use runtime::candle::{
 };
 pub use runtime::external_cmd::ExternalCmdLens;
 pub use runtime::onnx::{
-    OnnxFileSpec, OnnxLens, OnnxModelFiles, OnnxProviderPolicy, PoolingPolicy,
+    FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens, OnnxFileSpec, OnnxLens,
+    OnnxModelFiles, OnnxProviderPolicy, PoolingPolicy,
 };
 pub use runtime::static_lookup::{
     StaticLookupDType, StaticLookupFileSpec, StaticLookupFiles, StaticLookupLens,
 };
 pub use runtime::tei_http::{DEFAULT_TEI_ENDPOINT, TeiHttpLens};
-pub use spec::{LensHealth, LensRuntime, LensSpec};
+pub use spec::{FastembedBgem3Output, LensHealth, LensRuntime, LensSpec};
 pub use swap::{BackfillCandidate, BackfillQueue, SlotSpec, SwapController};
 pub use temporal::{
     DecayFunction, E2RecencyConfig, E2RecencyLens, E3PeriodicConfig, E3PeriodicLens,
