@@ -4,12 +4,12 @@ use calyx_mincut::{betweenness, tarjan_scc};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 
-use crate::grounding_gaps::grounding_gaps_for_members;
+use crate::grounding_gaps::{CALYX_KERNEL_EMPTY, grounding_gaps_for_members};
 use crate::recall_test::RecallTestParams;
 use crate::temporal_kernel::apply_frequency_bonuses;
 use crate::{
     DfvsResult, KernelGraph, KernelGraphParams, LpRoundParams, Result, dfvs_approx,
-    lp_round_kernel_graph, select_kernel_graph,
+    select_kernel_graph,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -124,17 +124,17 @@ fn build_kernel_pipeline_with_adjustment(
     let bet = betweenness(graph)?;
     let mut heuristic = select_kernel_graph(graph, &scc, &bet, anchors, &params.kernel_graph)?;
     adjust_heuristic(&mut heuristic)?;
-    let rounded = lp_round_kernel_graph(&heuristic, &params.lp_round)?;
-    let dfvs = dfvs_approx(&rounded)?;
+    let candidate_graph = heuristic;
+    let dfvs = dfvs_approx(&candidate_graph)?;
     let gap_report = grounding_gaps_for_members(
         &dfvs.members,
         graph,
         anchors,
         params.kernel_graph.max_groundedness_distance,
     )?;
-    let warnings = warnings(&rounded.warnings, &dfvs, &gap_report.gaps);
+    let warnings = warnings(&candidate_graph.warnings, &dfvs, &gap_report.gaps);
     let provenance = estimator_provenance(&dfvs, &warnings);
-    let kernel_graph = rounded.selected.clone();
+    let kernel_graph = candidate_graph.selected.clone();
     let kernel_id = kernel_id(params, &dfvs.members, &kernel_graph);
 
     Ok(Kernel {
@@ -161,7 +161,7 @@ fn groundedness_report(members: &[CxId], unanchored: Vec<CxId>) -> GroundednessR
     let reached = members.len().saturating_sub(unanchored.len());
     GroundednessReport {
         reached_anchor: if members.is_empty() {
-            1.0
+            0.0
         } else {
             reached as f32 / members.len() as f32
         },
@@ -171,7 +171,9 @@ fn groundedness_report(members: &[CxId], unanchored: Vec<CxId>) -> GroundednessR
 
 fn warnings(rounded_warnings: &[String], dfvs: &DfvsResult, unanchored: &[CxId]) -> Vec<String> {
     let mut warnings = rounded_warnings.to_vec();
-    if !dfvs.members.is_empty() && unanchored.len() == dfvs.members.len() {
+    if dfvs.members.is_empty() {
+        warnings.push(format!("{CALYX_KERNEL_EMPTY}: kernel has no members"));
+    } else if unanchored.len() == dfvs.members.len() {
         warnings.push("CALYX_KERNEL_UNGROUNDED: all kernel members are provisional".to_string());
     }
     warnings
@@ -179,6 +181,11 @@ fn warnings(rounded_warnings: &[String], dfvs: &DfvsResult, unanchored: &[CxId])
 
 fn estimator_provenance(dfvs: &DfvsResult, warnings: &[String]) -> String {
     let trust = if warnings
+        .iter()
+        .any(|warning| warning.starts_with(CALYX_KERNEL_EMPTY))
+    {
+        "empty"
+    } else if warnings
         .iter()
         .any(|warning| warning.starts_with("CALYX_KERNEL_UNGROUNDED"))
     {
@@ -212,12 +219,12 @@ fn empty_kernel(params: &KernelParams) -> Kernel {
         members: Vec::new(),
         kernel_graph: Vec::new(),
         groundedness: GroundednessReport {
-            reached_anchor: 1.0,
+            reached_anchor: 0.0,
             unanchored_members: Vec::new(),
         },
         recall: RecallReport::default(),
         built_at_millis: params.built_at_millis,
-        estimator_provenance: "ph32::empty; trust=anchored".to_string(),
-        warnings: Vec::new(),
+        estimator_provenance: "ph32::empty; trust=empty".to_string(),
+        warnings: vec![format!("{CALYX_KERNEL_EMPTY}: kernel has no members")],
     }
 }

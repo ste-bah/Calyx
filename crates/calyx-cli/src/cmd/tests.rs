@@ -160,12 +160,12 @@ fn parse_provenance_ops_commands() {
 }
 
 #[test]
-fn unknown_panel_template_is_usage_error_with_remediation_values() {
+fn unsafe_panel_template_selector_is_usage_error_with_remediation_values() {
     let err = parse(&tokens([
         "create-vault",
         "mydb",
         "--panel-template",
-        "unknown-default",
+        "../unknown-default",
     ]))
     .unwrap_err();
     assert_eq!(err.code(), "CALYX_CLI_USAGE_ERROR");
@@ -368,6 +368,9 @@ impl Subcommand {
                 args.answer_id.clone(),
             ],
             Self::AnnealStatus(args) => vec!["anneal-status".to_string(), args.vault.clone()],
+            Self::RebuildSearchIndex(args) => {
+                vec!["rebuild-search-index".to_string(), args.vault.clone()]
+            }
             Self::ProfileLens(args) => profile_lens_tokens(args),
         }
     }

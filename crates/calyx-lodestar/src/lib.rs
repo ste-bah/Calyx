@@ -34,6 +34,7 @@ pub mod scope_report;
 pub mod spectral_communities;
 pub mod summarize;
 pub mod temporal_kernel;
+pub mod vault_kernel;
 
 pub use aster_bridge::{
     ASTER_ASSOC_METADATA_KEY, AsterAssocMetadata, AsterAssocNodeProps, AsterAssocSnapshot,
@@ -63,7 +64,9 @@ pub use domain_bridges::{
     rank_domain_bridges,
 };
 pub use error::{LodestarError, Result};
-pub use grounding_gaps::{CALYX_KERNEL_UNGROUNDED, GroundingGapReport, grounding_gaps};
+pub use grounding_gaps::{
+    CALYX_KERNEL_EMPTY, CALYX_KERNEL_UNGROUNDED, GroundingGapReport, grounding_gaps,
+};
 pub use hierarchical::{
     HierarchicalKernel, HierarchicalKernelParams, RegionDescriptor, RegionId, RegionStore,
     build_hierarchical_kernel,
@@ -112,7 +115,10 @@ pub use molecular_bridges::{
     ClinicalMolecularSeed, MOLECULAR_BRIDGE_SCHEMA_VERSION, MolecularBridgeCandidate,
     MolecularBridgeParams, MolecularBridgeReport, MolecularEvidenceRow, rank_molecular_bridges,
 };
-pub use multi_scope::{anchors_for_scope, bridges, build_kernel, kernel_answer_scoped};
+pub use multi_scope::{
+    anchors_for_scope, bridges, build_kernel, kernel_answer_scoped,
+    kernel_answer_scoped_with_ledger,
+};
 pub use probe_matrix::{
     PROBE_MATRIX_SCHEMA_VERSION, ProbeFusionMode, ProbeHit, ProbeLength, ProbeLensEmphasis,
     ProbeMatrixLog, ProbeMatrixSpec, ProbePhrasing, ProbeProductivity, ProbeRecord, ProbeRefusal,
@@ -147,14 +153,18 @@ pub use spectral_communities::{
     SpectralCommunitySummary, spectral_community_report,
 };
 pub use summarize::{
-    CALYX_SCOPE_INVALID_TIME_WINDOW, CALYX_SUMMARIZE_INSUFFICIENT_GROUNDING,
-    CALYX_TIMETRAVEL_BEFORE_HORIZON, SUMMARIZE_INVOKED_MARKER, SummarizeCtx, SummarizeParams,
-    SummarizeRecall, SummarizeResult, summarize, summarize_as_of, summarize_with_ledger,
-    summarize_with_recall,
+    CALYX_SCOPE_INVALID_TIME_WINDOW, CALYX_SUMMARIZE_EMPTY_SCOPE,
+    CALYX_SUMMARIZE_INSUFFICIENT_GROUNDING, CALYX_TIMETRAVEL_BEFORE_HORIZON,
+    SUMMARIZE_INVOKED_MARKER, SummarizeCtx, SummarizeParams, SummarizeRecall, SummarizeResult,
+    summarize, summarize_as_of, summarize_with_ledger, summarize_with_recall,
 };
 pub use temporal_kernel::{
     CALYX_LODESTAR_INVALID_FREQUENCY, CALYX_LODESTAR_INVALID_WINDOW,
     CALYX_LODESTAR_MISSING_FREQUENCY, FREQ_BONUS_MAX, FREQ_WEIGHT, FrequencyRead, KernelResult,
     KernelScope, KernelWeight, TimeWindow, active_cxids_in_window, apply_frequency_bonuses,
     frequency_kernel_bonus, kernel_for_window, kernel_for_window_from_graph, kernel_weight_rows,
+};
+
+pub use vault_kernel::{
+    MeasuredVaultKernel, measured_kernel_from_vault, measured_kernel_with_contributions_from_vault,
 };

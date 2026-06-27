@@ -15,7 +15,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use calyx_aster::cf::ColumnFamily;
@@ -87,13 +87,13 @@ struct RebuildSummary {
 }
 
 #[derive(Debug)]
-pub(crate) struct PersistedSearchIndexes {
+pub struct PersistedSearchIndexes {
     vault_dir: PathBuf,
     manifest: SearchIndexManifest,
 }
 
 impl PersistedSearchIndexes {
-    pub(crate) fn open(vault_dir: &Path) -> CliResult<Self> {
+    pub fn open(vault_dir: &Path) -> CliResult<Self> {
         let manifest_path = manifest_path(vault_dir);
         if !manifest_path.is_file() {
             return Err(stale(format!(
@@ -115,7 +115,7 @@ impl PersistedSearchIndexes {
         })
     }
 
-    pub(crate) fn search(
+    pub fn search(
         &self,
         slot: SlotId,
         query: &SlotVector,
@@ -148,7 +148,7 @@ impl PersistedSearchIndexes {
         }
     }
 
-    pub(crate) fn search_filtered(
+    pub fn search_filtered(
         &self,
         slot: SlotId,
         query: &SlotVector,
@@ -187,10 +187,7 @@ impl PersistedSearchIndexes {
         }
     }
 
-    pub(crate) fn filter_candidates(
-        &self,
-        filters: &QueryFilters,
-    ) -> CliResult<Option<BTreeSet<CxId>>> {
+    pub fn filter_candidates(&self, filters: &QueryFilters) -> CliResult<Option<BTreeSet<CxId>>> {
         filter::candidates(
             &self.vault_dir,
             self.manifest.filter.as_ref(),
@@ -199,7 +196,7 @@ impl PersistedSearchIndexes {
         )
     }
 
-    pub(crate) fn max_len(&self) -> usize {
+    pub fn max_len(&self) -> usize {
         self.manifest
             .slots
             .iter()
@@ -351,7 +348,7 @@ impl SearchIndexEntry {
     }
 }
 
-pub(crate) fn rebuild_for_vault(vault_dir: &Path, vault: &AsterVault) -> CliResult {
+pub fn rebuild_for_vault(vault_dir: &Path, vault: &AsterVault) -> CliResult {
     let docs = load_docs(vault)?;
     let summary = rebuild_from_docs(vault_dir, &docs, vault.latest_seq())?;
     let _ = (summary.slots, summary.total_rows, &summary.manifest_path);
@@ -395,7 +392,7 @@ fn rebuild_from_docs(
     })
 }
 
-pub(crate) fn load_docs(vault: &AsterVault) -> CliResult<BTreeMap<CxId, Constellation>> {
+pub fn load_docs(vault: &AsterVault) -> CliResult<BTreeMap<CxId, Constellation>> {
     let snapshot = vault.snapshot();
     let mut docs = BTreeMap::new();
     for (key, _) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
@@ -432,6 +429,76 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> CliResult {
         let _ = fs::remove_file(&tmp);
     })?;
     Ok(())
+}
+
+/// Stream `value` as compact JSON straight to `path` (atomic temp + rename), hashing
+/// the bytes as they pass through. This avoids materializing the whole serialized
+/// sidecar in memory: `to_vec_pretty` over a full multi-vector (ColBERT) corpus builds
+/// a multi-gigabyte buffer and pins one core for many minutes formatting billions of
+/// floats — the post-ingest finalization hang. Returns the lowercase-hex SHA-256 of the
+/// written bytes (computed in the same single pass, no second walk over the buffer).
+fn write_json_atomic_hashed<T: Serialize>(path: &Path, value: &T) -> CliResult<String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let sha256 = {
+        let file = File::create(&tmp)?;
+        let mut writer = HashingWriter::new(BufWriter::new(file));
+        serde_json::to_writer(&mut writer, value).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
+        let (buf_writer, sha256) = writer.into_parts();
+        let file = buf_writer
+            .into_inner()
+            .map_err(|err| CliError::io(format!("flush index sidecar {}: {err}", tmp.display())))?;
+        file.sync_all()?;
+        sha256
+    };
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
+    Ok(sha256)
+}
+
+/// `io::Write` adapter that folds every written byte into a SHA-256 digest as it passes
+/// through to the inner writer, so a sidecar's hash is produced during the streaming
+/// write instead of a separate pass over a fully materialized buffer.
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn into_parts(self) -> (W, String) {
+        let digest = self.hasher.finalize();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        (self.inner, hex)
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn rel(root: &Path, path: &Path) -> CliResult<String> {

@@ -24,6 +24,7 @@ pub const CALYX_SEXTANT_VECTOR_SHAPE: &str = "CALYX_SEXTANT_VECTOR_SHAPE";
 pub const CALYX_SEXTANT_QUERY_SHAPE: &str = "CALYX_SEXTANT_QUERY_SHAPE";
 pub const CALYX_INVALID_ARGUMENT: &str = "CALYX_INVALID_ARGUMENT";
 pub const CALYX_ANSWER_UNGROUNDED: &str = "CALYX_ANSWER_UNGROUNDED";
+pub const CALYX_ANSWER_SYNTHESIS_UNAVAILABLE: &str = "CALYX_ANSWER_SYNTHESIS_UNAVAILABLE";
 pub const CALYX_LENS_NOT_FOUND: &str = "CALYX_LENS_NOT_FOUND";
 pub const CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE: &str = "CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE";
 pub const CALYX_SEXTANT_POSTINGS_CORRUPT: &str = "CALYX_SEXTANT_POSTINGS_CORRUPT";
@@ -34,6 +35,7 @@ pub const CALYX_SEXTANT_CX_MISSING: &str = "CALYX_SEXTANT_CX_MISSING";
 pub const CALYX_SEXTANT_CONSENSUS_INSUFFICIENT_LENSES: &str =
     "CALYX_SEXTANT_CONSENSUS_INSUFFICIENT_LENSES";
 pub const CALYX_SEXTANT_ASSOC_GRAPH_MISSING: &str = "CALYX_SEXTANT_ASSOC_GRAPH_MISSING";
+pub const CALYX_SEXTANT_VECTOR_FUSION_UNWIRED: &str = "CALYX_SEXTANT_VECTOR_FUSION_UNWIRED";
 pub const CALYX_SEXTANT_TRAVERSE_HOPS: &str = "CALYX_SEXTANT_TRAVERSE_HOPS";
 pub const CALYX_SEXTANT_SKILL_UNKNOWN: &str = "CALYX_SEXTANT_SKILL_UNKNOWN";
 pub const CALYX_SEXTANT_SKILL_PARAMS: &str = "CALYX_SEXTANT_SKILL_PARAMS";
@@ -82,6 +84,9 @@ pub fn sextant_error(code: &'static str, message: impl Into<String>) -> CalyxErr
         CALYX_ANSWER_UNGROUNDED => {
             "seed ASK with at least one visible grounded constellation candidate"
         }
+        CALYX_ANSWER_SYNTHESIS_UNAVAILABLE => {
+            "wire a real answer synthesis/oracle implementation before enabling ASK answers"
+        }
         CALYX_LENS_NOT_FOUND => "register or load a visible lens slot for ASK retrieval",
         CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE => {
             "wire a real Forge GPU path before claiming Sextant CPU/GPU parity"
@@ -102,6 +107,9 @@ pub fn sextant_error(code: &'static str, message: impl Into<String>) -> CalyxErr
         }
         CALYX_SEXTANT_ASSOC_GRAPH_MISSING => {
             "set the vault association graph on the engine before traversing"
+        }
+        CALYX_SEXTANT_VECTOR_FUSION_UNWIRED => {
+            "wire PlanStep::VectorFusion to real slot indexes before serving vector fusion"
         }
         CALYX_SEXTANT_TRAVERSE_HOPS => "set traverse hops within 1..=10",
         CALYX_SEXTANT_SKILL_UNKNOWN => "call skills() and use one of the returned skill names",

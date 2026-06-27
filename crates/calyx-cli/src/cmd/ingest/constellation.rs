@@ -2,74 +2,78 @@ use std::collections::BTreeMap;
 
 use calyx_aster::vault::AsterVault;
 use calyx_core::{
-    AbsentReason, Constellation, CxFlags, Input, InputRef, LedgerRef, LensId, Modality, Placement,
-    SlotState, SlotVector,
+    AbsentReason, CalyxError, CalyxErrorCode, Constellation, CxFlags, Input, InputRef, LedgerRef,
+    LensId, Modality, Placement, SlotState, SlotVector,
 };
 use calyx_registry::VaultPanelState;
+pub(crate) use calyx_registry::measure::{absent, input_hash, measure_constellation};
 use rayon::prelude::*;
 
 use crate::error::CliResult;
+use crate::lens_commands::support::runtime_name;
 
-pub(crate) fn measure_constellation(
-    vault: &AsterVault,
+/// Doctrine #1273 rule 3 ("never single — fail hard"): an ingest that leaves
+/// every declared, applicable content lens unmeasured would silently persist a
+/// constellation weaker than the panel promises and yield illusory retrieval
+/// (the search-returns-`[]` footgun). When EVERY content lens for the input
+/// modality is absent we refuse to persist and name each absent slot + reason so
+/// the operator can bind/repair the runtime. Partial degradation still records
+/// the `degraded` flag (full panel-floor enforcement is tracked separately).
+pub(crate) fn ensure_content_panel_floor(
+    cx: &Constellation,
     state: &VaultPanelState,
-    input: Input,
-    now: u64,
-) -> CliResult<Constellation> {
-    let cx_id = vault.cx_id_for_input(&input.bytes, state.panel.version);
-    let mut slots = BTreeMap::new();
-    let mut degraded = false;
+) -> CliResult<()> {
+    let mut declared = 0usize;
+    let mut absent: Vec<String> = Vec::new();
     for slot in &state.panel.slots {
-        let vector = if slot.state != SlotState::Active {
-            absent(AbsentReason::LensInactive)
-        } else if slot.modality != input.modality {
-            absent(AbsentReason::NotApplicable)
-        } else if !state.registry.contains(slot.lens_id) {
-            absent(AbsentReason::LensUnavailable)
-        } else {
-            state.registry.measure(slot.lens_id, &input)?
-        };
-        degraded |= slot.counts_toward_degraded(input.modality) && vector.is_absent();
-        slots.insert(slot.slot_id, vector);
+        if !slot.counts_toward_degraded(cx.modality) {
+            continue;
+        }
+        declared += 1;
+        if let Some(SlotVector::Absent { reason }) = cx.slots.get(&slot.slot_id) {
+            let spec = state.registry.lens_spec(slot.lens_id);
+            let runtime = spec
+                .map(|spec| runtime_name(&spec.runtime))
+                .unwrap_or("unregistered");
+            let spec_name = spec
+                .map(|spec| spec.name.as_str())
+                .unwrap_or("missing_registry_snapshot");
+            absent.push(format!(
+                "slot={} key={} lens={} spec_name={} runtime={} modality={:?} shape={:?} placement={:?} reason={:?}",
+                slot.slot_id.get(),
+                slot.slot_key.key(),
+                slot.lens_id,
+                spec_name,
+                runtime,
+                slot.modality,
+                slot.shape,
+                slot.resource.placement,
+                reason
+            ));
+        }
     }
-    Ok(Constellation {
-        cx_id,
-        vault_id: vault.vault_id(),
-        panel_version: state.panel.version,
-        created_at: now,
-        input_ref: InputRef {
-            hash: input_hash(&input.bytes),
-            pointer: input.pointer,
-            redacted: false,
-        },
-        modality: input.modality,
-        slots,
-        scalars: BTreeMap::new(),
-        metadata: BTreeMap::new(),
-        anchors: Vec::new(),
-        provenance: LedgerRef {
-            seq: vault.latest_seq().saturating_add(1),
-            hash: [0; 32],
-        },
-        flags: CxFlags {
-            ungrounded: true,
-            degraded,
-            novel_region: false,
-            redacted_input: false,
-        },
-    })
+    if declared > 0 && absent.len() == declared {
+        return Err(CalyxError::from_code(
+            CalyxErrorCode::LensUnreachable,
+            format!(
+                "ingest refused for cx {:?}: 0/{} declared content lenses materialized for \
+                 modality {:?} — every content lens is unavailable, so this constellation \
+                 would be silently empty and unsearchable. Bind/repair the lens runtimes \
+                 (calyx add-lens / verify runtime endpoints) and re-ingest. Absent content \
+                 slots: [{}]",
+                cx.cx_id,
+                declared,
+                cx.modality,
+                absent.join("; ")
+            ),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn text_input(text: String) -> Input {
     Input::new(Modality::Text, text.into_bytes())
-}
-
-fn absent(reason: AbsentReason) -> SlotVector {
-    SlotVector::Absent { reason }
-}
-
-fn input_hash(bytes: &[u8]) -> [u8; 32] {
-    *blake3::hash(bytes).as_bytes()
 }
 
 /// Batch-measure a modality-uniform microbatch of inputs through every applicable

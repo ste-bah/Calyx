@@ -12,7 +12,8 @@ path = "src/main.rs"
 
 [features]
 default = []
-cuda = ["calyx-forge/cuda", "calyx-registry/candle-cuda", "calyx-sextant/cuda"]
+cuda = ["calyx-forge/cuda", "calyx-registry/candle-cuda"]
+cuda-sextant = ["cuda", "calyx-sextant/cuda"]
 
 [dependencies]
 calyx-assay = { path = "../calyx-assay" }
@@ -25,6 +26,7 @@ calyx-lodestar = { path = "../calyx-lodestar" }
 calyx-loom = { path = "../calyx-loom" }
 calyx-oracle = { path = "../calyx-oracle" }
 calyx-paths = { path = "../calyx-paths" }
+calyx-search = { path = "../calyx-search" }
 calyx-registry = { path = "../calyx-registry" }
 calyx-sextant = { path = "../calyx-sextant" }
 calyx-ward = { path = "../calyx-ward" }

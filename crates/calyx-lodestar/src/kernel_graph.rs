@@ -38,7 +38,7 @@ impl Default for LpRoundParams {
     fn default() -> Self {
         Self {
             threshold: 0.5,
-            fallback_to_heuristic: true,
+            fallback_to_heuristic: false,
         }
     }
 }
@@ -130,17 +130,14 @@ pub fn groundedness_distance(
 }
 
 pub fn lp_round_kernel_graph(
-    kernel_graph: &KernelGraph,
+    _kernel_graph: &KernelGraph,
     params: &LpRoundParams,
 ) -> Result<KernelGraph> {
     validate_lp_params(params)?;
     if params.fallback_to_heuristic {
-        let mut fallback = kernel_graph.clone();
-        fallback
-            .warnings
-            .push("CALYX_KERNEL_LP_UNAVAILABLE: external LP solver not configured".to_string());
-        fallback.lp_fraction = Some(fallback.source_fraction);
-        return Ok(fallback);
+        return Err(LodestarError::KernelLpUnavailable {
+            detail: "external LP solver not configured; heuristic fallback is disabled".to_string(),
+        });
     }
     Err(LodestarError::KernelLpUnavailable {
         detail: "external LP solver not configured".to_string(),
@@ -160,18 +157,16 @@ pub fn lp_round_kernel_graph_from_solution(
                 detail: "LP solution status is infeasible".to_string(),
             });
         }
-        _ => return lp_round_kernel_graph(kernel_graph, params),
+        other => {
+            return Err(LodestarError::KernelLpUnavailable {
+                detail: format!(
+                    "LP solution status {other:?} is not optimal; heuristic fallback is disabled"
+                ),
+            });
+        }
     }
     let ids: Vec<_> = kernel_graph.graph.node_ids().collect();
-    if solution.values.len() != ids.len() {
-        return Err(LodestarError::KernelInvalidParams {
-            detail: format!(
-                "LP solution has {} values for {} nodes",
-                solution.values.len(),
-                ids.len()
-            ),
-        });
-    }
+    validate_lp_solution_values(solution, ids.len())?;
     let selected: Vec<_> = ids
         .iter()
         .zip(&solution.values)
@@ -193,6 +188,39 @@ pub fn lp_round_kernel_graph_from_solution(
         Some(lp_fraction),
         kernel_graph.warnings.clone(),
     )
+}
+
+fn validate_lp_solution_values(solution: &LpSolution, expected_len: usize) -> Result<()> {
+    if solution.values.len() != expected_len {
+        return Err(LodestarError::KernelInvalidParams {
+            detail: format!(
+                "LP solution has {} values for {} nodes",
+                solution.values.len(),
+                expected_len
+            ),
+        });
+    }
+    if !solution.objective_value.is_finite() {
+        return Err(LodestarError::KernelInvalidParams {
+            detail: format!(
+                "LP solution objective_value must be finite, got {}",
+                solution.objective_value
+            ),
+        });
+    }
+    for (idx, value) in solution.values.iter().copied().enumerate() {
+        if !value.is_finite() {
+            return Err(LodestarError::KernelInvalidParams {
+                detail: format!("LP solution value at index {idx} must be finite, got {value}"),
+            });
+        }
+        if !(0.0..=1.0).contains(&value) {
+            return Err(LodestarError::KernelInvalidParams {
+                detail: format!("LP solution value at index {idx}={value} is outside [0, 1]"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn score_nodes(

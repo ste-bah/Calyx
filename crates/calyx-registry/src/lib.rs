@@ -8,6 +8,7 @@ pub mod explain;
 pub mod frozen;
 pub mod ingest_microbatch;
 pub mod lens;
+pub mod measure;
 pub mod panel_ops;
 pub mod panels;
 pub mod persistence;
@@ -78,7 +79,7 @@ pub use runtime::adapters::{
     CALYX_ALLOW_NONCOMMERCIAL_LENSES_ENV, CALYX_LICENSE_DENIED, MultimodalAdapterLens,
     MultimodalAdapterProvider, MultimodalAdapterSpec, MultimodalAxis, MultimodalLensPackEntry,
     allow_noncommercial_from_env, default_multimodal_lens_specs, ensure_license_allowed,
-    is_non_commercial_license, register_multimodal_lens_pack,
+    is_non_commercial_license, register_multimodal_lens_pack, shutdown_multimodal_gpu_workers,
 };
 pub use runtime::algorithmic::{AlgorithmicEncoder, AlgorithmicLens};
 pub use runtime::candle::{
