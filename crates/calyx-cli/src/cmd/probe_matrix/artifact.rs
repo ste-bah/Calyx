@@ -18,7 +18,7 @@ use crate::cmd::vault::ResolvedVault;
 use crate::error::{CliError, CliResult};
 use crate::fsv_grounding::GroundingAudit;
 
-const PROBE_MATRIX_ARTIFACT_SCHEMA_VERSION: u32 = 6;
+const PROBE_MATRIX_ARTIFACT_SCHEMA_VERSION: u32 = 7;
 const PROBE_MATRIX_INCOMPLETE: &str = "CALYX_PROBE_MATRIX_INCOMPLETE";
 const PROBE_MATRIX_INCOMPLETE_REMEDIATION: &str = "inspect the persisted matrix/progress artifacts, then increase the budget or narrow explicit axes";
 const PROBE_MATRIX_TIMEOUT_REMEDIATION: &str = "inspect the persisted matrix/progress artifacts, then increase --time-budget-ms or narrow explicit axes";
@@ -247,13 +247,10 @@ fn guard_filtered_all_error(
     matrix_path: &Path,
     progress_path: &Path,
 ) -> CliError {
+    // Since #1094, in-region without an operator tau applies the calibrated
+    // Ward guard profile (per-slot conformal taus) — never a flat default.
     let tau_display = guard_tau.map_or_else(
-        || {
-            format!(
-                "{:.6} (uncalibrated default)",
-                calyx_search::DEFAULT_IN_REGION_GUARD_TAU
-            )
-        },
+        || "per-slot calibrated Ward guard profile".to_string(),
         |tau| format!("{tau:.6} (operator-supplied)"),
     );
     let observed = match (

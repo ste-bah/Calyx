@@ -41,7 +41,7 @@ pub(crate) fn usage() -> &'static str {
        calyx measure <vault> --text <s>
        calyx erase <vault> --cx-id <cx_id> [--fsv-out <json>]
        calyx search <vault> <query> [--k <n>] [--fusion <rrf|weighted-rrf|single-lens|kernel-first|pipeline>] [--guard <off|in-region>] [--explain] [--provenance|--no-provenance] [--fresh|--stale-ok] [--filter <json-predicate>] [--resident-addr <127.0.0.1:port>]
-       calyx probe-matrix <vault> --frontier <text> [--slot <u16>] [--weighted-profile <name>] [--phrasing <terse|clinical|mechanistic|analogical|contrast>] [--length <entity|phrase|paragraph>] [--top-k <n>] [--guard <off|in-region>] [--guard-tau <cosine in (0,1]>] [--out <json>] [--resident-addr <127.0.0.1:port>] [--max-variants <n>] [--time-budget-ms <ms>]
+       calyx probe-matrix <vault> --frontier <text> [--slot <u16>] [--weighted-profile <name>] [--phrasing <terse|clinical|mechanistic|analogical|contrast>] [--length <entity|phrase|paragraph>] [--top-k <n>] [--guard <off|in-region>] [--guard-tau <cosine in (0,1]>] [--out <json>] [--resident-addr <127.0.0.1:port>] [--max-variants <n>] [--time-budget-ms <ms>] [--search-miss-budget-ms <ms>] [--search-hit-budget-ms <ms>]
        calyx kernel-answer <vault> <query> [--anchor <kind>] [--explain]
        calyx bits <vault> <anchor-kind> [--explain]
        calyx kernel <vault> [--anchor <kind>] [--rebuild]
@@ -56,6 +56,7 @@ pub(crate) fn usage() -> &'static str {
        calyx reproduce <vault> <answer_id>
        calyx anneal-status <vault>
        calyx healthcheck [--vault <vault>] [--json|--no-json] [--tei <http://host:port[/path]>]
+       calyx build-info
        calyx resource-drill --vault <dir> --ops <n> --value-bytes <n> --memtable-cap <bytes> --pin-max-age-ms <ms>
        calyx migrate vault <sqlite.db> <vault.calyx> [--verify] [--backfill-default-panel] [--offline-backfill] [--batch-size <n>]
        calyx migrate backfill <sqlite.db> <vault.calyx> [--offline-backfill] [--batch-size <n>]

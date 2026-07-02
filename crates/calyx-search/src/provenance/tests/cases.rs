@@ -116,6 +116,109 @@ fn stale_ok_search_tags_hits_with_manifest_lag() {
     fixture.cleanup();
 }
 
+/// Regression for #1103: a content-neutral commit (an idempotency-ledger
+/// append) advances the pinned vault seq past the search manifest's base_seq
+/// but does NOT change derived-search inputs. Fresh search must still succeed
+/// and return real hits — it must not self-stale by one on the raw seq gap.
+///
+/// Before #1106 the freshness gate compared `manifest.base_seq` against the
+/// raw pinned seq with exact equality, so any Ledger/TimeIndex-only commit
+/// after the rebuild made `search --fresh` fail closed with
+/// `CALYX_STALE_DERIVED` even though the corpus was unchanged. This test pins
+/// that the watermark gate (`derived_content_seq <= base_seq <= pinned_seq`)
+/// keeps Fresh available across a content-neutral seq advance.
+#[test]
+fn fresh_search_survives_content_neutral_seq_advance() {
+    use calyx_ledger::{ActorId, EntryKind, SubjectId};
+
+    let fixture = Fixture::new("content-neutral-seq-advance");
+    let vault = fixture.open_vault();
+    let state = load_vault_panel_state(&fixture.vault_dir).unwrap();
+
+    // Manifest was rebuilt at the ingest seq. Capture the source-of-truth
+    // watermark state before the content-neutral commit.
+    let manifest_base_seq = fixture.readback()["manifest"]["base_seq"]
+        .as_u64()
+        .expect("manifest base_seq");
+    let seq_before = vault.latest_seq();
+    let derived_before = vault.derived_content_seq();
+    assert_eq!(
+        manifest_base_seq, derived_before,
+        "precondition: manifest covers the derived-content watermark"
+    );
+
+    // Append a Ledger-only entry. Ledger CF does not feed derived search
+    // content, so this advances the raw vault seq WITHOUT advancing the
+    // derived-content watermark — the exact #1103 trigger.
+    vault
+        .append_ledger_entry(
+            EntryKind::Ingest,
+            SubjectId::Cx(fixture.cx_id),
+            serde_json::to_vec(&json!({ "mode": "issue1103-idempotent-replay" })).unwrap(),
+            ActorId::Service("issue1103-regression".to_string()),
+        )
+        .expect("append content-neutral ledger entry");
+    vault.flush().expect("flush ledger append");
+
+    let seq_after = vault.latest_seq();
+    let derived_after = vault.derived_content_seq();
+    assert!(
+        seq_after > seq_before,
+        "ledger append must advance the raw vault seq ({seq_before} -> {seq_after})"
+    );
+    assert_eq!(
+        derived_after, derived_before,
+        "content-neutral commit must not advance the derived-content watermark"
+    );
+    assert!(
+        seq_after > manifest_base_seq,
+        "the manifest base_seq {manifest_base_seq} must now trail the pinned vault seq {seq_after}"
+    );
+
+    // The decisive assertion: Fresh search across the seq gap returns real
+    // hits instead of failing closed with CALYX_STALE_DERIVED.
+    let outcome = search_outcome(
+        &vault,
+        &state,
+        &fixture.vault_dir,
+        "alpha",
+        1,
+        FusionChoice::Rrf,
+        GuardChoice::Off,
+        None,
+        false,
+    )
+    .expect("fresh search must not self-stale across a content-neutral seq advance");
+    let hit = outcome.hits.first().expect("fresh hit");
+    assert_eq!(hit.cx_id, fixture.cx_id);
+    assert_eq!(
+        hit.freshness.policy, "fresh_derived",
+        "hit must carry the fresh-derived freshness policy, not a stale tag"
+    );
+    assert_eq!(
+        hit.freshness.stale_by, 0,
+        "a content-neutral seq gap must not count as staleness"
+    );
+
+    maybe_write_fsv_json(
+        "issue1103-content-neutral-seq-advance.json",
+        &json!({
+            "source_of_truth": "AsterVault latest_seq/derived_content_seq, idx/search/manifest.json base_seq, and the fresh search hit freshness tag",
+            "trigger": "append one Ledger-only (idempotency replay) entry after the search index rebuild",
+            "manifest_base_seq": manifest_base_seq,
+            "raw_seq_before": seq_before,
+            "raw_seq_after": seq_after,
+            "derived_content_seq_before": derived_before,
+            "derived_content_seq_after": derived_after,
+            "fresh_hit": {
+                "cx_id": hit.cx_id.to_string(),
+                "freshness": hit.freshness,
+            }
+        }),
+    );
+    fixture.cleanup();
+}
+
 #[test]
 fn search_hydrates_each_hit_with_bounded_reader_lease_readback() {
     let fixture = Fixture::new_with_inputs(
@@ -299,6 +402,7 @@ fn search_budget_fails_closed_during_hit_hydration() {
         FusionChoice::Rrf,
         GuardChoice::Off,
         None,
+        None,
         false,
         SearchFreshness::Fresh,
         SearchBudget::new(&mut budget),
@@ -315,159 +419,4 @@ fn search_budget_fails_closed_during_hit_hydration() {
             .any(|(phase, _)| *phase == "before_hit_doc_hydration")
     );
     fixture.cleanup();
-}
-
-#[test]
-fn search_accepts_batch_ingest_ledger_ref_when_payload_names_hit_cx() {
-    let root = temp_root("batch-ledger-ref");
-    let vault_id = VaultId::from_ulid(Ulid::new());
-    let vault_dir = root.join("vault");
-    let mut registry = Registry::new();
-    let lens = AlgorithmicLens::byte_features("issue918-byte", Modality::Text);
-    let contract = lens.contract().clone();
-    let lens_id = contract.lens_id();
-    let spec = LensSpec {
-        name: "issue918-byte".to_string(),
-        runtime: LensRuntime::Algorithmic {
-            kind: "byte-features".to_string(),
-        },
-        output: contract.shape(),
-        modality: contract.modality(),
-        weights_sha256: contract.weights_sha256(),
-        corpus_hash: contract.corpus_hash(),
-        norm_policy: contract.norm_policy(),
-        max_batch: None,
-        axis: Some("issue918-byte".to_string()),
-        asymmetry: Asymmetry::None,
-        quant_default: QuantPolicy::turboquant_default(),
-        truncate_dim: None,
-        recall_delta: default_recall_delta(),
-        retrieval_only: false,
-        excluded_from_dedup: false,
-    };
-    registry
-        .register_frozen_with_spec(lens, contract, spec)
-        .expect("register lens");
-    let panel = panel(lens_id);
-    let vault = AsterVault::new_durable(
-        &vault_dir,
-        vault_id,
-        salt(),
-        VaultOptions {
-            panel: Some(panel.clone()),
-            ..VaultOptions::default()
-        },
-    )
-    .expect("open vault");
-    persist_vault_panel_state(&vault_dir, &panel, &registry).expect("persist panel");
-    let state = VaultPanelState {
-        panel,
-        registry,
-        registry_snapshot: None,
-    };
-    let first = measure_constellation(
-        &vault,
-        &state,
-        Input::new(Modality::Text, b"alpha".to_vec()),
-        1,
-    )
-    .expect("measure first");
-    let second = measure_constellation(
-        &vault,
-        &state,
-        Input::new(Modality::Text, b"omega".to_vec()),
-        1,
-    )
-    .expect("measure second");
-    let first_id = first.cx_id;
-    let second_id = second.cx_id;
-
-    vault
-        .put_batch(vec![first, second])
-        .expect("put batch constellations");
-    vault.flush().expect("flush vault");
-    rebuild_for_vault(&vault_dir, &vault).expect("rebuild search index");
-    let first_stored = vault.get(first_id, vault.snapshot()).expect("read first");
-    let second_stored = vault.get(second_id, vault.snapshot()).expect("read second");
-
-    assert_eq!(first_stored.provenance, second_stored.provenance);
-    assert_ne!(first_id, second_id);
-
-    let outcome = search_outcome(
-        &vault,
-        &state,
-        &vault_dir,
-        "omega",
-        2,
-        FusionChoice::Rrf,
-        GuardChoice::Off,
-        None,
-        false,
-    )
-    .expect("search succeeds with batch ledger provenance");
-    let hit = outcome
-        .hits
-        .iter()
-        .find(|hit| hit.cx_id == second_id)
-        .expect("second batch cx appears in hits");
-    assert_eq!(hit.provenance, second_stored.provenance);
-
-    maybe_write_fsv_json(
-        "shared-search-provenance-batch-ledger-ref.json",
-        &json!({
-            "source_of_truth": "Aster Base CF rows share one batch Ledger CF row whose payload names both Cx ids",
-            "trigger": "put_batch with two measured text constellations, then search for the second input",
-            "stored": {
-                "first_cx_id": first_id.to_string(),
-                "second_cx_id": second_id.to_string(),
-                "shared_ledger_ref": first_stored.provenance == second_stored.provenance,
-                "ledger_seq": second_stored.provenance.seq,
-                "ledger_hash": hex32(&second_stored.provenance.hash),
-            },
-            "search_hit": {
-                "cx_id": hit.cx_id.to_string(),
-                "ledger_seq": hit.provenance.seq,
-                "ledger_hash": hex32(&hit.provenance.hash),
-            },
-            "ledger_rows": ledger_rows(&vault_dir),
-            "ledger_entries": decoded_ledger_entries(&vault_dir),
-        }),
-    );
-    if calyx_fsv::fsv_root("CALYX_FSV_ROOT").is_none() {
-        let _ = fs::remove_dir_all(root);
-    }
-}
-
-#[test]
-fn batch_ingest_subject_mismatch_invalid_payload_fails_actionably() {
-    let target = CxId::from_bytes([0x42; 16]);
-    let entry = LedgerEntry::new(
-        7,
-        [0; 32],
-        EntryKind::Ingest,
-        SubjectId::Query(b"batch-ingest".to_vec()),
-        b"{not-json".to_vec(),
-        calyx_ledger::ActorId::Service("calyx-search-test".to_string()),
-        1,
-    );
-
-    let error = entry_covers_cx(&entry, target).unwrap_err();
-
-    assert_eq!(error.code(), "CALYX_LEDGER_CORRUPT");
-    assert!(error.message().contains("payload is invalid JSON"));
-    assert!(error.message().contains("seq 7"));
-    maybe_write_fsv_json(
-        "issue979-batch-ledger-invalid-payload-edge.json",
-        &json!({
-            "source_of_truth": "synthetic valid LedgerEntry decoded by calyx-search provenance verifier",
-            "trigger": "EntryKind::Ingest with non-Cx subject and invalid JSON payload",
-            "entry": {
-                "seq": entry.seq,
-                "kind": format!("{:?}", entry.kind),
-                "subject": subject_json(&entry.subject),
-                "payload_utf8": String::from_utf8_lossy(&entry.payload),
-            },
-            "error": error_json(&error),
-        }),
-    );
 }

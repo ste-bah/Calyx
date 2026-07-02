@@ -26,10 +26,12 @@ mod diagnostics;
 mod grounding;
 mod guard_summary;
 mod parse;
+mod perf_budget;
 mod persist;
 mod progress;
 mod resident;
 mod runner;
+mod slot_timings;
 mod support;
 mod trace;
 pub(super) use artifact::ProbeMatrixArtifact;
@@ -56,6 +58,8 @@ pub(crate) struct ProbeMatrixArgs {
     pub resident_addr: Option<SocketAddr>,
     pub max_variants: Option<usize>,
     pub time_budget_ms: Option<u64>,
+    pub search_miss_budget_ms: Option<u64>,
+    pub search_hit_budget_ms: Option<u64>,
 }
 
 impl Default for ProbeMatrixArgs {
@@ -74,6 +78,8 @@ impl Default for ProbeMatrixArgs {
             resident_addr: None,
             max_variants: None,
             time_budget_ms: None,
+            search_miss_budget_ms: None,
+            search_hit_budget_ms: None,
         }
     }
 }
@@ -89,7 +95,13 @@ fn probe_read_vault_options(panel: &Panel, guard: GuardChoice) -> VaultOptions {
     let mut selected_cfs = match guard {
         GuardChoice::Off => super::search::base_read_cfs(),
         GuardChoice::InRegion => {
-            super::search::panel_read_cfs(panel).expect("probe panel read cfs are always selected")
+            // Profile-backed guarding (#1094) reads the calibrated Ward
+            // profile from the Guard CF; an unselected CF silently reads as
+            // None, which would masquerade as a missing profile.
+            let mut cfs = super::search::panel_read_cfs(panel)
+                .expect("probe panel read cfs are always selected");
+            cfs.push(ColumnFamily::Guard);
+            cfs
         }
     };
     selected_cfs.push(ColumnFamily::Anchors);
@@ -155,6 +167,7 @@ fn probe_variant(
         fusion_choice(variant),
         ctx.guard,
         ctx.guard_tau,
+        Some(u64::from(ctx.state.panel.version)),
         None,
         false,
         SearchFreshness::Fresh,

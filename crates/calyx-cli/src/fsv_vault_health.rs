@@ -19,6 +19,7 @@ use crate::fsv_grounding::{
     ANCHOR_CF_DRIFT_CODE, GROUNDING_FLAG_DRIFT_CODE, NO_GROUNDED_CANDIDATES_CODE,
 };
 use crate::fsv_vault_health_grounding::check_grounded_candidates;
+use crate::fsv_vault_health_marker::{REBUILD_REQUIRED_CODE, check_search_rebuild_marker};
 use crate::fsv_vault_health_quarantine::{
     QUARANTINE_FILE, QUARANTINED_CODE, check_marker as check_quarantine_marker,
     write_marker as write_quarantine_marker,
@@ -26,7 +27,7 @@ use crate::fsv_vault_health_quarantine::{
 use crate::output::print_json;
 
 pub(crate) const REPORT_SCHEMA: &str = "calyx.fsv.vault_health.v1";
-pub(crate) const SOURCE_OF_TRUTH: &str = "vault CURRENT/MANIFEST, registry snapshot asset, Base/anchors CF grounding rows, idx/search/manifest.json, base_page_index_v1/manifest.json, and fsv_quarantine.json";
+pub(crate) const SOURCE_OF_TRUTH: &str = "vault CURRENT/MANIFEST, registry snapshot asset, Base/anchors CF grounding rows, idx/search/manifest.json, idx/search/rebuild-required.json, base_page_index_v1/manifest.json, and fsv_quarantine.json";
 const UNREADY_CODE: &str = "CALYX_FSV_VAULT_UNREADY";
 const REGISTRY_CONTRACT_DRIFT_CODE: &str = "CALYX_REGISTRY_CONTRACT_DRIFT";
 pub(crate) const REMEDIATION: &str = "repair stale derived indexes with explicit rebuild commands or restore the real missing persisted registry snapshot before using this vault for FSV";
@@ -146,6 +147,7 @@ fn build_report(vault_ref: &str, resolved: &ResolvedVault) -> CliResult<VaultHea
         check_registry_contracts(&resolved.path),
         check_grounded_candidates(resolved),
         check_search_index(&resolved.path, latest_seq_result),
+        check_search_rebuild_marker(&resolved.path),
         check_base_page_index(&resolved.path),
     ];
 
@@ -167,7 +169,12 @@ fn build_report(vault_ref: &str, resolved: &ResolvedVault) -> CliResult<VaultHea
     })
 }
 
-fn open_latest_seq(resolved: &ResolvedVault) -> Result<u64, CliError> {
+struct VaultSeqReadback {
+    latest_seq: u64,
+    derived_content_seq: u64,
+}
+
+fn open_latest_seq(resolved: &ResolvedVault) -> Result<VaultSeqReadback, CliError> {
     let vault = AsterVault::open(
         &resolved.path,
         resolved.vault_id,
@@ -180,7 +187,10 @@ fn open_latest_seq(resolved: &ResolvedVault) -> Result<u64, CliError> {
             ..VaultOptions::default()
         },
     )?;
-    Ok(vault.latest_seq())
+    Ok(VaultSeqReadback {
+        latest_seq: vault.latest_seq(),
+        derived_content_seq: vault.derived_content_seq(),
+    })
 }
 
 fn check_manifest(result: &calyx_core::Result<VaultManifest>) -> VaultHealthCheck {
@@ -250,10 +260,10 @@ fn check_registry_contracts(vault_dir: &Path) -> VaultHealthCheck {
 
 fn check_search_index(
     vault_dir: &Path,
-    latest_seq_result: Result<u64, CliError>,
+    latest_seq_result: Result<VaultSeqReadback, CliError>,
 ) -> VaultHealthCheck {
-    let latest_seq = match latest_seq_result {
-        Ok(seq) => seq,
+    let seqs = match latest_seq_result {
+        Ok(seqs) => seqs,
         Err(error) => {
             return failed_from_cli(
                 "search_index_freshness",
@@ -262,6 +272,7 @@ fn check_search_index(
             );
         }
     };
+    let (latest_seq, derived_content_seq) = (seqs.latest_seq, seqs.derived_content_seq);
     let indexes = match PersistedSearchIndexes::open(vault_dir) {
         Ok(indexes) => indexes,
         Err(error) => {
@@ -276,21 +287,35 @@ fn check_search_index(
         }
     };
     let base_seq = indexes.base_seq();
-    if base_seq == latest_seq {
+    let details = json!({
+        "search_manifest_base_seq": base_seq,
+        "pinned_vault_seq": latest_seq,
+        "derived_content_seq": derived_content_seq,
+    });
+    // Same Fresh doctrine as PersistedSearchIndexes::ensure_fresh_at_snapshot
+    // (issue #1100): fresh iff derived_content_seq <= base_seq <= latest_seq.
+    if derived_content_seq <= base_seq && base_seq <= latest_seq {
         return ok(
             "search_index_freshness",
-            "persistent search index is fresh for the pinned vault sequence",
-            json!({"search_manifest_base_seq": base_seq, "pinned_vault_seq": latest_seq}),
+            "persistent search index covers every derived-content commit at the pinned vault sequence",
+            details,
         );
     }
+    let message = if base_seq > latest_seq {
+        format!(
+            "persistent search manifest base seq {base_seq} is ahead of pinned vault seq {latest_seq}"
+        )
+    } else {
+        format!(
+            "persistent search manifest base seq {base_seq} is behind derived content seq {derived_content_seq} (pinned vault seq {latest_seq})"
+        )
+    };
     failed(
         "search_index_freshness",
         "CALYX_STALE_DERIVED",
-        format!(
-            "persistent search manifest base seq {base_seq} does not match pinned vault seq {latest_seq}"
-        ),
+        message,
         "run `calyx rebuild-search-index <vault>` and rerun vault-health before search or FSV",
-        json!({"search_manifest_base_seq": base_seq, "pinned_vault_seq": latest_seq}),
+        details,
     )
 }
 
@@ -407,7 +432,7 @@ fn manifest_details(manifest: &VaultManifest) -> Value {
 
 fn repair_actions(checks: &[VaultHealthCheck]) -> Vec<String> {
     let mut actions = Vec::new();
-    if has_code(checks, "CALYX_STALE_DERIVED") {
+    if has_code(checks, "CALYX_STALE_DERIVED") || has_code(checks, REBUILD_REQUIRED_CODE) {
         actions.push("run `calyx rebuild-search-index <vault>` and rerun vault-health".to_string());
     }
     if has_code(checks, NO_GROUNDED_CANDIDATES_CODE)

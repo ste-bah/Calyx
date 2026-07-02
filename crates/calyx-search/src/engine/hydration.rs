@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::Arc;
 
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Constellation, CxId};
@@ -9,11 +11,14 @@ use crate::error::CliResult;
 use crate::persisted::PersistedSearchIndexes;
 use crate::provenance::hit_docs_at;
 
+use super::hydration_cache;
 use super::support::{SearchReadSnapshot, index_freshness_tag};
 use super::{SearchBudget, SearchFreshness};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
     vault: &AsterVault,
+    vault_dir: &Path,
     indexes: &PersistedSearchIndexes,
     hits: &[Hit],
     freshness: SearchFreshness,
@@ -24,7 +29,7 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
     if hits.is_empty() {
         budget.check("empty_hit_set", 0)?;
         let read = pin_search_readback(vault, trace, "empty_hit_set", None, 0);
-        let freshness_tag = verify_index_freshness(indexes, read.seq(), freshness, trace)?;
+        let freshness_tag = verify_index_freshness(indexes, &read, freshness, trace)?;
         return Ok((BTreeMap::new(), freshness_tag));
     }
 
@@ -55,7 +60,7 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
         } else {
             expected_seq = Some(read.seq());
         }
-        let tag = verify_index_freshness(indexes, read.seq(), freshness, trace)?;
+        let tag = verify_index_freshness(indexes, &read, freshness, trace)?;
         if freshness_tag.is_none() {
             freshness_tag = Some(tag);
         }
@@ -69,20 +74,47 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
                 read.seq()
             )),
         );
-        let one = hit_docs_at(
-            vault,
-            std::slice::from_ref(hit),
-            read.snapshot(),
+        let slots_key = hit_slots_key(hit);
+        let cached = hydration_cache::cached_doc(
+            vault_dir,
+            hit.cx_id,
+            read.seq(),
             hydrate_hit_slots,
-        )
-        .map_err(|error| contextualize_hit_hydration_error(error, hit, hit_index, &read))?;
-        docs.extend(one);
+            &slots_key,
+        )?;
+        let from_cache = cached.is_some();
+        if let Some(doc) = cached {
+            docs.insert(hit.cx_id, (*doc).clone());
+        } else {
+            let one = hit_docs_at(
+                vault,
+                std::slice::from_ref(hit),
+                read.snapshot(),
+                hydrate_hit_slots,
+            )
+            .map_err(|error| contextualize_hit_hydration_error(error, hit, hit_index, &read))?;
+            if let Some(doc) = one.get(&hit.cx_id) {
+                hydration_cache::store_doc(
+                    vault_dir,
+                    hit.cx_id,
+                    read.seq(),
+                    hydrate_hit_slots,
+                    &slots_key,
+                    Arc::new(doc.clone()),
+                )?;
+            }
+            docs.extend(one);
+        }
         budget.check("after_hit_doc_hydration", hit_index + 1)?;
         trace.emit_detail(
             "hit_doc.hydrate.done",
             None,
             Some(hit_index + 1),
-            Some(format!("cx_id={} snapshot_seq={}", hit.cx_id, read.seq())),
+            Some(format!(
+                "cx_id={} snapshot_seq={} cached={from_cache}",
+                hit.cx_id,
+                read.seq()
+            )),
         );
     }
 
@@ -92,6 +124,19 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
         )
     })?;
     Ok((docs, tag))
+}
+
+fn hit_slots_key(hit: &Hit) -> String {
+    let slots = hit
+        .per_lens
+        .iter()
+        .map(|lens_hit| lens_hit.slot)
+        .collect::<BTreeSet<_>>();
+    slots
+        .iter()
+        .map(|slot| slot.get().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn pin_search_readback<'a>(
@@ -132,26 +177,28 @@ fn pin_search_readback<'a>(
 
 fn verify_index_freshness(
     indexes: &PersistedSearchIndexes,
-    pinned_seq: u64,
+    read: &SearchReadSnapshot<'_>,
     freshness: SearchFreshness,
     trace: &mut SearchTracer<'_>,
 ) -> CliResult<FreshnessTag> {
+    let pinned_seq = read.seq();
+    let derived_content_seq = read.derived_content_seq();
     trace.emit_detail(
         "indexes.freshness.start",
         None,
         None,
         Some(format!(
-            "pinned_seq={pinned_seq} index_base_seq={}",
+            "pinned_seq={pinned_seq} derived_content_seq={derived_content_seq} index_base_seq={}",
             indexes.base_seq()
         )),
     );
-    let freshness_tag = index_freshness_tag(indexes, pinned_seq, freshness)?;
+    let freshness_tag = index_freshness_tag(indexes, pinned_seq, derived_content_seq, freshness)?;
     trace.emit_detail(
         "indexes.freshness.done",
         None,
         None,
         Some(format!(
-            "{} pinned_seq={pinned_seq} index_base_seq={}",
+            "{} pinned_seq={pinned_seq} derived_content_seq={derived_content_seq} index_base_seq={}",
             freshness_tag.policy,
             indexes.base_seq()
         )),
