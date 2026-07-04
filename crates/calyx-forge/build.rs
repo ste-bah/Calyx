@@ -2,8 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const CUDA_PATH_DEFAULT: &str = "/usr/local/cuda-13.3";
-const CUDA_ARCH: &str = "sm_120";
+const CUDA_PATH_DEFAULT: &str = "/usr/local/cuda-13.2";
+const CUDA_ARCH: &str = "sm_86";
 const CUDA_CCBIN_ENV: &str = "FORGE_CUDA_CCBIN";
 
 struct Kernel {
