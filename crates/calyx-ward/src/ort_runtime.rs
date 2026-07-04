@@ -9,7 +9,7 @@ const ORT_DYLIB_PATH: &str = "ORT_DYLIB_PATH";
 pub(crate) fn ensure_dynamic_ort() -> Result<PathBuf, WardError> {
     let path = env::var_os(ORT_DYLIB_PATH).ok_or_else(|| WardError::Runtime {
         reason: format!(
-            "{ORT_DYLIB_PATH} must point to a sm_120-capable ONNX Runtime dynamic library; \
+            "{ORT_DYLIB_PATH} must point to a sm_86-capable ONNX Runtime dynamic library; \
              this build uses ort/load-dynamic and has no bundled ORT fallback"
         ),
     })?;
