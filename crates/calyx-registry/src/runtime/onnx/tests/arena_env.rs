@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::super::fastembed_runtime::execution_providers;
-use super::super::{OnnxProviderPolicy, arena, io_binding};
+use super::super::{OnnxProviderPolicy, arena, io_binding, session};
 
 static ARENA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -41,12 +41,78 @@ fn execution_provider_policy_is_cuda_fail_loud() {
 
 #[test]
 fn execution_provider_policy_can_be_explicit_cpu() {
+    let _lock = arena_env_lock();
     let providers = execution_providers(OnnxProviderPolicy::CpuExplicit).unwrap();
 
     assert_eq!(providers.len(), 1);
     let provider = format!("{:?}", providers[0]);
     assert!(provider.contains("CPU"));
     assert!(!provider.contains("CUDA"));
+}
+
+#[test]
+fn cuda_graph_env_enables_cuda_provider_option() {
+    let _lock = arena_env_lock();
+    unsafe { std::env::set_var("CALYX_ONNX_CUDA_GRAPHS", "1") };
+    assert!(session::configured_cuda_graphs().unwrap());
+    let providers = execution_providers(OnnxProviderPolicy::CudaFailLoud).unwrap();
+    unsafe { std::env::remove_var("CALYX_ONNX_CUDA_GRAPHS") };
+
+    let provider = format!("{:?}", providers[0]);
+    assert!(provider.contains("CUDA"));
+}
+
+#[test]
+fn cuda_graph_env_fails_closed_on_garbage() {
+    let _lock = arena_env_lock();
+    unsafe { std::env::set_var("CALYX_ONNX_CUDA_GRAPHS", "maybe") };
+    let error = execution_providers(OnnxProviderPolicy::CudaFailLoud).unwrap_err();
+    assert_eq!(error.code, "CALYX_ONNX_CUDA_GRAPHS_INVALID");
+    unsafe { std::env::remove_var("CALYX_ONNX_CUDA_GRAPHS") };
+}
+
+#[test]
+fn cuda_graphs_require_gpu_policy_and_io_binding() {
+    let _lock = arena_env_lock();
+    unsafe { std::env::set_var("CALYX_ONNX_CUDA_GRAPHS", "1") };
+    let error = io_binding::OnnxRunPlan::new(OnnxProviderPolicy::CpuExplicit, "cpu-graph-test")
+        .unwrap_err();
+    assert_eq!(error.code, "CALYX_ONNX_CUDA_GRAPHS_CPU_POLICY");
+
+    unsafe { std::env::set_var("CALYX_ONNX_IO_BINDING", "0") };
+    let error = io_binding::OnnxRunPlan::new(OnnxProviderPolicy::CudaFailLoud, "graph-no-bind")
+        .unwrap_err();
+    assert_eq!(error.code, "CALYX_ONNX_CUDA_GRAPHS_IO_BINDING");
+    unsafe { std::env::remove_var("CALYX_ONNX_IO_BINDING") };
+
+    unsafe { std::env::set_var("CALYX_ONNX_ARENA_SHRINK", "always") };
+    let error =
+        io_binding::OnnxRunPlan::new(OnnxProviderPolicy::CudaFailLoud, "graph-shrink").unwrap_err();
+    assert_eq!(error.code, "CALYX_ONNX_CUDA_GRAPHS_ARENA_SHRINK");
+    unsafe { std::env::remove_var("CALYX_ONNX_ARENA_SHRINK") };
+    unsafe { std::env::remove_var("CALYX_ONNX_CUDA_GRAPHS") };
+}
+
+#[test]
+fn green_context_env_fails_closed_on_bad_config() {
+    let _lock = arena_env_lock();
+    unsafe { std::env::set_var("CALYX_ONNX_GREEN_CONTEXT_SMS", "nope") };
+    let error =
+        io_binding::OnnxRunPlan::new(OnnxProviderPolicy::CudaFailLoud, "green-bad").unwrap_err();
+    assert_eq!(error.code, "CALYX_ONNX_GREEN_CONTEXT_SMS_INVALID");
+
+    unsafe { std::env::set_var("CALYX_ONNX_GREEN_CONTEXT_SMS", "8") };
+    let error =
+        io_binding::OnnxRunPlan::new(OnnxProviderPolicy::CpuExplicit, "green-cpu").unwrap_err();
+    assert_eq!(error.code, "CALYX_ONNX_GREEN_CONTEXT_CPU_POLICY");
+
+    unsafe { std::env::set_var("CALYX_ONNX_CUDA_GRAPHS", "1") };
+    let error =
+        io_binding::OnnxRunPlan::new(OnnxProviderPolicy::CudaFailLoud, "green-graph").unwrap_err();
+    assert_eq!(error.code, "CALYX_ONNX_GREEN_CONTEXT_CUDA_GRAPHS");
+
+    unsafe { std::env::remove_var("CALYX_ONNX_CUDA_GRAPHS") };
+    unsafe { std::env::remove_var("CALYX_ONNX_GREEN_CONTEXT_SMS") };
 }
 
 #[test]

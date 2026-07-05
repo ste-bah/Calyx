@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
-use ort::session::Session;
 use ort::value::ValueType;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -11,14 +10,15 @@ use super::colbert_files::fetch_answerai_colbert_files;
 use super::colbert_tokens::multi_rows;
 use super::cuda_guard::CudaDropGuard;
 use super::custom::batch::{TokenBatch, max_tokens_from_config, session_inputs, token_batches};
-use super::io_binding::{OnnxRunPlan, build_session};
+use super::io_binding::OnnxRunPlan;
+use super::session::{ManagedOnnxSession, build_session};
 use super::{OnnxModelFiles, OnnxProviderPolicy, config_invalid};
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::runtime::common::hash_files;
 use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
 
 pub const DEFAULT_ANSWERAI_COLBERT_MODEL: &str = "answerdotai/answerai-colbert-small-v1";
-pub(in crate::runtime::onnx) const DEFAULT_COLBERT_ONNX: &str = "onnx/model_int8.onnx";
+pub(in crate::runtime::onnx) const DEFAULT_COLBERT_ONNX: &str = "onnx/model_fp16.onnx";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OnnxColbertFileSpec {
@@ -45,7 +45,7 @@ pub struct OnnxColbertLens {
 }
 
 struct OnnxColbertRuntime {
-    session: Option<Session>,
+    session: Option<ManagedOnnxSession>,
     run_plan: OnnxRunPlan,
     tokenizer: Tokenizer,
     token_dim: u32,
@@ -277,13 +277,14 @@ impl Lens for OnnxColbertLens {
             .runtime
             .lock()
             .map_err(|_| CalyxError::lens_unreachable("ONNX ColBERT mutex was poisoned"))?;
-        let chunk_size = self.max_batch.unwrap_or(inputs.len()).max(1);
+        let max_batch = super::scoped_max_batch(self.max_batch)?;
+        let chunk_size = max_batch.unwrap_or(inputs.len()).max(1);
         if chunk_size >= inputs.len() {
-            return runtime.measure_batch(self, inputs, self.contract(), self.max_batch);
+            return runtime.measure_batch(self, inputs, self.contract(), max_batch);
         }
         let mut out = Vec::with_capacity(inputs.len());
         for chunk in inputs.chunks(chunk_size) {
-            out.extend(runtime.measure_batch(self, chunk, self.contract(), self.max_batch)?);
+            out.extend(runtime.measure_batch(self, chunk, self.contract(), max_batch)?);
         }
         Ok(out)
     }
@@ -353,10 +354,10 @@ impl OnnxColbertRuntime {
             .session
             .as_mut()
             .ok_or_else(|| CalyxError::lens_unreachable("ONNX ColBERT session is unavailable"))?;
-        let input_tensors = session_inputs(session, batch)?;
+        let input_tensors = session_inputs(session.as_ref(), batch)?;
         let token_dim = self.token_dim as usize;
         self.run_plan.run_extract(
-            session,
+            session.as_mut(),
             input_tensors,
             (batch.batch, batch.seq),
             |outputs| {
@@ -424,7 +425,7 @@ fn validate_config(path: &Path) -> Result<Value> {
     })
 }
 
-fn output_token_dim(session: &Session) -> Result<u32> {
+fn output_token_dim(session: &ort::session::Session) -> Result<u32> {
     let output = session
         .outputs()
         .iter()

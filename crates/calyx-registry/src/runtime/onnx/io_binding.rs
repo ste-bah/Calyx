@@ -19,6 +19,15 @@
 //!   (batch, seq) shape differs from the first bound shape instead of
 //!   rebinding. This is the CUDA-graph-capture precondition; a dynamic batch
 //!   under this mode is a structured error, not a fallback.
+//! - `CALYX_ONNX_CUDA_GRAPHS=1` — enable ORT CUDA Graph capture/replay for
+//!   GPU-policy sessions. This requires I/O binding, and assigns a stable
+//!   `gpu_graph_id` per observed `(batch, seq)` shape. Invalid values or an
+//!   incompatible run plan fail closed. Graph mode disables the default arena
+//!   shrink run option; an explicit non-`off` arena-shrink policy is refused.
+//! - `CALYX_ONNX_GREEN_CONTEXT_SMS=<n>` — opt a GPU-policy session into a CUDA
+//!   green-context user stream with an SM slice of at least `n` SMs and balanced
+//!   work queues. Invalid values, CPU-policy sessions, unsupported builds, or
+//!   `CALYX_ONNX_CUDA_GRAPHS=1` fail closed.
 //! - `CALYX_ONNX_DISABLE_CPU_EP_FALLBACK=1` — additionally set the ORT
 //!   session config that refuses node-level CPU placement at build time.
 //!
@@ -50,14 +59,13 @@ use super::arena::{
 };
 use super::cpu_fallback_audit::{
     AuditMode, audit_from_trace, configured_audit_mode, configured_max_cpu_fraction,
-    profiling_file_path,
+};
+use super::cuda_graphs::{CUDA_GRAPHS_ENV, CudaGraphRunConfig, CudaGraphRunRequest};
+use super::session::{
+    IO_BINDING_ENV, REQUIRE_STATIC_BINDING_ENV, configured_cuda_device, configured_cuda_graphs,
+    cpu_ep_fallback_disabled, env_flag,
 };
 use super::{OnnxProviderPolicy, config_invalid};
-
-pub(super) const CUDA_DEVICE_ENV: &str = "CALYX_ONNX_CUDA_DEVICE";
-pub(super) const IO_BINDING_ENV: &str = "CALYX_ONNX_IO_BINDING";
-pub(super) const REQUIRE_STATIC_BINDING_ENV: &str = "CALYX_ONNX_REQUIRE_STATIC_BINDING";
-pub(super) const DISABLE_CPU_EP_FALLBACK_ENV: &str = "CALYX_ONNX_DISABLE_CPU_EP_FALLBACK";
 
 /// Per-runtime run plan: which device, whether I/O binding is active, and the
 /// static-shape contract state.
@@ -68,6 +76,7 @@ pub(super) struct OnnxRunPlan {
     gpu_policy: bool,
     device_id: i32,
     require_static: bool,
+    cuda_graphs: CudaGraphRunConfig,
     arena_shrink: ArenaShrinkPolicy,
     max_distinct_shapes: usize,
     audit_mode: AuditMode,
@@ -75,87 +84,6 @@ pub(super) struct OnnxRunPlan {
     audited: bool,
     bound_shape: Option<(usize, usize)>,
     seen_shapes: BTreeSet<(usize, usize)>,
-}
-
-/// CUDA device ordinal from the environment; fails closed on garbage input.
-pub(super) fn configured_cuda_device() -> Result<i32> {
-    let Ok(raw) = std::env::var(CUDA_DEVICE_ENV) else {
-        return Ok(0);
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(0);
-    }
-    raw.parse::<i32>()
-        .ok()
-        .filter(|device| *device >= 0)
-        .ok_or_else(|| CalyxError {
-            code: "CALYX_ONNX_CUDA_DEVICE_INVALID",
-            message: format!("{CUDA_DEVICE_ENV}={raw} is not a non-negative CUDA device ordinal"),
-            remediation: "set CALYX_ONNX_CUDA_DEVICE to the integer ordinal reported by nvidia-smi, or unset it for device 0",
-        })
-}
-
-pub(super) fn cpu_ep_fallback_disabled() -> bool {
-    env_flag(DISABLE_CPU_EP_FALLBACK_ENV)
-}
-
-/// Shared session build for the Calyx-owned ONNX runtimes: device-aware
-/// provider registration (fail-loud, no CPU EP in the GPU list) plus the
-/// optional ORT-level refusal of node-level CPU placement.
-pub(super) fn build_session(
-    label: &str,
-    model_file: &std::path::Path,
-    policy: OnnxProviderPolicy,
-) -> Result<Session> {
-    let device_id = configured_cuda_device()?;
-    let mut builder = Session::builder()
-        .map_err(|err| config_invalid(format!("ONNX session builder failed: {err}")))?
-        .with_intra_threads(1)
-        .map_err(|err| config_invalid(format!("ONNX intra-thread config failed: {err}")))?
-        .with_execution_providers(super::fastembed_runtime::execution_providers_on_device(
-            policy, device_id,
-        )?)
-        .map_err(|err| {
-            config_invalid(format!(
-                "ONNX provider config failed for {label} (policy={} device_id={device_id}): {err}",
-                policy.as_str()
-            ))
-        })?;
-    if cpu_ep_fallback_disabled() {
-        builder = builder
-            .with_config_entry("session.disable_cpu_ep_fallback", "1")
-            .map_err(|err| {
-                config_invalid(format!(
-                    "ONNX disable_cpu_ep_fallback config failed for {label}: {err}"
-                ))
-            })?;
-    }
-    // #1142: enable ORT profiling so the first run can be audited for per-node
-    // CPU fallback. Off by default, so the hot path pays nothing unless the
-    // operator opts in via CALYX_ONNX_CPU_FALLBACK_AUDIT.
-    if configured_audit_mode()?.enabled() {
-        builder = builder
-            .with_profiling(profiling_file_path(label))
-            .map_err(|err| {
-                config_invalid(format!("ONNX profiling enable failed for {label}: {err}"))
-            })?;
-    }
-    builder.commit_from_file(model_file).map_err(|err| {
-        config_invalid(format!(
-            "load ONNX model failed for {label} (policy={} device_id={device_id}): {err}",
-            policy.as_str()
-        ))
-    })
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|raw| {
-            let raw = raw.trim();
-            raw == "1" || raw.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false)
 }
 
 impl OnnxRunPlan {
@@ -174,14 +102,38 @@ impl OnnxRunPlan {
         let gpu_policy = matches!(policy, OnnxProviderPolicy::CudaFailLoud);
         let io_binding = gpu_policy && !binding_env_off;
         let require_static = env_flag(REQUIRE_STATIC_BINDING_ENV);
-        let arena_shrink = configured_arena_shrink()?;
+        let cuda_graphs = configured_cuda_graphs()?;
+        let green_context_sms = super::green_context::configured_green_context_sms()?;
+        super::green_context::validate_run_plan(policy, cuda_graphs)?;
+        if cuda_graphs && !gpu_policy {
+            return Err(CalyxError {
+                code: "CALYX_ONNX_CUDA_GRAPHS_CPU_POLICY",
+                message: format!(
+                    "{CUDA_GRAPHS_ENV}=1 was requested for CPU-policy ONNX session {label}"
+                ),
+                remediation: "enable CUDA graphs only on CudaFailLoud sessions, or unset CALYX_ONNX_CUDA_GRAPHS for CPU sessions",
+            });
+        }
+        if cuda_graphs && !io_binding {
+            return Err(CalyxError {
+                code: "CALYX_ONNX_CUDA_GRAPHS_IO_BINDING",
+                message: format!(
+                    "{CUDA_GRAPHS_ENV}=1 requires I/O binding for {label}, but {IO_BINDING_ENV} disabled it"
+                ),
+                remediation: "unset CALYX_ONNX_IO_BINDING or set it to 1 before enabling CUDA graphs",
+            });
+        }
+        let arena_shrink =
+            super::cuda_graphs::compatible_arena_shrink(cuda_graphs, configured_arena_shrink()?)?;
         let max_distinct_shapes = configured_max_distinct_shapes()?;
         let mem_limit = configured_gpu_mem_limit()?;
         let audit_mode = configured_audit_mode()?;
         let max_cpu_fraction = configured_max_cpu_fraction()?;
         let (allocator, cpu_fallback) = if gpu_policy {
             (
-                if io_binding {
+                if cuda_graphs {
+                    "cuda_graph_static_device_io"
+                } else if io_binding {
                     "cuda_input_bind_pinned_output"
                 } else {
                     "ort_default_device_arena"
@@ -192,8 +144,11 @@ impl OnnxRunPlan {
             ("host", "cpu_explicit_policy")
         };
         eprintln!(
-            "CALYX_ONNX_RUNTIME phase=session_ready label={label} provider={} device_id={device_id} io_binding={io_binding} io_binding_env_off={binding_env_off} allocator={allocator} cpu_fallback={cpu_fallback} require_static_binding={require_static} disable_cpu_ep_fallback={} arena_extend=same_as_requested gpu_mem_limit_mib={} arena_shrink={} max_distinct_shapes={max_distinct_shapes} cpu_fallback_audit={} max_cpu_node_fraction={max_cpu_fraction:.4}",
+            "CALYX_ONNX_RUNTIME phase=session_ready label={label} provider={} device_id={device_id} io_binding={io_binding} io_binding_env_off={binding_env_off} allocator={allocator} cpu_fallback={cpu_fallback} require_static_binding={require_static} cuda_graphs={cuda_graphs} green_context_sms={} disable_cpu_ep_fallback={} arena_extend=same_as_requested gpu_mem_limit_mib={} arena_shrink={} max_distinct_shapes={max_distinct_shapes} cpu_fallback_audit={} max_cpu_node_fraction={max_cpu_fraction:.4}",
             policy.as_str(),
+            green_context_sms
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "off".to_string()),
             cpu_ep_fallback_disabled(),
             mem_limit
                 .map(|bytes| (bytes / (1024 * 1024)).to_string())
@@ -207,6 +162,7 @@ impl OnnxRunPlan {
             gpu_policy,
             device_id,
             require_static,
+            cuda_graphs: CudaGraphRunConfig::new(cuda_graphs),
             arena_shrink,
             max_distinct_shapes,
             audit_mode,
@@ -227,14 +183,18 @@ impl OnnxRunPlan {
     /// Arena shrinkage request for this run, per policy: reclaim the device
     /// arena's transient over-extension after first-seen shapes (`new-shape`),
     /// after every run (`always`), or never (`off`). Logged whenever active.
-    fn shrink_options(&self, new_shape: bool) -> Result<Option<RunOptions>> {
+    fn run_options(
+        &mut self,
+        shape: (usize, usize),
+        new_shape: bool,
+    ) -> Result<Option<RunOptions>> {
         let shrink = self.gpu_policy
             && match self.arena_shrink {
                 ArenaShrinkPolicy::Off => false,
                 ArenaShrinkPolicy::NewShape => new_shape,
                 ArenaShrinkPolicy::Always => true,
             };
-        if !shrink {
+        if !shrink && !self.cuda_graphs.enabled() {
             return Ok(None);
         }
         let mut options = RunOptions::new().map_err(|err| {
@@ -243,21 +203,25 @@ impl OnnxRunPlan {
                 self.label
             ))
         })?;
-        options
-            .add_config_entry(ARENA_SHRINKAGE_RUN_KEY, format!("gpu:{}", self.device_id))
-            .map_err(|err| {
-                config_invalid(format!(
-                    "ONNX arena shrinkage config failed for {}: {err}",
-                    self.label
-                ))
-            })?;
-        eprintln!(
-            "CALYX_ONNX_RUNTIME phase=arena_shrink label={} device_id={} policy={} distinct_shapes={}",
-            self.label,
-            self.device_id,
-            self.arena_shrink.as_str(),
-            self.seen_shapes.len()
-        );
+        if shrink {
+            options
+                .add_config_entry(ARENA_SHRINKAGE_RUN_KEY, format!("gpu:{}", self.device_id))
+                .map_err(|err| {
+                    config_invalid(format!(
+                        "ONNX arena shrinkage config failed for {}: {err}",
+                        self.label
+                    ))
+                })?;
+            eprintln!(
+                "CALYX_ONNX_RUNTIME phase=arena_shrink label={} device_id={} policy={} distinct_shapes={}",
+                self.label,
+                self.device_id,
+                self.arena_shrink.as_str(),
+                self.seen_shapes.len()
+            );
+        }
+        self.cuda_graphs
+            .add_run_options(&mut options, &self.label, shape, new_shape)?;
         Ok(Some(options))
     }
 
@@ -271,7 +235,7 @@ impl OnnxRunPlan {
         extract: impl FnOnce(&SessionOutputs<'_>) -> Result<R>,
     ) -> Result<R> {
         let new_shape = self.enforce_shape_contract(shape)?;
-        let run_options = self.shrink_options(new_shape)?;
+        let run_options = self.run_options(shape, new_shape)?;
         if !self.io_binding {
             let named: Vec<(String, SessionInputValue<'_>)> = inputs
                 .into_iter()
@@ -292,6 +256,21 @@ impl OnnxRunPlan {
             .iter()
             .map(|output| output.name().to_string())
             .collect();
+        if self.cuda_graphs.enabled() {
+            let result = self.cuda_graphs.run_extract(
+                session,
+                CudaGraphRunRequest {
+                    label: &self.label,
+                    device_id: self.device_id,
+                    shape,
+                    options: run_options.as_ref(),
+                },
+                inputs,
+                extract,
+            )?;
+            self.audit_placement_once(session)?;
+            return Ok(result);
+        }
         let mut binding = session.create_binding().map_err(|err| {
             config_invalid(format!(
                 "ONNX io-binding create failed for {}: {err}",
