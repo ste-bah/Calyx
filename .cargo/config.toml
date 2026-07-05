@@ -6,3 +6,15 @@
 
 [term]
 color = "auto"
+
+# CUDA build environment. NOTE: these are machine-specific absolute paths and
+# contradict the header warning above; added here at the maintainer's explicit
+# request so `cargo build --features cuda` works without per-shell env setup.
+# Adjust the CUDA version and MSVC toolset version to match each machine.
+# Cargo precedence is CLI > env > config, so an env var set in the shell still
+# wins over these defaults.
+[env]
+CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
+NVCC_CCBIN = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64"
+FORGE_CUDA_CCBIN = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64"
+CL = "/Zc:preprocessor"

@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const CUDA_PATH_DEFAULT: &str = "/usr/local/cuda-13.3";
-const CUDA_ARCH: &str = "sm_120";
+const CUDA_ARCH_DEFAULT: &str = "sm_89";
+const CUDA_ARCH_ENV: &str = "FORGE_CUDA_ARCH";
 const CUDA_CCBIN_ENV: &str = "FORGE_CUDA_CCBIN";
 
 struct Kernel {
@@ -47,8 +48,10 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed={CUDA_CCBIN_ENV}");
+    println!("cargo:rerun-if-env-changed={CUDA_ARCH_ENV}");
     let nvcc = locate_nvcc();
     let host_compiler = locate_cuda_host_compiler();
+    let cuda_arch = cuda_arch();
     warn_nvcc_version(&nvcc);
 
     for kernel in KERNELS {
@@ -59,8 +62,8 @@ fn main() {
         let ptx = kernel_out_dir.join(format!("{}.ptx", kernel.name));
         let cubin = kernel_out_dir.join(format!("{}.cubin", kernel.name));
 
-        compile_ptx(&nvcc, host_compiler.as_deref(), &src, &ptx);
-        compile_cubin(&nvcc, host_compiler.as_deref(), &src, &cubin);
+        compile_ptx(&nvcc, host_compiler.as_deref(), &cuda_arch, &src, &ptx);
+        compile_cubin(&nvcc, host_compiler.as_deref(), &cuda_arch, &src, &cubin);
 
         println!("cargo:rustc-env={}={}", kernel.ptx_env, ptx.display());
         println!("cargo:rustc-env={}={}", kernel.cubin_env, cubin.display());
@@ -69,6 +72,10 @@ fn main() {
 
 fn cuda_feature_enabled() -> bool {
     cfg!(feature = "cuda") || env::var_os("CARGO_FEATURE_CUDA").is_some()
+}
+
+fn cuda_arch() -> String {
+    env::var(CUDA_ARCH_ENV).unwrap_or_else(|_| CUDA_ARCH_DEFAULT.to_string())
 }
 
 fn locate_nvcc() -> PathBuf {
@@ -230,8 +237,8 @@ fn warn_nvcc_version(nvcc: &Path) {
     println!("cargo:warning=nvcc detected: {summary}");
 }
 
-fn compile_ptx(nvcc: &Path, host_compiler: Option<&Path>, src: &Path, out: &Path) {
-    let args = deterministic_args(src, out, "--ptx", host_compiler);
+fn compile_ptx(nvcc: &Path, host_compiler: Option<&Path>, arch: &str, src: &Path, out: &Path) {
+    let args = deterministic_args(src, out, "--ptx", host_compiler, arch);
     let output = Command::new(nvcc)
         .args(&args)
         .output()
@@ -239,8 +246,8 @@ fn compile_ptx(nvcc: &Path, host_compiler: Option<&Path>, src: &Path, out: &Path
     assert_success(nvcc, &args, output);
 }
 
-fn compile_cubin(nvcc: &Path, host_compiler: Option<&Path>, src: &Path, out: &Path) {
-    let args = deterministic_args(src, out, "-cubin", host_compiler);
+fn compile_cubin(nvcc: &Path, host_compiler: Option<&Path>, arch: &str, src: &Path, out: &Path) {
+    let args = deterministic_args(src, out, "-cubin", host_compiler, arch);
     let output = Command::new(nvcc)
         .args(&args)
         .output()
@@ -253,9 +260,10 @@ fn deterministic_args(
     out: &Path,
     output_kind: &str,
     host_compiler: Option<&Path>,
+    arch: &str,
 ) -> Vec<String> {
     let mut args = vec![
-        format!("-arch={CUDA_ARCH}"),
+        format!("-arch={arch}"),
         "-O3".to_string(),
         "--ftz=false".to_string(),
         "--prec-div=true".to_string(),
