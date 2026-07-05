@@ -1,5 +1,6 @@
 //! Calyx command-line entry point.
 mod a35_signal;
+mod a37_admission_store;
 mod anneal_ab_log;
 mod anneal_autotune_report;
 mod anneal_bandit_readback;
@@ -84,6 +85,7 @@ mod oracle_sufficiency_validation;
 mod output;
 mod panel_commands;
 mod partitioned_bench;
+mod partitioned_rrf_report_store;
 mod path_identity;
 mod ph42_readback;
 mod provenance;
