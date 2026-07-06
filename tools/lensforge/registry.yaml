@@ -32,20 +32,13 @@ models:
     license: mit
     max_batch: 64
 
-  - name: audio-wav2vec2-base-960h
-    hf_id: Xenova/wav2vec2-base-960h
-    modality: audio
-    formats: [onnx-int8]
-    pooling: mean
-    norm: finite
-
   - name: image-siglip2-b16-adapter
     hf_id: google/siglip2-base-patch16-224
     modality: image
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 768
     license: apache-2.0
 
   - name: audio-clap-htsat-adapter
@@ -54,7 +47,7 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 512
     license: apache-2.0
 
   - name: protein-esm2-t6-8m-adapter
@@ -63,7 +56,7 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 320
     license: mit
 
   - name: dna-dnabert2-117m-adapter
@@ -72,7 +65,7 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 768
     license: apache-2.0
 
   - name: molecule-chemberta-zinc-adapter
@@ -81,5 +74,5 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 768
     license: mit

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use calyx_core::{
     Asymmetry, CalyxError, CxId, LensId, Modality, Panel, QuantPolicy, Result, Slot, SlotId,
-    SlotKey, SlotShape, SlotState, Ts,
+    SlotKey, SlotResource, SlotShape, SlotState, Ts,
 };
 use serde::{Deserialize, Serialize};
 
@@ -198,6 +198,24 @@ impl SwapController {
             },
             queued,
         })
+    }
+
+    /// Overwrite the resource (measured cost + GPU/CPU placement) of an existing
+    /// slot. `add_lens` admits slots with a default (`Cpu`) resource because the
+    /// registry layer is GPU-agnostic; the CLI computes the real placement from
+    /// the live VRAM budget and stores it here, so `panel resident serve` and the
+    /// measure scheduler see the correct GPU/CPU split.
+    pub fn set_slot_resource(&mut self, slot_id: SlotId, resource: SlotResource) -> Result<()> {
+        let slot = self
+            .panel
+            .slots
+            .iter_mut()
+            .find(|slot| slot.slot_id == slot_id)
+            .ok_or_else(|| {
+                CalyxError::lens_frozen_violation(format!("slot {slot_id} is not in panel"))
+            })?;
+        slot.resource = resource;
+        Ok(())
     }
 
     pub fn add_lens_durable<I>(

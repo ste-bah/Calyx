@@ -49,6 +49,26 @@ pub(super) fn placement_budget_from_catalog(catalog: &LensCatalog) -> CliResult<
     })
 }
 
+/// Build a placement budget from explicit vault residency (rather than the
+/// global catalog), so `add-lens` can compute a slot's GPU/CPU placement against
+/// what the target vault already holds resident.
+pub(super) fn placement_budget_from_usage(
+    gpu_vram_allocated_bytes: u64,
+    ram_used_bytes: u64,
+    cpu_resident_count: usize,
+) -> CliResult<PlacementBudget> {
+    let (vram_soft_cap_bytes, tei_reserved_bytes) = resolve_gpu_vram_budget()?;
+    Ok(PlacementBudget {
+        vram_soft_cap_bytes,
+        tei_reserved_bytes,
+        vram_allocated_bytes: gpu_vram_allocated_bytes,
+        ram_soft_cap_bytes: env_u64("CALYX_PANEL_RAM_SOFT_CAP_BYTES", 121 * gib())?,
+        ram_used_bytes,
+        cpu_resident_limit: env_usize("CALYX_CPU_LENS_POOL_CAP", 128)?,
+        cpu_resident_count,
+    })
+}
+
 fn resolve_gpu_vram_budget() -> CliResult<(u64, u64)> {
     let cap_override = env_opt_u64("CALYX_PANEL_VRAM_SOFT_CAP_BYTES")?;
     let tei_override = env_opt_u64("CALYX_TEI_RESERVED_BYTES")?;
