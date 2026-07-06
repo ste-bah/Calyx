@@ -206,8 +206,14 @@ fn candle_contract(
     let dim = dense_hidden_size(config, "candle")?;
     let precision = CandlePrecision::parse(dtype)?;
     let pooling = CandlePoolingPolicy::parse(pooling)?;
+    // Must mirror CandleLens::from_files exactly: the runtime loads reduced
+    // precision with an F32 finite-replay model (needs_f32_finite_replay under
+    // the CudaFailLoud policy from_lens_spec always uses), so its corpus hash
+    // records "f32" for f16/bf16 weights — never the raw precision. Recording
+    // the raw precision here made every f16 candle lens registered from a
+    // manifest disagree with its runtime LensId (frozen-contract drift).
     let finite_replay_text = match precision {
-        CandlePrecision::F16 | CandlePrecision::BF16 => precision.as_str(),
+        CandlePrecision::F16 | CandlePrecision::BF16 => CandlePrecision::F32.as_str(),
         CandlePrecision::F32 => "none",
     };
     let max_tokens = DEFAULT_MAX_TOKENS.to_string();

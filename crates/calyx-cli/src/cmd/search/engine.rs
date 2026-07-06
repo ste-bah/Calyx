@@ -3,7 +3,7 @@
 //! All search logic (index load, recall, fusion, provenance, guard) lives in
 //! `calyx-search` so the CLI and `calyx-web-api` share ONE path (#573).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Instant;
@@ -16,7 +16,8 @@ use calyx_core::{
 use calyx_registry::{VaultPanelState, load_vault_panel_state, require_vault_registry_contracts};
 use calyx_search::{
     FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchTraceEvent, load_docs,
-    search_outcome_with_freshness, search_outcome_with_query_vectors_freshness,
+    measure_query_vectors_with_slots, search_outcome_with_freshness,
+    search_outcome_with_query_vectors_freshness,
 };
 use calyx_sextant::Hit;
 
@@ -177,7 +178,16 @@ fn measure_search_query_vectors_via_resident(
     }
 
     let mut out = Vec::new();
+    // The GPU resident service only serves Gpu-placed slots (it refuses CPU
+    // content lenses at startup), so CPU-placed text slots — static lookups and
+    // algorithmic lenses — are measured locally below, mirroring the hybrid
+    // split the ingest measure path already uses (GPU via resident, CPU local).
+    let mut cpu_slots: BTreeSet<SlotId> = BTreeSet::new();
     for slot in active_registered_text_slots(state) {
+        if slot.resource.placement == Placement::Cpu {
+            cpu_slots.insert(slot.slot_id);
+            continue;
+        }
         let returned = row
             .slots
             .iter()
@@ -230,8 +240,13 @@ fn measure_search_query_vectors_via_resident(
         snapshot.contract.verify_vector(slot.lens_id, &vector)?;
         out.push((slot.slot_id, vector));
     }
+    let cpu_slot_count = cpu_slots.len();
+    if !cpu_slots.is_empty() {
+        let local = measure_query_vectors_with_slots(state, query, Some(&cpu_slots))?;
+        out.extend(local);
+    }
     eprintln!(
-        "CALYX_SEARCH_RUNTIME phase=search_resident_service_ok addr={} process_id={} template_source={} inputs=1 slots={} elapsed_ms={} resident_elapsed_ms={} protocol=binary request_bytes={} response_bytes={}",
+        "CALYX_SEARCH_RUNTIME phase=search_resident_service_ok addr={} process_id={} template_source={} inputs=1 slots={} local_cpu_slots={cpu_slot_count} elapsed_ms={} resident_elapsed_ms={} protocol=binary request_bytes={} response_bytes={}",
         addr,
         response.process_id,
         response.template_source,

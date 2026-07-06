@@ -149,7 +149,14 @@ fn load_vault_resident_warm_state(
         record.lens_count = Some(slot_scope.len());
         log.append(&record)?;
     }
-    require_gpu_content_slots(&selector, &panel.slots)?;
+    let skipped_cpu = skip_cpu_content_slots(&selector, &mut panel.slots);
+    if let Some(log) = &progress_log
+        && skipped_cpu > 0
+    {
+        let mut record = run_progress_record(&selector, "resident_cpu_content_slots_skipped");
+        record.lens_count = Some(skipped_cpu);
+        log.append(&record)?;
+    }
     let build = SavedTemplatePanelBuild {
         template_id: format!("vault:{}", vault.display()),
         template_name: vault
@@ -308,15 +315,22 @@ fn resident_slot_scope_error(selector: &str, detail: String) -> CliError {
     })
 }
 
-fn require_gpu_content_slots(selector: &str, slots: &[Slot]) -> CliResult {
+/// The resident service serves Gpu-placed content lenses only. Cpu-placed
+/// content lenses (static lookups, algorithmic runtimes) are measured locally
+/// by the ingest/search hybrid paths, so they are excluded from the resident
+/// panel — loudly — instead of refusing to serve the vault at all. Explicitly
+/// selecting a CPU slot with `--slot` still refuses (see
+/// apply_resident_slot_scope): that is an operator error, not a panel shape.
+fn skip_cpu_content_slots(selector: &str, slots: &mut Vec<Slot>) -> usize {
+    fn is_cpu_content(slot: &Slot) -> bool {
+        slot.state == SlotState::Active
+            && !slot.retrieval_only
+            && !slot.excluded_from_dedup
+            && slot.resource.placement != Placement::Gpu
+    }
     let cpu_lenses = slots
         .iter()
-        .filter(|slot| {
-            slot.state == SlotState::Active
-                && !slot.retrieval_only
-                && !slot.excluded_from_dedup
-                && slot.resource.placement != Placement::Gpu
-        })
+        .filter(|slot| is_cpu_content(slot))
         .map(|slot| {
             format!(
                 "slot={} key={} lens={} placement={:?}",
@@ -328,17 +342,16 @@ fn require_gpu_content_slots(selector: &str, slots: &[Slot]) -> CliResult {
         })
         .collect::<Vec<_>>();
     if cpu_lenses.is_empty() {
-        return Ok(());
+        return 0;
     }
-    Err(CliError::from(CalyxError {
-        code: RESIDENT_CPU_LENS_REFUSED,
-        message: format!(
-            "resident vault {selector} refuses {} CPU/non-GPU content lenses: {}",
-            cpu_lenses.len(),
-            cpu_lenses.join(", ")
-        ),
-        remediation: "pass --modality to select a GPU-only modality or replace every content lens with a GPU resident runtime",
-    }))
+    eprintln!(
+        "CALYX_PANEL_RESIDENT_RUNTIME phase=cpu_content_slots_skipped selector={selector} \
+         count={} detail={} remediation=CPU-placed lenses are measured locally by ingest/search",
+        cpu_lenses.len(),
+        cpu_lenses.join(", ")
+    );
+    slots.retain(|slot| !is_cpu_content(slot));
+    cpu_lenses.len()
 }
 
 fn require_gpu_content_lenses(
