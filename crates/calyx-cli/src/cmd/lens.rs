@@ -502,12 +502,75 @@ fn declared_runtime(
             };
             Ok(LensRuntime::Onnx { model_id, files })
         }
-        "multimodal-adapter" => Ok(LensRuntime::MultimodalAdapter {
-            axis: endpoint.unwrap_or("mixed").to_string(),
-            model_id: "declared-multimodal".to_string(),
-            adapter_config: weights.map(Path::to_path_buf),
-            files: weights.into_iter().map(Path::to_path_buf).collect(),
-        }),
+        "multimodal-adapter" => {
+            // Resolve the adapter.json (accept a lensforge manifest.json or the
+            // adapter config directly) and read its real axis + model_id so the
+            // frozen contract matches the artifacts. The old declared-multimodal /
+            // "mixed" placeholders made every real adapter fail load_adapter_config
+            // with a CALYX_LENS_FROZEN_VIOLATION.
+            let w = weights.ok_or_else(|| {
+                CliError::usage(
+                    "multimodal-adapter runtime requires --weights <adapter.json|manifest.json>",
+                )
+            })?;
+            let adapter_config = if w.file_name().map_or(false, |n| n == "manifest.json") {
+                let manifest = std::fs::read_to_string(w)
+                    .map_err(|e| CliError::io(format!("read manifest: {e}")))?;
+                let m: serde_json::Value = serde_json::from_str(&manifest)
+                    .map_err(|e| CliError::usage(format!("parse manifest: {e}")))?;
+                let dir = w.parent().unwrap_or_else(|| std::path::Path::new(""));
+                m.get("files")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find(|f| {
+                            f.get("role").and_then(|r| r.as_str()) == Some("adapter")
+                        })
+                    })
+                    .and_then(|f| f.get("path").and_then(|p| p.as_str()))
+                    .map(|p| dir.join(p))
+                    .unwrap_or_else(|| dir.join("adapter.json"))
+            } else {
+                w.to_path_buf()
+            };
+            let raw = std::fs::read_to_string(&adapter_config).map_err(|e| {
+                CliError::io(format!(
+                    "read adapter config {}: {e}",
+                    adapter_config.display()
+                ))
+            })?;
+            let cfg: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                CliError::usage(format!(
+                    "parse adapter config {}: {e}",
+                    adapter_config.display()
+                ))
+            })?;
+            let model_id = cfg
+                .get("model_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    CliError::usage(format!(
+                        "adapter config {} missing model_id",
+                        adapter_config.display()
+                    ))
+                })?
+                .to_string();
+            let axis = cfg
+                .get("axis")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    CliError::usage(format!(
+                        "adapter config {} missing axis",
+                        adapter_config.display()
+                    ))
+                })?
+                .to_string();
+            Ok(LensRuntime::MultimodalAdapter {
+                axis,
+                model_id,
+                adapter_config: Some(adapter_config),
+                files: vec![],
+            })
+        }
         other => Err(CliError::usage(format!(
             "unknown runtime {other}; expected algorithmic, tei-http, external-cmd, candle-local, onnx, or multimodal-adapter"
         ))),
