@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{Asymmetry, CalyxError, Panel, SlotId, SlotState, VaultId};
+use calyx_core::{Asymmetry, CalyxError, Panel, Placement, SlotId, SlotState, VaultId};
 use calyx_registry::{
     PanelTemplate, Registry, SlotSpec, SwapController, bio_default, civic_default, code_default,
     legal_default, list_panel, load_vault_panel_state, materialize_panel_template, media_default,
@@ -178,6 +178,36 @@ fn add_lens(args: AddLensArgs) -> CliResult {
     let shape = built.spec.output;
     let modality = built.spec.modality;
     let quant = built.spec.quant_default;
+    // Compute the slot's real resource (measured cost + GPU/CPU placement) from the
+    // live VRAM budget and what the vault already has resident, BEFORE `register`
+    // consumes the spec. add_lens is GPU-agnostic and would otherwise default the
+    // slot to Cpu, which hides GPU-capable lenses from `panel resident serve`.
+    let gpu_vram_allocated = state
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotState::Active && slot.resource.placement == Placement::Gpu)
+        .map(|slot| slot.resource.cost.vram_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let ram_used = state
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotState::Active && slot.resource.placement == Placement::Cpu)
+        .map(|slot| slot.resource.cost.ram_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let cpu_resident_count = state
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotState::Active && slot.resource.placement == Placement::Cpu)
+        .count();
+    let resource = crate::lens_commands::catalog::slot_resource_for_spec(
+        &built.spec,
+        gpu_vram_allocated,
+        ram_used,
+        cpu_resident_count,
+    )?;
     if !state.registry.contains(lens_id) {
         built.register(&mut state.registry)?;
     }
@@ -199,6 +229,7 @@ fn add_lens(args: AddLensArgs) -> CliResult {
         [],
         now_ms(),
     )?;
+    controller.set_slot_resource(outcome.slot.slot_id, resource)?;
     persist_vault_panel_state(&vault_dir, controller.panel(), &state.registry)?;
     print_json(&AddLensReport {
         lens_id: lens_id.to_string(),
