@@ -1,5 +1,5 @@
 mod card;
-mod catalog;
+pub(crate) mod catalog;
 mod commission;
 mod explain;
 mod flags;

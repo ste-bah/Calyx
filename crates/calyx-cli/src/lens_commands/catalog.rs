@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use calyx_core::{Input, Lens, LensCost, Placement};
+use calyx_core::{Input, Lens, LensCost, Placement, SlotResource};
 use calyx_registry::{
     CALYX_VRAM_BUDGET_EXCEEDED, LENS_VRAM_REMEDIATION, LensHealth, LensRuntime, LensSpec,
     MultimodalAdapterLens, PlacementBudget, StaticLookupLens, choose_placement,
@@ -217,6 +217,36 @@ fn placement_from_spec(
     Ok(choose_placement(&spec.runtime, cost, budget)?
         .resource
         .placement)
+}
+
+/// Compute the persisted [`SlotResource`] (measured cost + GPU/CPU placement) for
+/// a lens being admitted to a vault panel, against the live GPU VRAM budget. This
+/// is the same admission logic `lens list` uses for display, exposed so `add-lens`
+/// can store a real placement instead of the `Cpu` default — the default is what
+/// made GPU-capable lenses invisible to `panel resident serve`.
+///
+/// `gpu_vram_allocated_bytes` / `ram_used_bytes` / `cpu_resident_count` describe
+/// what the target vault already has resident, so the budget reflects headroom
+/// after existing placements.
+pub(crate) fn slot_resource_for_spec(
+    spec: &LensSpec,
+    gpu_vram_allocated_bytes: u64,
+    ram_used_bytes: u64,
+    cpu_resident_count: usize,
+) -> CliResult<SlotResource> {
+    let cost = estimate_lens_cost(spec)?;
+    let (vram_soft_cap_bytes, tei_reserved_bytes) = resolve_gpu_vram_budget()?;
+    let budget = PlacementBudget {
+        vram_soft_cap_bytes,
+        tei_reserved_bytes,
+        vram_allocated_bytes: gpu_vram_allocated_bytes,
+        ram_soft_cap_bytes: env_u64("CALYX_PANEL_RAM_SOFT_CAP_BYTES", 121 * gib())?,
+        ram_used_bytes,
+        cpu_resident_limit: env_usize("CALYX_CPU_LENS_POOL_CAP", 128)?,
+        cpu_resident_count,
+    };
+    let placement = placement_from_spec(spec, cost, budget)?;
+    Ok(SlotResource { cost, placement })
 }
 
 fn ensure_vram_available(cost: LensCost, budget: PlacementBudget) -> CliResult {
