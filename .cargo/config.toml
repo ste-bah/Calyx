@@ -2,6 +2,11 @@
 color = "auto"
 
 [env]
-CUDA_PATH = "/usr/local/cuda"
+# Driver 591.74 caps at CUDA 13.1; building candle kernels with 13.2 yields a
+# runtime CUDA_ERROR_UNSUPPORTED_PTX_VERSION on the RTX 4090. Pin the 13.1
+# toolkit and target native sm_89 (no PTX JIT). Cargo precedence is CLI > env >
+# config, so a shell CUDA_PATH (e.g. from ~/.profile) still overrides this.
+CUDA_PATH = "/usr/local/cuda-13.1"
+CUDA_COMPUTE_CAP = "89"
 cuvs_DIR = "/home/unixdude/.local/lib/python3.12/site-packages/libcuvs/lib64/cmake/cuvs"
 LIBCUVS_USE_PYTHON = "1"

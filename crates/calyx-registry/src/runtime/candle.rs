@@ -262,7 +262,7 @@ impl CandleLens {
             tokenizer: tokenizer.clone(),
             weights: weights.clone(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            device_policy: CandleDevicePolicy::CpuExplicit,
+            device_policy: CandleDevicePolicy::CudaFailLoud { ordinal: 0 },
             precision: CandlePrecision::parse(dtype)?,
             pooling: CandlePoolingPolicy::parse(pooling)?,
             norm_policy: spec.norm_policy,
