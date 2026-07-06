@@ -43,6 +43,40 @@ fn minimal_search_returns_provenanced_hits() {
 }
 
 #[test]
+fn search_accepts_batch_ingest_ledger_ref_when_payload_names_hit_cx() {
+    let _env = TestEnv::new("batch-ledger-ref");
+    let server = server();
+    call_ok(&server, 1, "calyx.create_vault", json!({"name": "v"}));
+    call_ok(
+        &server,
+        2,
+        "calyx.add_lens",
+        json!({"vault": "v", "name": "byte_axis", "runtime": "algorithmic"}),
+    );
+    let ingested = call_ok(
+        &server,
+        3,
+        "calyx.ingest",
+        json!({"vault": "v", "batch": ["alpha", "omega"]}),
+    );
+    let expected_cx_id = ingested["results"][1]["cx_id"].as_str().unwrap();
+
+    let result = call_ok(
+        &server,
+        4,
+        "calyx.search",
+        json!({"vault": "v", "query": "omega", "k": 2}),
+    );
+
+    let hits = result["hits"].as_array().unwrap();
+    let hit = hits
+        .iter()
+        .find(|hit| hit["cx_id"].as_str() == Some(expected_cx_id))
+        .expect("second batch cx appears in MCP search hits");
+    assert!(hit["provenance"].is_object());
+}
+
+#[test]
 fn search_fails_closed_when_ledger_chain_is_tampered() {
     let env = TestEnv::new("ledger-tamper");
     let server = server();
