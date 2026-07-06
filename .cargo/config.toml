@@ -1,20 +1,7 @@
-# Machine-specific settings (e.g. build.target-dir) must NOT be committed
-# here: this file applies to every checkout on every machine, and an absolute
-# Unix path silently resolves to <drive>:\home\... on Windows. FSV builds must
-# use scripts/build-verified-calyx.sh, which sets and then readbacks an explicit
-# per-worktree target dir. Cargo precedence is CLI > env > config.
-
 [term]
 color = "auto"
 
-# CUDA build environment. NOTE: these are machine-specific absolute paths and
-# contradict the header warning above; added here at the maintainer's explicit
-# request so `cargo build --features cuda` works without per-shell env setup.
-# Adjust the CUDA version and MSVC toolset version to match each machine.
-# Cargo precedence is CLI > env > config, so an env var set in the shell still
-# wins over these defaults.
 [env]
-CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
-NVCC_CCBIN = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64"
-FORGE_CUDA_CCBIN = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64"
-CL = "/Zc:preprocessor"
+CUDA_PATH = "/usr/local/cuda"
+cuvs_DIR = "/home/unixdude/.local/lib/python3.12/site-packages/libcuvs/lib64/cmake/cuvs"
+LIBCUVS_USE_PYTHON = "1"

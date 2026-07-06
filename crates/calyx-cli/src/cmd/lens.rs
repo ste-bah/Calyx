@@ -1,3 +1,4 @@
+use sha2::Digest;
 use std::fs;
 use std::path::Path;
 
@@ -260,18 +261,155 @@ fn build_declared_lens(
         .transpose()?
         .unwrap_or(SlotShape::Dense(768));
     let weights_hash = weights_hash(weights, runtime, endpoint)?;
-    let contract = FrozenLensContract::new(
-        name,
-        weights_hash,
-        sha256_digest(&[runtime.as_bytes(), endpoint.unwrap_or("").as_bytes()]),
-        output,
-        modality,
-        LensDType::F32,
-        NormPolicy::finite_only(),
-    );
+    let runtime_key = runtime.replace('_', "-");
+    let declared_rt = declared_runtime(runtime, endpoint, weights)?;
+    // For ONNX and candle-local, use authoritative runtime constructor
+    // to compute contract at registration time (one source of truth)
+    let contract = if runtime_key == "onnx" {
+        // Compute real weights hash from the 3 files passed to LensRuntime::Onnx
+        let onnx_files: Vec<std::path::PathBuf> = if let Some(w) = weights {
+            if w.file_name().map_or(false, |n| n == "manifest.json") {
+                let manifest = std::fs::read_to_string(w)
+                    .map_err(|e| CliError::io(format!("read manifest: {e}")))?;
+                let m: serde_json::Value = serde_json::from_str(&manifest)
+                    .map_err(|e| CliError::usage(format!("parse manifest: {e}")))?;
+                let dir = w.parent().unwrap_or(std::path::Path::new(""));
+                let mut model_file = dir.join("model.onnx");
+                let mut tokenizer_file = dir.join("tokenizer.json");
+                let mut config_file = dir.join("config.json");
+                if let Some(files_arr) = m.get("files").and_then(|v| v.as_array()) {
+                    for f in files_arr {
+                        let role = f.get("role").and_then(|r| r.as_str());
+                        let path = f.get("path").and_then(|p| p.as_str());
+                        if let (Some(r), Some(p)) = (role, path) {
+                            let full = dir.join(p);
+                            match r {
+                                "model" | "weights" => model_file = full,
+                                "tokenizer" => tokenizer_file = full,
+                                "config" => config_file = full,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                vec![model_file, tokenizer_file, config_file]
+            } else {
+                vec![w.to_path_buf()]
+            }
+        } else {
+            vec![]
+        };
+        // Hash the same 3 files the runtime will hash
+        let w_hash = {
+            let mut hasher = sha2::Sha256::new();
+            for path in &onnx_files {
+                if let Ok(data) = std::fs::read(path) {
+                    let len = (data.len() as u64).to_be_bytes();
+                    hasher.update(&len);
+                    hasher.update(&data);
+                }
+            }
+            hasher.finalize().into()
+        };
+        let lens_spec = LensSpec {
+            name: name.to_string(),
+            runtime: declared_rt.clone(),
+            output: output.clone(),
+            modality,
+            weights_sha256: w_hash,
+            corpus_hash: [0u8; 32],
+            norm_policy: NormPolicy::finite_only(),
+            max_batch: None,
+            axis: None,
+            asymmetry: calyx_core::Asymmetry::None,
+            quant_default: calyx_core::QuantPolicy::turboquant_default(),
+            truncate_dim: None,
+            recall_delta: 0.0,
+            retrieval_only: false,
+            excluded_from_dedup: false,
+        };
+        let lens = calyx_registry::runtime::onnx::OnnxLens::from_lens_spec(&lens_spec)
+            .map_err(|e| CliError::usage(format!("ONNX model load failed: {e}")))?;
+        lens.contract().clone()
+    } else if runtime_key == "candle-local" {
+        // Compute real weights hash from the 3 files passed to LensRuntime::CandleLocal
+        let candle_files: Vec<std::path::PathBuf> = if let Some(w) = weights {
+            if w.file_name().map_or(false, |n| n == "manifest.json") {
+                let manifest = std::fs::read_to_string(w)
+                    .map_err(|e| CliError::io(format!("read manifest: {e}")))?;
+                let m: serde_json::Value = serde_json::from_str(&manifest)
+                    .map_err(|e| CliError::usage(format!("parse manifest: {e}")))?;
+                let dir = w.parent().unwrap_or(std::path::Path::new(""));
+                let mut weights_file = dir.join("model.safetensors");
+                let mut tokenizer_file = dir.join("tokenizer.json");
+                let mut config_file = dir.join("config.json");
+                if let Some(files_arr) = m.get("files").and_then(|v| v.as_array()) {
+                    for f in files_arr {
+                        let role = f.get("role").and_then(|r| r.as_str());
+                        let path = f.get("path").and_then(|p| p.as_str());
+                        if let (Some(r), Some(p)) = (role, path) {
+                            let full = dir.join(p);
+                            match r {
+                                "weights" | "model" => weights_file = full,
+                                "tokenizer" => tokenizer_file = full,
+                                "config" => config_file = full,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                vec![weights_file, tokenizer_file, config_file]
+            } else {
+                vec![w.to_path_buf()]
+            }
+        } else {
+            vec![]
+        };
+        let w_hash = {
+            let mut hasher = sha2::Sha256::new();
+            for path in &candle_files {
+                if let Ok(data) = std::fs::read(path) {
+                    let len = (data.len() as u64).to_be_bytes();
+                    hasher.update(&len);
+                    hasher.update(&data);
+                }
+            }
+            hasher.finalize().into()
+        };
+        let lens_spec = LensSpec {
+            name: name.to_string(),
+            runtime: declared_rt.clone(),
+            output: output.clone(),
+            modality,
+            weights_sha256: w_hash,
+            corpus_hash: [0u8; 32],
+            norm_policy: NormPolicy::finite_only(),
+            max_batch: None,
+            axis: None,
+            asymmetry: calyx_core::Asymmetry::None,
+            quant_default: calyx_core::QuantPolicy::turboquant_default(),
+            truncate_dim: None,
+            recall_delta: 0.0,
+            retrieval_only: false,
+            excluded_from_dedup: false,
+        };
+        let lens = calyx_registry::runtime::candle::CandleLens::from_lens_spec(&lens_spec)
+            .map_err(|e| CliError::usage(format!("Candle model load failed: {e}")))?;
+        lens.contract().clone()
+    } else {
+        FrozenLensContract::new(
+            name,
+            weights_hash,
+            sha256_digest(&[runtime.as_bytes(), endpoint.unwrap_or("").as_bytes()]),
+            output,
+            modality,
+            LensDType::F32,
+            NormPolicy::finite_only(),
+        )
+    };
     let spec = spec_from_contract(
         name,
-        declared_runtime(runtime, endpoint, weights)?,
+        declared_rt,
         &contract,
     );
     let lens = DeclaredLens {
@@ -292,16 +430,78 @@ fn declared_runtime(
     weights: Option<&Path>,
 ) -> CliResult<LensRuntime> {
     match runtime.replace('_', "-").as_str() {
-        "candle-local" => Ok(LensRuntime::CandleLocal {
-            model_id: endpoint.unwrap_or("declared-candle-local").to_string(),
-            files: weights.into_iter().map(Path::to_path_buf).collect(),
-            dtype: "f32".to_string(),
-            pooling: "mean".to_string(),
-        }),
-        "onnx" => Ok(LensRuntime::Onnx {
-            model_id: endpoint.unwrap_or("declared-onnx").to_string(),
-            files: weights.into_iter().map(Path::to_path_buf).collect(),
-        }),
+        "candle-local" => {
+            let model_id = endpoint.unwrap_or("declared-candle-local").to_string();
+            let files = if let Some(w) = weights {
+                if w.file_name().map_or(false, |n| n == "manifest.json") {
+                    let manifest = std::fs::read_to_string(w)
+                        .map_err(|e| CliError::io(format!("read manifest: {e}")))?;
+                    let m: serde_json::Value = serde_json::from_str(&manifest)
+                        .map_err(|e| CliError::usage(format!("parse manifest: {e}")))?;
+                    let dir = w.parent().unwrap_or(std::path::Path::new(""));
+                    let mut weights_file = dir.join("model.safetensors");
+                    let mut tokenizer_file = dir.join("tokenizer.json");
+                    let mut config_file = dir.join("config.json");
+                    if let Some(files_arr) = m.get("files").and_then(|v| v.as_array()) {
+                        for f in files_arr {
+                            let role = f.get("role").and_then(|r| r.as_str());
+                            let path = f.get("path").and_then(|p| p.as_str());
+                            if let (Some(r), Some(p)) = (role, path) {
+                                let full = dir.join(p);
+                                match r {
+                                    "weights" | "model" => weights_file = full,
+                                    "tokenizer" => tokenizer_file = full,
+                                    "config" => config_file = full,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    vec![weights_file, tokenizer_file, config_file]
+                } else {
+                    vec![w.to_path_buf()]
+                }
+            } else {
+                vec![]
+            };
+            Ok(LensRuntime::CandleLocal { model_id, files, dtype: "f32".to_string(), pooling: "mean".to_string() })
+        }
+        "onnx" => {
+            let model_id = endpoint.unwrap_or("declared-onnx").to_string();
+            let files = if let Some(w) = weights {
+                if w.file_name().map_or(false, |n| n == "manifest.json") {
+                    let manifest = std::fs::read_to_string(w)
+                        .map_err(|e| CliError::io(format!("read manifest: {e}")))?;
+                    let m: serde_json::Value = serde_json::from_str(&manifest)
+                        .map_err(|e| CliError::usage(format!("parse manifest: {e}")))?;
+                    let dir = w.parent().unwrap_or(std::path::Path::new(""));
+                    let mut model_file = dir.join("model.onnx");
+                    let mut tokenizer_file = dir.join("tokenizer.json");
+                    let mut config_file = dir.join("config.json");
+                    if let Some(files_arr) = m.get("files").and_then(|v| v.as_array()) {
+                        for f in files_arr {
+                            let role = f.get("role").and_then(|r| r.as_str());
+                            let path = f.get("path").and_then(|p| p.as_str());
+                            if let (Some(r), Some(p)) = (role, path) {
+                                let full = dir.join(p);
+                                match r {
+                                    "model" | "weights" => model_file = full,
+                                    "tokenizer" => tokenizer_file = full,
+                                    "config" => config_file = full,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    vec![model_file, tokenizer_file, config_file]
+                } else {
+                    vec![w.to_path_buf()]
+                }
+            } else {
+                vec![]
+            };
+            Ok(LensRuntime::Onnx { model_id, files })
+        }
         "multimodal-adapter" => Ok(LensRuntime::MultimodalAdapter {
             axis: endpoint.unwrap_or("mixed").to_string(),
             model_id: "declared-multimodal".to_string(),

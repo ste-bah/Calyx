@@ -46,8 +46,8 @@ pub struct OnnxLens {
 }
 
 enum OnnxBackend {
-    FastEmbed(Mutex<TextEmbedding>),
-    Custom(Mutex<custom::CustomOnnxRuntime>),
+    FastEmbed(Box<Mutex<TextEmbedding>>),
+    Custom(Box<Mutex<custom::CustomOnnxRuntime>>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,7 +155,7 @@ impl OnnxFileSpec {
             pooling,
             norm_policy,
             max_batch: None,
-            provider_policy: OnnxProviderPolicy::CudaFailLoud,
+            provider_policy: OnnxProviderPolicy::CpuExplicit,
             expected_shape: None,
             expected_weights_sha256: None,
             contract_paths: Vec::new(),
@@ -185,7 +185,7 @@ impl OnnxFileSpec {
             pooling,
             norm_policy: spec.norm_policy,
             max_batch: spec.max_batch,
-            provider_policy: OnnxProviderPolicy::CudaFailLoud,
+            provider_policy: OnnxProviderPolicy::CpuExplicit,
             expected_shape: Some(spec.output),
             expected_weights_sha256: Some(spec.weights_sha256),
             contract_paths: files.clone(),
@@ -298,7 +298,7 @@ impl OnnxLens {
             files,
             provider_policy,
             max_batch: None,
-            backend: Some(OnnxBackend::FastEmbed(Mutex::new(model))),
+            backend: Some(OnnxBackend::FastEmbed(Box::new(Mutex::new(model)))),
         }
     }
 
@@ -316,7 +316,7 @@ impl OnnxLens {
             files,
             provider_policy,
             max_batch,
-            backend: Some(OnnxBackend::Custom(Mutex::new(runtime))),
+            backend: Some(OnnxBackend::Custom(Box::new(Mutex::new(runtime)))),
         }
     }
 

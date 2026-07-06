@@ -33,11 +33,22 @@ models:
     max_batch: 64
 
   - name: audio-wav2vec2-base-960h
-    hf_id: Xenova/wav2vec2-base-960h
+    hf_id: facebook/wav2vec2-base-960h
     modality: audio
-    formats: [onnx-int8]
+    formats: [adapter]
     pooling: mean
-    norm: finite
+    norm: l2
+    dim: 768
+    files:
+      - role: model
+        url: https://huggingface.co/Xenova/wav2vec2-base-960h/resolve/main/model_int8.onnx
+        path: model_int8.onnx
+      - role: tokenizer
+        url: https://huggingface.co/Xenova/wav2vec2-base-960h/resolve/main/tokenizer.json
+        path: tokenizer.json
+      - role: config
+        url: https://huggingface.co/Xenova/wav2vec2-base-960h/resolve/main/config.json
+        path: config.json
 
   - name: image-siglip2-b16-adapter
     hf_id: google/siglip2-base-patch16-224
@@ -45,7 +56,7 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 768
     license: apache-2.0
 
   - name: audio-clap-htsat-adapter
@@ -54,7 +65,7 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 512
     license: apache-2.0
 
   - name: protein-esm2-t6-8m-adapter
@@ -63,7 +74,7 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 320
     license: mit
 
   - name: dna-dnabert2-117m-adapter
@@ -72,7 +83,7 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 768
     license: apache-2.0
 
   - name: molecule-chemberta-zinc-adapter
@@ -81,5 +92,5 @@ models:
     formats: [adapter]
     pooling: mean
     norm: l2
-    dim: 16
+    dim: 768
     license: mit
