@@ -27,13 +27,17 @@ mod multi_rrf;
 #[path = "partitioned_bench/progress.rs"]
 mod progress;
 #[path = "partitioned_bench/rrf_plan.rs"]
-mod rrf_plan;
+pub(crate) mod rrf_plan;
 #[path = "partitioned_bench/slot_truth_generate.rs"]
 mod slot_truth_generate;
 #[path = "partitioned_bench/slot_truth_store.rs"]
 mod slot_truth_store;
 #[path = "partitioned_bench/summary.rs"]
 mod summary;
+#[path = "partitioned_bench/timeline_import.rs"]
+mod timeline_import;
+#[path = "partitioned_bench/timeline_store.rs"]
+pub(crate) mod timeline_store;
 #[path = "partitioned_bench/tuner_status.rs"]
 mod tuner_status;
 use args::{SearchArgs, parse, parse_pruning_epsilon, parse_recall_floor};
@@ -197,6 +201,10 @@ pub(crate) fn run_rrf_plan(args: &[String]) -> CliResult {
 
 pub(crate) fn run_rrf_slot_truth(args: &[String]) -> CliResult {
     slot_truth_generate::run(args)
+}
+
+pub(crate) fn run_rrf_timeline(args: &[String]) -> CliResult {
+    timeline_import::run(args)
 }
 
 /// REAL-data search: real query embeddings + brute-force ground truth over the REAL

@@ -68,6 +68,11 @@ pub(crate) fn run(args: Vec<String>) -> CliResult {
         {
             partitioned_bench::run_rrf_slot_truth(rest)
         }
+        [command, topic, rest @ ..]
+            if command == "bench" && topic == "partitioned-rrf-timeline" =>
+        {
+            partitioned_bench::run_rrf_timeline(rest)
+        }
         [command, topic, rest @ ..] if command == "bench" => sextant_bench::run_bench(topic, rest),
         [command, topic, rest @ ..] if command == "sextant" => sextant_commands::run(topic, rest),
         [command, topic, rest @ ..] if command == "media" => media_commands::run(topic, rest),
@@ -87,6 +92,9 @@ pub(crate) fn run(args: Vec<String>) -> CliResult {
         [command, topic, rest @ ..] if command == "assay" && topic == "i8bin-ensemble-card" => {
             assay_i8bin_ensemble_card::run(rest)
         }
+        [command, topic, rest @ ..] if command == "assay" && topic == "i8bin-labels" => {
+            assay_i8bin_ensemble_card::run_label_import(rest)
+        }
         [command, topic, rest @ ..]
             if command == "assay" && topic == "multi-anchor-ensemble-card" =>
         {
@@ -100,6 +108,11 @@ pub(crate) fn run(args: Vec<String>) -> CliResult {
         }
         [command, topic, rest @ ..] if command == "assay" && topic == "gdelt-rows" => {
             assay_gdelt_rows::run(rest)
+        }
+        [command, topic, rest @ ..]
+            if command == "assay" && topic == "stream-fbin-lens-template" =>
+        {
+            assay_stream_fbin::run_lens_template(rest)
         }
         [command, topic, rest @ ..] if command == "assay" && topic == "stream-fbin" => {
             assay_stream_fbin::run(rest)
