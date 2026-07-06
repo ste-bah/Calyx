@@ -32,24 +32,6 @@ models:
     license: mit
     max_batch: 64
 
-  - name: audio-wav2vec2-base-960h
-    hf_id: facebook/wav2vec2-base-960h
-    modality: audio
-    formats: [adapter]
-    pooling: mean
-    norm: l2
-    dim: 768
-    files:
-      - role: model
-        url: https://huggingface.co/Xenova/wav2vec2-base-960h/resolve/main/model_int8.onnx
-        path: model_int8.onnx
-      - role: tokenizer
-        url: https://huggingface.co/Xenova/wav2vec2-base-960h/resolve/main/tokenizer.json
-        path: tokenizer.json
-      - role: config
-        url: https://huggingface.co/Xenova/wav2vec2-base-960h/resolve/main/config.json
-        path: config.json
-
   - name: image-siglip2-b16-adapter
     hf_id: google/siglip2-base-patch16-224
     modality: image
