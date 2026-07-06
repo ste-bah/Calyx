@@ -189,18 +189,20 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
         }
         None => None,
     };
-    let scale_truth = precomputed_truth
-        .as_ref()
-        .is_some_and(ground_truth::PrecomputedTruth::scale_suitable)
-        || db_fused_truth
+    let scale_truth = gate_scale_truth(
+        precomputed_truth
             .as_ref()
-            .is_some_and(fused_truth_db::DbFusedTruth::scale_suitable)
-        || slot_truth
+            .is_some_and(ground_truth::PrecomputedTruth::scale_suitable),
+        db_fused_truth
             .as_ref()
-            .is_some_and(slot_truth::SlotTruth::scale_suitable)
-        || db_slot_truth
+            .is_some_and(fused_truth_db::DbFusedTruth::scale_suitable),
+        slot_truth
             .as_ref()
-            .is_some_and(slot_truth_db::DbSlotTruth::scale_suitable);
+            .is_some_and(slot_truth::SlotTruth::scale_suitable),
+        db_slot_truth
+            .as_ref()
+            .is_some_and(slot_truth_db::DbSlotTruth::scale_suitable),
+    );
     truth_gate::enforce(args.recall_floor.is_some(), truth_n, scale_truth)?;
     if n == 0 {
         return Err(CliError::usage(
@@ -266,6 +268,7 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
     } else {
         recall::RecallReadback::default()
     };
+    enforce_recall_floor(args.recall_floor, truth_n, recall.fused_recall)?;
     let written_ground_truth = match (
         args.write_fused_ground_truth_file.as_ref(),
         args.write_fused_ground_truth_manifest.as_ref(),
@@ -308,7 +311,6 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
             None => None,
         },
     };
-    enforce_recall_floor(args.recall_floor, truth_n, recall.fused_recall)?;
     let latency_us = percentiles(&fused_latencies_us);
     let tuner_status_path = if let Some(vault) = &args.anneal_vault {
         Some(tuner::write_status(tuner::StatusRequest {
@@ -453,6 +455,15 @@ fn fuse(per_slot: &BTreeMap<SlotId, Vec<IndexSearchHit>>, k: usize) -> Vec<calyx
         stage1_slots: Vec::new(),
     };
     fusion::fuse(per_slot, &context)
+}
+
+fn gate_scale_truth(
+    _file_fused_truth_scale_suitable: bool,
+    db_fused_truth_scale_suitable: bool,
+    _file_slot_truth_scale_suitable: bool,
+    db_slot_truth_scale_suitable: bool,
+) -> bool {
+    db_fused_truth_scale_suitable || db_slot_truth_scale_suitable
 }
 
 #[cfg(test)]

@@ -2,11 +2,16 @@ use super::args::Args;
 use super::*;
 use std::path::PathBuf;
 
+#[path = "args_gate_tests.rs"]
+mod args_gate_tests;
+
 #[test]
 fn args_parse_plan_truth_depth_and_tuner_vault() {
     let args = Args::parse(&strings([
-        "--plan",
-        "plan.json",
+        "--plan-cf-root",
+        "plan-db",
+        "--plan-key",
+        "issue791_plan",
         "--timeline-cf-root",
         "timeline-db",
         "--timeline-key",
@@ -23,14 +28,14 @@ fn args_parse_plan_truth_depth_and_tuner_vault() {
         "5",
         "--truth-depth",
         "40",
-        "--fused-ground-truth-file",
-        "truth.i32bin",
-        "--fused-ground-truth-manifest",
-        "truth.manifest.json",
-        "--ensemble-card",
-        "ensemble_card.json",
-        "--a37-admission-card",
-        "multi_anchor_ensemble_card.json",
+        "--slot-ground-truth-cf-root",
+        "slot-truth-db",
+        "--slot-ground-truth-key",
+        "issue791_truth",
+        "--a37-admission-cf-root",
+        "a37-admission-db",
+        "--a37-admission-key",
+        "issue791_a37",
         "--recall-floor",
         "0.8",
         "--anneal-vault",
@@ -44,30 +49,29 @@ fn args_parse_plan_truth_depth_and_tuner_vault() {
     ]))
     .unwrap();
 
-    assert_eq!(args.plan, Some(PathBuf::from("plan.json")));
-    assert_eq!(args.plan_cf_root, None);
+    assert_eq!(args.plan, None);
+    assert_eq!(args.plan_cf_root, Some(PathBuf::from("plan-db")));
+    assert_eq!(args.plan_key, "issue791_plan");
     assert_eq!(args.timeline_cf_root, Some(PathBuf::from("timeline-db")));
     assert_eq!(args.timeline_key, "issue791_timeline");
     assert_eq!(args.n, 12);
     assert_eq!(args.k, 4);
     assert_eq!(args.truth_depth, Some(40));
+    assert_eq!(args.fused_ground_truth_file, None);
+    assert_eq!(args.fused_ground_truth_manifest, None);
     assert_eq!(
-        args.fused_ground_truth_file,
-        Some(PathBuf::from("truth.i32bin"))
+        args.slot_ground_truth_cf_root,
+        Some(PathBuf::from("slot-truth-db"))
     );
-    assert_eq!(
-        args.fused_ground_truth_manifest,
-        Some(PathBuf::from("truth.manifest.json"))
-    );
+    assert_eq!(args.slot_ground_truth_key, "issue791_truth");
     assert_eq!(args.slot_ground_truth_manifest, None);
+    assert_eq!(args.ensemble_card, None);
     assert_eq!(
-        args.ensemble_card,
-        Some(PathBuf::from("ensemble_card.json"))
+        args.a37_admission_cf_root,
+        Some(PathBuf::from("a37-admission-db"))
     );
-    assert_eq!(
-        args.a37_admission_card,
-        Some(PathBuf::from("multi_anchor_ensemble_card.json"))
-    );
+    assert_eq!(args.a37_admission_key, "issue791_a37");
+    assert_eq!(args.a37_admission_card, None);
     assert_eq!(args.recall_floor, Some(0.8));
     assert_eq!(args.out, None);
     assert_eq!(args.report_cf_root, Some(PathBuf::from("report-db")));
@@ -75,6 +79,25 @@ fn args_parse_plan_truth_depth_and_tuner_vault() {
     assert!(!args.report_db_only);
     assert_eq!(args.anneal_vault, Some(PathBuf::from("anneal-out")));
     assert_eq!(args.tuner_slo_us, Some(100));
+}
+
+#[test]
+fn args_reject_recall_floor_with_file_plan() {
+    let err = Args::parse(&strings([
+        "--plan",
+        "plan.json",
+        "--ground-truth",
+        "5",
+        "--recall-floor",
+        "0.8",
+    ]))
+    .unwrap_err();
+
+    assert_eq!(err.code(), "CALYX_CLI_USAGE_ERROR");
+    assert!(
+        err.message()
+            .contains("--recall-floor requires --plan-cf-root")
+    );
 }
 
 #[test]
@@ -389,6 +412,13 @@ fn args_reject_slot_manifest_and_db_truth_sources_together() {
         err.message()
             .contains("precomputed fused file, fused DB, slot manifest, and slot DB ground truth")
     );
+}
+
+#[test]
+fn gate_scale_truth_ignores_file_manifest_truth() {
+    assert!(!gate_scale_truth(true, false, true, false));
+    assert!(gate_scale_truth(false, true, false, false));
+    assert!(gate_scale_truth(false, false, false, true));
 }
 
 #[test]

@@ -64,6 +64,11 @@ pub(crate) fn run(args: Vec<String>) -> CliResult {
             partitioned_bench::run_rrf_plan(rest)
         }
         [command, topic, rest @ ..]
+            if command == "bench" && topic == "partitioned-rrf-plan-remap" =>
+        {
+            partitioned_bench::run_rrf_plan_remap(rest)
+        }
+        [command, topic, rest @ ..]
             if command == "bench" && topic == "partitioned-rrf-slot-truth" =>
         {
             partitioned_bench::run_rrf_slot_truth(rest)
@@ -99,6 +104,9 @@ pub(crate) fn run(args: Vec<String>) -> CliResult {
             if command == "assay" && topic == "multi-anchor-ensemble-card" =>
         {
             assay_multi_anchor_card::run(rest)
+        }
+        [command, topic, rest @ ..] if command == "assay" && topic == "multi-anchor-readback" => {
+            assay_multi_anchor_card::run_readback(rest)
         }
         [command, topic, rest @ ..] if command == "assay" && topic == "corpus-build" => {
             assay_corpus_build::run(rest)
