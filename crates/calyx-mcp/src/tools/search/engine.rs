@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
-    AnchorKind, AnchorValue, CalyxError, Constellation, CxId, Input, Modality, SlotId, SlotState,
-    SlotVector, VaultStore,
+    AnchorKind, AnchorValue, CalyxError, Constellation, CxId, Input, Modality, Placement, SlotId,
+    SlotState, SlotVector, VaultStore,
 };
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
 use calyx_sextant::fusion;
@@ -55,6 +55,7 @@ pub(super) fn search(request: &SearchRequest) -> ToolResult<SearchOutcome> {
             dropped_guard_hits: Vec::new(),
         });
     }
+    require_resident_for_gpu_text_search(&state)?;
     let query_vectors = measure_query_vectors(&state, &request.query)?;
     if query_vectors.is_empty() {
         return Err(no_indexable_query_vectors().into());
@@ -206,6 +207,41 @@ pub(super) fn kernel_report(
 mod filters;
 use filters::{filtered_docs, has_grounding};
 
+fn require_resident_for_gpu_text_search(state: &VaultPanelState) -> ToolResult<()> {
+    let gpu_slots = state
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| {
+            slot.state == SlotState::Active
+                && slot.modality == Modality::Text
+                && slot.resource.placement == Placement::Gpu
+                && state.registry.contains(slot.lens_id)
+        })
+        .map(|slot| {
+            format!(
+                "slot={} key={} lens={} placement={:?}",
+                slot.slot_id.get(),
+                slot.slot_key.key(),
+                slot.lens_id,
+                slot.resource.placement
+            )
+        })
+        .collect::<Vec<_>>();
+    if gpu_slots.is_empty() {
+        return Ok(());
+    }
+    Err(CalyxError {
+        code: "CALYX_SEARCH_RESIDENT_REQUIRED",
+        message: format!(
+            "MCP search refuses cold local query measurement for {} active GPU text lens(es): {}",
+            gpu_slots.len(),
+            gpu_slots.join(", ")
+        ),
+        remediation: "start `calyx panel resident serve --vault <vault-path>` and use CLI search with --resident-addr until MCP resident routing is wired",
+    }
+    .into())
+}
 pub(super) fn measure_query_vectors(
     state: &VaultPanelState,
     query: &str,
