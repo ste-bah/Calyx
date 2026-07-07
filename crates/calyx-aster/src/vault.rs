@@ -62,7 +62,39 @@ pub use slot_column::{
     read_materialized_slot_column,
 };
 
-const DEFAULT_LEASE_MS: u64 = 5_000;
+/// Wall-clock lifetime of a bounded reader lease. A lease is pinned at the
+/// start of a read/scan and re-checked (against SystemClock) on each access, so
+/// it must outlive the slowest read-holding phase. The old 5s value expired
+/// mid-batch once GPU measure batches ran ~10s (CALYX_READER_LEASE_EXPIRED),
+/// aborting long ingest/index-rebuild scans. 300s matches the resident/lens
+/// worker timeout family; override with `CALYX_ASTER_READER_LEASE_MS`.
+const DEFAULT_LEASE_MS: u64 = 300_000;
+const READER_LEASE_ENV: &str = "CALYX_ASTER_READER_LEASE_MS";
+
+/// Resolve the reader-lease lifetime once, honoring `CALYX_ASTER_READER_LEASE_MS`.
+/// A malformed or zero override is a tuning mistake, not a correctness hazard
+/// (the default is always safe), so it warns loudly and falls back rather than
+/// failing an infallible read path.
+fn reader_lease_ms() -> u64 {
+    use std::sync::OnceLock;
+    static RESOLVED: OnceLock<u64> = OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let Some(raw) = std::env::var_os(READER_LEASE_ENV) else {
+            return DEFAULT_LEASE_MS;
+        };
+        match raw.to_str().map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+            Some(ms) if ms > 0 => ms,
+            _ => {
+                eprintln!(
+                    "CALYX_ASTER_RUNTIME phase=reader_lease_config_invalid \
+                     {READER_LEASE_ENV}={raw:?} is not a positive integer of milliseconds; \
+                     using default {DEFAULT_LEASE_MS}"
+                );
+                DEFAULT_LEASE_MS
+            }
+        }
+    })
+}
 
 /// Single-vault Aster store with content-addressed ingest semantics.
 #[derive(Debug)]
@@ -395,7 +427,7 @@ where
     }
 
     fn snapshot_handle(&self, seq: Seq) -> Snapshot {
-        let lease = ReaderLease::new(0, seq, self.clock.now(), DEFAULT_LEASE_MS);
+        let lease = ReaderLease::new(0, seq, self.clock.now(), reader_lease_ms());
         Snapshot::new(seq, Freshness::FreshDerived, lease)
     }
 
