@@ -26,7 +26,7 @@ pub(super) fn run(
             })?,
         };
     let matched = required_vectors(&runtime.docs, identity, &profile)?;
-    let produced = generated_vectors(&runtime.docs, identity, candidate_text, &profile)?;
+    let produced = generated_vectors(runtime, candidate_text, &profile)?;
     let verdict = guard(&profile, &produced, &matched, true).map_err(ward_to_tool)?;
     let min_cos = verdict
         .per_slot
@@ -88,25 +88,41 @@ fn required_vectors(
 }
 
 fn generated_vectors(
-    docs: &BTreeMap<CxId, Constellation>,
-    identity: CxId,
-    text: &str,
+    runtime: &NavRuntime,
+    candidate_text: &str,
     profile: &GuardProfile,
 ) -> ToolResult<ProducedSlots> {
-    let cx = docs
-        .get(&identity)
-        .ok_or_else(|| CalyxError::vault_access_denied("identity constellation not found"))?;
+    // Measure the CANDIDATE TEXT through the vault panel lenses themselves
+    // (GPU slots via the resident service, CPU slots locally) so the guard
+    // verdict compares real embeddings, not a content hash.
+    let home = crate::tools::vault::store::home_dir()?;
+    let measured = calyx_search::resident_measure::measure_query_vectors_resident_hybrid(
+        &runtime.state,
+        &home,
+        &runtime.path,
+        candidate_text,
+        None,
+    )
+    .map_err(|error| match error {
+        calyx_search::SearchError::Calyx(error) => ToolError::from(error),
+        calyx_search::SearchError::Io(message) => ToolError::invalid_params(message),
+        calyx_search::SearchError::Usage(message) => ToolError::invalid_params(message),
+    })?;
+    let by_slot: BTreeMap<_, _> = measured.into_iter().collect();
     let mut out = BTreeMap::new();
     for slot in &profile.required_slots {
-        let dim = cx
-            .slots
-            .get(slot)
-            .and_then(SlotVector::as_dense)
-            .map(|values| values.len())
-            .ok_or_else(|| {
-                CalyxError::stale_derived(format!("identity lacks dense slot {slot}"))
-            })?;
-        out.insert(*slot, text_vector(text, dim));
+        let vector = by_slot.get(slot).ok_or_else(|| {
+            CalyxError::stale_derived(format!(
+                "guard generate could not measure candidate text through required slot {slot}; ensure the slot is an active text lens on this panel"
+            ))
+        })?;
+        let SlotVector::Dense { data, .. } = vector else {
+            return Err(CalyxError::lens_dim_mismatch(format!(
+                "guard required slot {slot} is not dense; the guard profile must use dense slots"
+            ))
+            .into());
+        };
+        out.insert(*slot, data.clone());
     }
     Ok(out)
 }

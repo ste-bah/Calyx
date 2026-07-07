@@ -1,3 +1,4 @@
+#![allow(dead_code)] // rustc 1.95 ICE: dead_code diagnostic rendering panics (slice-index in warn_dead_code); same workaround as calyx-mcp lib.rs. Remove after toolchain bump.
 //! Calyx command-line entry point.
 mod a35_signal;
 mod a37_admission_store;

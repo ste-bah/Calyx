@@ -11,8 +11,8 @@ use calyx_ward::{
 };
 use serde::Deserialize;
 
-use super::core::{
-    dense, dense_dim, load_context, load_docs, parse_cx_id, read_json_row, text_vector,
+use super::core::{VaultContext, 
+    dense, load_context, load_docs, parse_cx_id, read_json_row,
     write_json_row,
 };
 use super::model::{
@@ -132,7 +132,7 @@ fn generate_command(vault_name: &str, text: &str, identity_cx: Option<&str>) -> 
             })?,
         };
     let matched = required_vectors(&docs, identity, &profile)?;
-    let produced = generated_vectors(text, docs.get(&identity), &profile)?;
+    let produced = generated_vectors(&ctx, text, &profile)?;
     let verdict = guard(&profile, &produced, &matched, true).map_err(ward_to_cli)?;
     print_json(&check_out(&verdict.per_slot, verdict.overall_pass))
 }
@@ -214,18 +214,37 @@ fn required_vectors(
 }
 
 fn generated_vectors(
+    ctx: &VaultContext,
     text: &str,
-    identity: Option<&Constellation>,
     profile: &GuardProfile,
 ) -> CliResult<BTreeMap<SlotId, Vec<f32>>> {
-    let identity = identity
-        .ok_or_else(|| CalyxError::vault_access_denied("identity constellation not found"))?;
+    // Measure the CANDIDATE TEXT through the vault panel lenses themselves
+    // (GPU slots via the resident service, CPU slots locally) so the guard
+    // verdict compares real embeddings, not a content hash. This is what makes
+    // guard_generate an identity gate rather than an exact-quote detector.
+    let home = super::super::vault::home_dir()?;
+    let measured = calyx_search::resident_measure::measure_query_vectors_resident_hybrid(
+        &ctx.state,
+        &home,
+        &ctx.path,
+        text,
+        None,
+    )?;
+    let by_slot: BTreeMap<SlotId, calyx_core::SlotVector> = measured.into_iter().collect();
     let mut out = BTreeMap::new();
     for slot in &profile.required_slots {
-        let dim = dense_dim(identity, &[*slot]).ok_or_else(|| {
-            CalyxError::stale_derived(format!("identity lacks dense slot {slot}"))
+        let vector = by_slot.get(slot).ok_or_else(|| {
+            CalyxError::stale_derived(format!(
+                "guard generate could not measure candidate text through required slot {slot}; ensure the slot is an active text lens on this panel"
+            ))
         })?;
-        out.insert(*slot, text_vector(text, dim));
+        let calyx_core::SlotVector::Dense { data, .. } = vector else {
+            return Err(CalyxError::lens_dim_mismatch(format!(
+                "guard required slot {slot} is not dense; the guard profile must use dense slots"
+            ))
+            .into());
+        };
+        out.insert(*slot, data.clone());
     }
     Ok(out)
 }

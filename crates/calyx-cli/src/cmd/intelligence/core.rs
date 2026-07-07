@@ -17,13 +17,15 @@ use crate::error::{CliError, CliResult};
 pub(super) struct VaultContext {
     pub vault: AsterVault,
     pub state: VaultPanelState,
+    pub(super) path: std::path::PathBuf,
 }
 
 pub(super) fn load_context(vault_name: &str) -> CliResult<VaultContext> {
     let resolved = resolve_vault_info(&home_dir()?, vault_name)?;
     let vault = open_vault(&resolved)?;
     let state = load_vault_panel_state(&resolved.path)?;
-    Ok(VaultContext { vault, state })
+    let path = resolved.path.clone();
+    Ok(VaultContext { vault, state, path })
 }
 
 pub(super) fn open_vault(resolved: &ResolvedVault) -> CliResult<AsterVault> {

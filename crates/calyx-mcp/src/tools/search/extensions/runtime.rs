@@ -12,6 +12,7 @@ use crate::server::{ToolError, ToolResult};
 use super::super::engine;
 
 pub(super) struct NavRuntime {
+    pub(super) path: std::path::PathBuf,
     pub(super) vault: AsterVault,
     pub(super) state: VaultPanelState,
     pub(super) docs: BTreeMap<CxId, Constellation>,
@@ -20,11 +21,13 @@ pub(super) struct NavRuntime {
 
 pub(super) fn load_runtime(vault: &str) -> ToolResult<NavRuntime> {
     let resolved = engine::resolve_requested_vault(vault)?;
+    let path = resolved.path.clone();
     let vault = engine::open_vault(&resolved)?;
     let state = load_vault_panel_state(&resolved.path)?;
     let loaded = engine::load_docs(&vault)?;
     let engine = build_search_engine(&loaded.docs, loaded.snapshot_seq)?;
     Ok(NavRuntime {
+        path,
         vault,
         state,
         docs: loaded.docs,
