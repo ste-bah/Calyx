@@ -12,9 +12,12 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-mod discovery;
 mod flags;
-mod protocol;
+
+// Wire protocol, frame codec, discovery file, and the minimal client calls
+// live in calyx-registry::resident (single source of truth shared with
+// calyx-mcp and calyx-search); the server implementation stays here.
+pub(crate) use calyx_registry::resident::{codec, discovery, protocol};
 
 pub(crate) use discovery::{ResidentDiscovery, read_resident_discovery, resident_discovery_path};
 
@@ -42,46 +45,12 @@ const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_MAX_RESIDENT_VRAM_MIB: u64 = 22 * 1024;
 const DEFAULT_RESIDENT_OVERHEAD_MULTIPLIER_MILLI: u64 = 2100;
 const DEFAULT_MAX_LOAD_SECS: u64 = 60;
-/// Resident client socket read/write timeout. SO_RCVTIMEO is per-syscall, so
-/// this bounds one blocking read — and the frame-header wait IS the GPU
-/// measure wait, so it must cover the slowest single batch. Long book chunks
-/// through 7 GPU lenses were observed near 40s; the old hardcoded 30s killed
-/// them mid-measure with EAGAIN (os error 11) as
-/// CALYX_PANEL_RESIDENT_BINARY_FRAME. Matches the cold lens-worker default
-/// (DEFAULT_LENS_WORKER_TIMEOUT_SECS = 300).
-const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 300;
-const CLIENT_TIMEOUT_ENV: &str = "CALYX_RESIDENT_CLIENT_TIMEOUT_SECS";
-const CLIENT_TIMEOUT_REMEDIATION: &str =
-    "start `calyx panel resident serve` on the requested loopback address; for measurements \
-     slower than the client timeout, raise CALYX_RESIDENT_CLIENT_TIMEOUT_SECS";
-
-/// Resolve the resident client timeout, overridable via
-/// CALYX_RESIDENT_CLIENT_TIMEOUT_SECS. Fails loud on an unparseable or zero
-/// value — never falls back silently.
-fn client_timeout_secs() -> CliResult<u64> {
-    let Some(value) = std::env::var_os(CLIENT_TIMEOUT_ENV) else {
-        return Ok(DEFAULT_CLIENT_TIMEOUT_SECS);
-    };
-    let value = value.to_str().ok_or_else(|| {
-        CliError::usage(format!("{CLIENT_TIMEOUT_ENV} is not valid unicode"))
-    })?;
-    let secs = value.trim().parse::<u64>().map_err(|error| {
-        CliError::usage(format!(
-            "{CLIENT_TIMEOUT_ENV}={value} is not a valid timeout in seconds: {error}"
-        ))
-    })?;
-    if secs == 0 {
-        return Err(CliError::usage(format!(
-            "{CLIENT_TIMEOUT_ENV} must be greater than zero"
-        )));
-    }
-    Ok(secs)
-}
-const RESIDENT_BINARY_MAGIC: &[u8] = b"CALYX_PANEL_RESIDENT_BIN1\n";
-const MAX_RESIDENT_SERVICE_FRAME_BYTES: usize = 2 * 1024 * 1024 * 1024;
+use calyx_registry::resident::{
+    CLIENT_TIMEOUT_REMEDIATION, MAX_RESIDENT_SERVICE_FRAME_BYTES, RESIDENT_BINARY_MAGIC,
+    client_timeout_secs,
+};
 
 mod client;
-mod codec;
 mod dispatch;
 mod parallel;
 mod server;
@@ -90,7 +59,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use client::{measure_batch_at, ready_value_at};
+pub(crate) use calyx_registry::resident::{measure_batch_at, ready_value_at};
 pub(crate) fn run(args: &[String]) -> CliResult {
     let Some(command) = args.first().map(String::as_str) else {
         return Err(CliError::usage(

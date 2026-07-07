@@ -68,9 +68,10 @@ impl Tool for SearchTool {
     fn call(&self, params: Value) -> ToolResult<Value> {
         let args: SearchArgs = decode("calyx.search", params)?;
         let request = SearchRequest::from_args(args)?;
-        let outcome = engine::search(&request)?;
-        let mut response =
-            json!({ "hits": output::render_hits(&outcome.hits, request.explain, None) });
+        let outcome = engine::search_shared(&request)?;
+        let mut response = json!({
+            "hits": output::render_hits(&outcome.hits, request.explain, outcome.guard_tau)
+        });
         if request.guard == SearchGuard::InRegion {
             response["dropped_guard_hits"] = json!(outcome.dropped_guard_hits);
         }
@@ -111,7 +112,7 @@ impl Tool for KernelAnswerTool {
             freshness: FreshnessRequirement::FreshDerived,
             filter: None,
         };
-        let outcome = engine::search(&search)?;
+        let outcome = engine::search_shared(&search)?;
         serde_json::to_value(engine::kernel_report(
             &outcome.docs,
             &outcome.hits,

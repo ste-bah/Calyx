@@ -23,6 +23,7 @@ calyx-ledger = { path = "../calyx-ledger" }
 calyx-loom = { path = "../calyx-loom" }
 calyx-paths = { path = "../calyx-paths" }
 calyx-registry = { path = "../calyx-registry" }
+calyx-search = { path = "../calyx-search" }
 calyx-sextant = { path = "../calyx-sextant" }
 calyx-ward = { path = "../calyx-ward" }
 blake3.workspace = true

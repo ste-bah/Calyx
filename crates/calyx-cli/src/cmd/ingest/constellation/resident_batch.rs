@@ -27,8 +27,8 @@ pub(super) fn measure_gpu_lenses_via_resident_service(
             code: "CALYX_PANEL_RESIDENT_UNAVAILABLE",
             message: format!(
                 "resident service measurement failed addr={addr} code={} message={}",
-                error.code(),
-                error.message()
+                error.code,
+                error.message
             ),
             remediation: "start `calyx panel resident serve` for the matching GPU panel on the requested loopback address, then retry ingest",
         })?;

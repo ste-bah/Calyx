@@ -1,6 +1,16 @@
-use super::*;
+//! Length-prefixed bincode frame codec for the resident binary protocol.
+//! Moved verbatim from calyx-cli; shared by client (here) and server (CLI).
 
-pub(crate) fn encode_binary(value: &impl Serialize) -> Result<Vec<u8>, CalyxError> {
+use std::io::{self, Read, Write};
+
+use bincode::config;
+use calyx_core::CalyxError;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use super::{CLIENT_TIMEOUT_REMEDIATION, MAX_RESIDENT_SERVICE_FRAME_BYTES};
+
+pub fn encode_binary(value: &impl Serialize) -> Result<Vec<u8>, CalyxError> {
     bincode::serde::encode_to_vec(value, config::standard()).map_err(|error| CalyxError {
         code: "CALYX_PANEL_RESIDENT_BINARY_ENCODE",
         message: format!("encode resident binary frame failed: {error}"),
@@ -8,7 +18,7 @@ pub(crate) fn encode_binary(value: &impl Serialize) -> Result<Vec<u8>, CalyxErro
     })
 }
 
-pub(crate) fn decode_binary<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CalyxError> {
+pub fn decode_binary<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CalyxError> {
     let (value, consumed) =
         bincode::serde::decode_from_slice(bytes, config::standard()).map_err(|error| {
             CalyxError {
@@ -30,7 +40,7 @@ pub(crate) fn decode_binary<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Caly
     Ok(value)
 }
 
-pub(crate) fn write_frame(writer: &mut dyn Write, bytes: &[u8]) -> Result<(), CalyxError> {
+pub fn write_frame(writer: &mut dyn Write, bytes: &[u8]) -> Result<(), CalyxError> {
     if bytes.len() > MAX_RESIDENT_SERVICE_FRAME_BYTES {
         return Err(CalyxError {
             code: "CALYX_PANEL_RESIDENT_BINARY_FRAME",
@@ -60,7 +70,7 @@ pub(crate) fn write_frame(writer: &mut dyn Write, bytes: &[u8]) -> Result<(), Ca
         })
 }
 
-pub(crate) fn read_frame(reader: &mut dyn Read) -> Result<Vec<u8>, CalyxError> {
+pub fn read_frame(reader: &mut dyn Read) -> Result<Vec<u8>, CalyxError> {
     let mut header = [0_u8; 8];
     let mut offset = 0;
     while offset < header.len() {

@@ -46,7 +46,7 @@ pub(super) fn check_resident_parallelism(addr: SocketAddr) -> HealthCheck {
             return fail(
                 "calyx_resident_parallelism",
                 "CALYX_HEALTH_RESIDENT_UNREACHABLE",
-                format!("ready probe {addr}: {} {}", error.code(), error.message()),
+                format!("ready probe {addr}: {} {}", error.code, error.message),
             );
         }
     };
@@ -66,8 +66,8 @@ pub(super) fn check_resident_parallelism(addr: SocketAddr) -> HealthCheck {
                 "CALYX_HEALTH_RESIDENT_PROBE_FAILED",
                 format!(
                     "measure_batch probe {addr}: {} {}",
-                    error.code(),
-                    error.message()
+                    error.code,
+                    error.message
                 ),
             );
         }

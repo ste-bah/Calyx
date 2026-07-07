@@ -13,6 +13,7 @@ pub mod error;
 pub mod filters;
 pub mod persisted;
 mod provenance;
+pub mod resident_measure;
 
 pub use engine::{
     DEFAULT_IN_REGION_GUARD_TAU, FusionChoice, GuardChoice, SearchBudget, SearchFreshness,

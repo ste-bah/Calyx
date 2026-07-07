@@ -75,7 +75,7 @@ pub struct SearchOutcome {
 }
 
 impl SearchOutcome {
-    pub(super) fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             hits: Vec::new(),
             guard_tau: None,

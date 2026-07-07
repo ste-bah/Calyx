@@ -68,8 +68,8 @@ pub(super) fn measure_query_vectors_via_resident(
             code: "CALYX_PANEL_RESIDENT_UNAVAILABLE",
             message: format!(
                 "resident probe-matrix measurement failed addr={addr} code={} message={}",
-                error.code(),
-                error.message()
+                error.code,
+                error.message
             ),
             remediation:
                 "start `calyx panel resident serve --vault <vault-path>` for the matching active vault, then retry probe-matrix with --resident-addr",

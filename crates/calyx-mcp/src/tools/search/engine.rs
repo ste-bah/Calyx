@@ -453,3 +453,79 @@ fn no_indexable_stored_vectors() -> CalyxError {
         "search has no indexable stored slot vectors matching active query lenses; reingest or backfill stale slot rows",
     )
 }
+
+pub(super) fn search_shared(request: &SearchRequest) -> ToolResult<calyx_search::SearchOutcome> {
+    let resolved = resolve_requested_vault(&request.vault)?;
+    let state = load_vault_panel_state(&resolved.path)?;
+    let home = home_dir()?;
+    let query_vectors = calyx_search::resident_measure::measure_query_vectors_resident_hybrid(
+        &state,
+        &home,
+        &resolved.path,
+        &request.query,
+        None,
+    )
+    .map_err(search_error_to_tool)?;
+    if query_vectors.is_empty() {
+        return Err(no_indexable_query_vectors().into());
+    }
+    let vault = open_vault(&resolved)?;
+    let filter = request
+        .filter
+        .as_ref()
+        .map(|value| serde_json::to_string(value))
+        .transpose()
+        .map_err(|error| ToolError::invalid_params(format!("serialize filter: {error}")))?;
+    calyx_search::search_outcome_with_query_vectors_freshness(
+        &vault,
+        &resolved.path,
+        &query_vectors,
+        request.k,
+        shared_fusion(request.fusion),
+        shared_guard(request.guard),
+        Some(u64::from(state.panel.version)),
+        filter.as_deref(),
+        request.explain,
+        shared_freshness(&request.freshness),
+        calyx_search::SearchBudget::disabled(),
+        None,
+    )
+    .map_err(search_error_to_tool)
+}
+
+fn shared_fusion(fusion: super::SearchFusion) -> calyx_search::FusionChoice {
+    match fusion {
+        super::SearchFusion::Rrf => calyx_search::FusionChoice::Rrf,
+        super::SearchFusion::WeightedRrf => calyx_search::FusionChoice::WeightedRrf,
+        super::SearchFusion::SingleLens => calyx_search::FusionChoice::SingleLens,
+        super::SearchFusion::KernelFirst => calyx_search::FusionChoice::KernelFirst,
+        super::SearchFusion::Pipeline => calyx_search::FusionChoice::Pipeline,
+    }
+}
+
+fn shared_guard(guard: SearchGuard) -> calyx_search::GuardChoice {
+    match guard {
+        SearchGuard::Off => calyx_search::GuardChoice::Off,
+        SearchGuard::InRegion => calyx_search::GuardChoice::InRegion,
+    }
+}
+
+fn shared_freshness(
+    freshness: &calyx_sextant::FreshnessRequirement,
+) -> calyx_search::SearchFreshness {
+    match freshness {
+        calyx_sextant::FreshnessRequirement::FreshDerived => calyx_search::SearchFreshness::Fresh,
+        calyx_sextant::FreshnessRequirement::StaleOk { .. } => {
+            calyx_search::SearchFreshness::StaleOk
+        }
+    }
+}
+
+fn search_error_to_tool(error: calyx_search::SearchError) -> ToolError {
+    match error {
+        calyx_search::SearchError::Calyx(error) => ToolError::from(error),
+        calyx_search::SearchError::Io(message) => ToolError::invalid_params(message),
+        calyx_search::SearchError::Usage(message) => ToolError::invalid_params(message),
+    }
+}
+

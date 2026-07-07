@@ -1,3 +1,4 @@
+#![allow(dead_code)] // rustc 1.95 ICE: emitting dead_code diagnostics for tools::search panics in the renderer (slice-index in warn_dead_code -> track_diagnostic); suppress emission crate-wide until the pinned toolchain moves past it. Do NOT remove without testing cargo check -p calyx-mcp.
 //! MCP interface for agent-facing Calyx operations.
 //!
 //! The wire stack is split across modules: [`jsonrpc`] decodes inbound requests,

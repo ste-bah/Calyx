@@ -68,7 +68,7 @@ pub(crate) fn serve(args: &[String]) -> CliResult {
     // that via the live readiness probe.
     let removed = remove_resident_discovery(&home, std::process::id());
     served?;
-    removed
+    Ok(removed?)
 }
 
 fn resolve_home(flags: &mut ServeFlags) -> CliResult<PathBuf> {

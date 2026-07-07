@@ -20,6 +20,7 @@ pub mod persistence;
 mod persistence_contracts;
 pub mod placement;
 pub mod profile;
+pub mod resident;
 pub mod runtime;
 mod runtime_limit;
 pub mod spec;

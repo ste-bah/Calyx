@@ -130,8 +130,8 @@ fn measure_search_query_vectors_via_resident(
                 code: "CALYX_PANEL_RESIDENT_UNAVAILABLE",
                 message: format!(
                     "resident search measurement failed addr={addr} code={} message={}",
-                    error.code(),
-                    error.message()
+                    error.code,
+                    error.message
                 ),
                 remediation: "start `calyx panel resident serve --vault <vault-path>` for the matching active vault, then retry search with --resident-addr",
             }

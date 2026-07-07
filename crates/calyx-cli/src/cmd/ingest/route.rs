@@ -177,7 +177,7 @@ fn probe_discovered_service(
                 "phase=gpu_route_discovery_skipped path={} reason=stale_unreachable bind={} error_code={}",
                 resident_discovery_path(home).display(),
                 discovery.bind,
-                error.code()
+                error.code
             ));
             return Ok(Err("stale_unreachable"));
         }

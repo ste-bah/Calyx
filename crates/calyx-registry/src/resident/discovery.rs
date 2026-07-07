@@ -1,55 +1,55 @@
+//! Resident-service discovery file, written by `calyx panel resident serve`
+//! and consumed by every route resolver (ingest, search, MCP). Moved verbatim
+//! from calyx-cli with CalyxError error types.
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
-
-use crate::error::{CliError, CliResult};
 
 /// Schema tag for the resident-service discovery file. Bump when the shape
 /// changes so stale readers fail closed instead of misinterpreting fields.
-pub(crate) const RESIDENT_DISCOVERY_SCHEMA: &str = "calyx-panel-resident-discovery-v1";
+pub const RESIDENT_DISCOVERY_SCHEMA: &str = "calyx-panel-resident-discovery-v1";
 
 /// Well-known discovery record written by `calyx panel resident serve` under
-/// `<CALYX_HOME>/resident/discovery.json`. Consumers (ingest route resolution)
-/// treat every anomaly as "no discovered route" and record the reason; the
-/// fail-closed enforcement happens at the GPU measurement gate, so a corrupt
-/// or stale file never silently degrades a CPU-only ingest.
+/// `<CALYX_HOME>/resident/discovery.json`. Consumers (ingest route resolution,
+/// search, MCP) treat every anomaly as "no discovered route" and record the
+/// reason; the fail-closed enforcement happens at the GPU measurement gate, so
+/// a corrupt or stale file never silently degrades a CPU-only path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct ResidentDiscovery {
-    pub(crate) schema: String,
-    pub(crate) bind: SocketAddr,
-    pub(crate) process_id: u32,
+pub struct ResidentDiscovery {
+    pub schema: String,
+    pub bind: SocketAddr,
+    pub process_id: u32,
     /// Canonicalized vault path when the service warmed from `--vault`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) vault: Option<PathBuf>,
+    pub vault: Option<PathBuf>,
     /// Template selector when the service warmed from `--template`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) template: Option<String>,
-    pub(crate) written_at_unix_ms: u64,
+    pub template: Option<String>,
+    pub written_at_unix_ms: u64,
 }
 
-pub(crate) fn resident_discovery_path(home: &Path) -> PathBuf {
+pub fn resident_discovery_path(home: &Path) -> PathBuf {
     home.join("resident").join("discovery.json")
 }
 
-pub(crate) fn write_resident_discovery(
-    home: &Path,
-    discovery: &ResidentDiscovery,
-) -> CliResult<PathBuf> {
+pub fn write_resident_discovery(home: &Path, discovery: &ResidentDiscovery) -> Result<PathBuf> {
     let path = resident_discovery_path(home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
-            CliError::io(format!(
+            discovery_io(format!(
                 "create resident discovery dir {}: {error}",
                 parent.display()
             ))
         })?;
     }
     let bytes = serde_json::to_vec_pretty(discovery)
-        .map_err(|error| CliError::runtime(format!("serialize resident discovery: {error}")))?;
+        .map_err(|error| discovery_io(format!("serialize resident discovery: {error}")))?;
     std::fs::write(&path, bytes).map_err(|error| {
-        CliError::io(format!(
+        discovery_io(format!(
             "write resident discovery file {}: {error}",
             path.display()
         ))
@@ -57,12 +57,10 @@ pub(crate) fn write_resident_discovery(
     Ok(path)
 }
 
-/// Read the discovery file. `Ok(None)` means "not discoverable" (missing file);
-/// parse/schema anomalies also resolve to `Ok(None)` with the reason returned so
+/// Read the discovery file. `Ok(Err(reason))` means "not discoverable"
+/// (missing file); parse/schema anomalies also resolve to `Ok(Err(reason))` so
 /// the caller can surface it at the GPU gate — see the struct-level contract.
-pub(crate) fn read_resident_discovery(
-    home: &Path,
-) -> CliResult<Result<ResidentDiscovery, &'static str>> {
+pub fn read_resident_discovery(home: &Path) -> Result<std::result::Result<ResidentDiscovery, &'static str>> {
     let path = resident_discovery_path(home);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -70,7 +68,7 @@ pub(crate) fn read_resident_discovery(
             return Ok(Err("no_discovery_file"));
         }
         Err(error) => {
-            return Err(CliError::io(format!(
+            return Err(discovery_io(format!(
                 "read resident discovery file {}: {error}",
                 path.display()
             )));
@@ -88,14 +86,14 @@ pub(crate) fn read_resident_discovery(
     Ok(Ok(discovery))
 }
 
-pub(crate) fn remove_resident_discovery(home: &Path, process_id: u32) -> CliResult<()> {
+pub fn remove_resident_discovery(home: &Path, process_id: u32) -> Result<()> {
     let path = resident_discovery_path(home);
     // Only remove a record this process wrote; a newer service instance may
     // have already replaced it.
     match read_resident_discovery(home)? {
         Ok(discovery) if discovery.process_id == process_id => {
             std::fs::remove_file(&path).map_err(|error| {
-                CliError::io(format!(
+                discovery_io(format!(
                     "remove resident discovery file {}: {error}",
                     path.display()
                 ))
@@ -105,11 +103,19 @@ pub(crate) fn remove_resident_discovery(home: &Path, process_id: u32) -> CliResu
     }
 }
 
-pub(crate) fn unix_now_ms() -> u64 {
+pub fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn discovery_io(message: String) -> CalyxError {
+    CalyxError {
+        code: "CALYX_PANEL_RESIDENT_DISCOVERY_IO",
+        message,
+        remediation: "check CALYX_HOME permissions and the resident/discovery.json path",
+    }
 }
 
 #[cfg(test)]
@@ -121,7 +127,7 @@ mod tests {
     impl TempHome {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "calyx-resident-discovery-{tag}-{}",
+                "calyx-registry-resident-discovery-{tag}-{}",
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
