@@ -42,6 +42,7 @@ pub(crate) enum GuardCommand {
         domain: String,
         set: PathBuf,
         target_far: f32,
+        identity_cx: Option<String>,
     },
     Check {
         cx_id: String,
@@ -165,6 +166,7 @@ fn guard_layout(rest: &[String]) -> CliResult<(String, String, &[String])> {
 fn parse_guard_calibrate(flags: &[String]) -> CliResult<GuardCommand> {
     let mut domain = None;
     let mut set = None;
+    let mut identity_cx = None;
     let mut target_far = None;
     let mut idx = 0;
     while idx < flags.len() {
@@ -172,6 +174,10 @@ fn parse_guard_calibrate(flags: &[String]) -> CliResult<GuardCommand> {
             "--domain" => {
                 idx += 1;
                 domain = Some(value(flags, idx, "--domain")?.to_string());
+            }
+            "--identity-cx" => {
+                idx += 1;
+                identity_cx = Some(value(flags, idx, "--identity-cx")?.to_string());
             }
             "--set" => {
                 idx += 1;
@@ -197,6 +203,7 @@ fn parse_guard_calibrate(flags: &[String]) -> CliResult<GuardCommand> {
         set: set.ok_or_else(|| CliError::usage("guard calibrate requires --set <jsonl>"))?,
         target_far: target_far
             .ok_or_else(|| CliError::usage("guard calibrate requires --target-far <f32>"))?,
+        identity_cx,
     })
 }
 
@@ -320,8 +327,12 @@ pub(crate) fn guard_tokens(args: &GuardArgs) -> Vec<String> {
             domain,
             set,
             target_far,
+            identity_cx,
         } => {
             out.push("calibrate".to_string());
+            if let Some(identity) = identity_cx {
+                out.extend(["--identity-cx".to_string(), identity.clone()]);
+            }
             out.extend(["--domain".to_string(), domain.clone()]);
             out.extend(["--set".to_string(), set.display().to_string()]);
             out.extend(["--target-far".to_string(), target_far.to_string()]);

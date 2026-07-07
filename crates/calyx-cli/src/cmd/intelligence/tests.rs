@@ -114,7 +114,7 @@ fn guard_calibration_jsonl_blocks_99_percent_injections() {
         jsonl.push('\n');
     }
     fs::write(&path, jsonl).unwrap();
-    let scores = guard::read_calibration_set(&path).unwrap();
+    let scores = guard::read_calibration_set(&path, None).unwrap();
     let inputs = scores
         .into_iter()
         .map(|(slot, scores)| calyx_ward::CalibrationInput {

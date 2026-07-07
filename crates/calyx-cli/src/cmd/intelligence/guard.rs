@@ -4,7 +4,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use calyx_aster::cf::ColumnFamily;
-use calyx_core::{CalyxError, Constellation, CxId, SlotId};
+use calyx_core::{CalyxError, Constellation, CxId, SlotId, VaultStore};
 use calyx_ward::{
     CalibrationInput, GuardId, GuardPolicy, GuardProfile, NoveltyAction, SlotKind, WardError,
     calibrate, guard, validate_calibration_slots,
@@ -34,6 +34,7 @@ pub(super) struct SlotScores {
 struct CalibrationLine {
     slot: Option<u16>,
     score: Option<f32>,
+    text: Option<String>,
     good: Option<bool>,
     class: Option<String>,
     label: Option<String>,
@@ -46,7 +47,8 @@ pub(super) fn command(args: GuardArgs) -> CliResult {
             domain,
             set,
             target_far,
-        } => calibrate_command(&args.vault, &domain, &set, target_far),
+            identity_cx,
+        } => calibrate_command(&args.vault, &domain, &set, target_far, identity_cx.as_deref()),
         GuardCommand::Check { cx_id, identity_cx } => {
             check_command(&args.vault, &cx_id, identity_cx.as_deref())
         }
@@ -57,9 +59,56 @@ pub(super) fn command(args: GuardArgs) -> CliResult {
     }
 }
 
-fn calibrate_command(vault_name: &str, domain: &str, set: &Path, target_far: f32) -> CliResult {
+fn calibrate_command(
+    vault_name: &str,
+    domain: &str,
+    set: &Path,
+    target_far: f32,
+    identity_cx: Option<&str>,
+) -> CliResult {
     let ctx = load_context(vault_name)?;
-    let scores = read_calibration_set(set)?;
+    // Raw-text calibration rows are scored through the SAME measurement the
+    // guard verdict uses (real lens embeddings via the resident hybrid) so
+    // calibration and enforcement cannot drift apart.
+    let identity_doc = match identity_cx {
+        Some(raw) => {
+            let id = parse_cx_id(raw, "--identity-cx")?;
+            Some(ctx.vault.get(id, ctx.vault.snapshot())?)
+        }
+        None => None,
+    };
+    let scorer = |text: &str| -> CliResult<Vec<(SlotId, f32)>> {
+        let identity = identity_doc.as_ref().ok_or_else(|| {
+            CliError::usage(
+                "calibration rows with raw text require --identity-cx <cx> to score against",
+            )
+        })?;
+        let home = super::super::vault::home_dir()?;
+        let measured = calyx_search::resident_measure::measure_query_vectors_resident_hybrid(
+            &ctx.state,
+            &home,
+            &ctx.path,
+            text,
+            None,
+        )?;
+        let mut out = Vec::new();
+        for (slot, vector) in measured {
+            let calyx_core::SlotVector::Dense { data, .. } = &vector else {
+                continue;
+            };
+            let Some(identity_values) = dense(identity, slot) else {
+                continue;
+            };
+            out.push((slot, cosine(data, identity_values)));
+        }
+        if out.is_empty() {
+            return Err(CliError::usage(
+                "calibration text produced no dense slots shared with the identity constellation",
+            ));
+        }
+        Ok(out)
+    };
+    let scores = read_calibration_set(set, Some(&scorer))?;
     let inputs = scores
         .into_iter()
         .map(|(slot, scores)| CalibrationInput {
@@ -137,7 +186,10 @@ fn generate_command(vault_name: &str, text: &str, identity_cx: Option<&str>) -> 
     print_json(&check_out(&verdict.per_slot, verdict.overall_pass))
 }
 
-pub(super) fn read_calibration_set(path: &Path) -> CliResult<BTreeMap<SlotId, SlotScores>> {
+pub(super) fn read_calibration_set(
+    path: &Path,
+    scorer: Option<&dyn Fn(&str) -> CliResult<Vec<(SlotId, f32)>>>,
+) -> CliResult<BTreeMap<SlotId, SlotScores>> {
     let text = fs::read_to_string(path).map_err(|error| {
         CliError::io(format!(
             "read guard calibration set {}: {error}",
@@ -152,8 +204,25 @@ pub(super) fn read_calibration_set(path: &Path) -> CliResult<BTreeMap<SlotId, Sl
         let row: CalibrationLine = serde_json::from_str(line).map_err(|error| {
             CliError::usage(format!("parse calibration JSONL line {}: {error}", idx + 1))
         })?;
+        if row.score.is_none() {
+            if let (Some(text), Some(scorer)) = (row.text.as_deref(), scorer) {
+                let good = row_is_good(&row)?;
+                for (slot, score) in scorer(text)? {
+                    let entry = scores.entry(slot).or_default();
+                    if good {
+                        entry.good.push(score);
+                    } else {
+                        entry.bad.push(score);
+                    }
+                }
+                continue;
+            }
+        }
         let score = row.score.ok_or_else(|| {
-            CliError::usage(format!("calibration line {} missing score", idx + 1))
+            CliError::usage(format!(
+                "calibration line {} missing score (provide score, or text plus --identity-cx)",
+                idx + 1
+            ))
         })?;
         let slot = SlotId::new(row.slot.unwrap_or(0));
         let entry = scores.entry(slot).or_default();
@@ -323,4 +392,20 @@ fn ward_to_cli(error: WardError) -> CliError {
             _ => "inspect guard calibration inputs and required slots",
         },
     })
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = (na.sqrt() * nb.sqrt()).max(f32::EPSILON);
+    dot / denom
 }
