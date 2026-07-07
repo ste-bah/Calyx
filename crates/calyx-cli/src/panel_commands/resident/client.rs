@@ -70,7 +70,7 @@ fn send_request(addr: SocketAddr, request: Value) -> CliResult<Value> {
             remediation: CLIENT_TIMEOUT_REMEDIATION,
         })
     })?;
-    let timeout = Some(Duration::from_secs(CLIENT_TIMEOUT_SECS));
+    let timeout = Some(Duration::from_secs(client_timeout_secs()?));
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
     serde_json::to_writer(&mut stream, &request)
@@ -97,7 +97,7 @@ pub(crate) fn measure_batch_at(
             remediation: CLIENT_TIMEOUT_REMEDIATION,
         })
     })?;
-    let timeout = Some(Duration::from_secs(CLIENT_TIMEOUT_SECS));
+    let timeout = Some(Duration::from_secs(client_timeout_secs()?));
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
     stream.write_all(RESIDENT_BINARY_MAGIC)?;
@@ -129,7 +129,7 @@ fn measure_batch_summary_at(
             remediation: CLIENT_TIMEOUT_REMEDIATION,
         })
     })?;
-    let timeout = Some(Duration::from_secs(CLIENT_TIMEOUT_SECS));
+    let timeout = Some(Duration::from_secs(client_timeout_secs()?));
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
     stream.write_all(RESIDENT_BINARY_MAGIC)?;
