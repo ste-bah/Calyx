@@ -69,7 +69,14 @@ pub(super) fn cpu_ep_fallback_disabled_for_policy(policy: OnnxProviderPolicy) ->
             remediation: "unset CALYX_ONNX_DISABLE_CPU_EP_FALLBACK for CPU-policy sessions, or use CudaFailLoud when every node must stay off CPU",
         });
     }
-    Ok(matches!(policy, OnnxProviderPolicy::CudaFailLoud) || env_requested)
+    // LOCAL OVERRIDE of upstream's strict GPU policy: our full-panel-v2 vaults
+    // include ONNX lenses (e.g. semantic_bge_small_en_v1_5 / Xenova bge-small)
+    // whose graphs place some ops on the CPU EP with no CUDA kernel; forcing
+    // no-CPU-fallback on every CudaFailLoud session aborts the whole resident,
+    // and our existing calibrations were built with that fallback active.
+    // Disable CPU fallback only when explicitly requested via the env flag.
+    let _ = policy;
+    Ok(env_requested)
 }
 
 pub(super) fn configured_cuda_graphs() -> Result<bool> {
