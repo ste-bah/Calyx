@@ -8,6 +8,7 @@ use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::lens::ensure_input_modality;
 
 mod gdelt;
+mod stylometry;
 
 const BYTE_FEATURE_DIM: u32 = 16;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -24,6 +25,10 @@ pub enum AlgorithmicEncoder {
     OneHot { buckets: u32 },
     /// Small AST/code-style feature vector.
     AstStyle,
+    /// Prose pacing statistics (sentence rhythm, dialogue share, figurative
+    /// and abstract density, function-word profile) z-scored against frozen
+    /// English-narrative reference statistics.
+    Stylometry,
     /// Hashed whitespace terms in a sparse ambient space.
     SparseKeywords { dim: u32 },
     /// Hashed whitespace terms as per-token vectors for MaxSim.
@@ -70,6 +75,7 @@ impl AlgorithmicEncoder {
                 }
             }
             Self::AstStyle => 8,
+            Self::Stylometry => stylometry::STYLO_DIM,
             Self::SparseKeywords { dim }
             | Self::GdeltActorGeo { dim }
             | Self::GdeltSourceDomain { dim }
@@ -148,6 +154,10 @@ impl AlgorithmicLens {
 
     pub fn ast_style(name: impl Into<String>, modality: Modality) -> Self {
         Self::new(name, modality, AlgorithmicEncoder::AstStyle)
+    }
+
+    pub fn stylometry(name: impl Into<String>, modality: Modality) -> Self {
+        Self::new(name, modality, AlgorithmicEncoder::Stylometry)
     }
 
     pub fn sparse_keywords(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
@@ -268,6 +278,10 @@ impl Lens for AlgorithmicLens {
             AlgorithmicEncoder::AstStyle => SlotVector::Dense {
                 dim: self.encoder.dim(),
                 data: ast_style_features(&input.bytes),
+            },
+            AlgorithmicEncoder::Stylometry => SlotVector::Dense {
+                dim: self.encoder.dim(),
+                data: stylometry::stylometry_features(&input.bytes),
             },
             AlgorithmicEncoder::SparseKeywords { dim } => sparse_keywords(&input.bytes, dim)?,
             AlgorithmicEncoder::TokenHash { token_dim } => token_hash(&input.bytes, token_dim)?,

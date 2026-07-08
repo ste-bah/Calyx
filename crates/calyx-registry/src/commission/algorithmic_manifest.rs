@@ -24,6 +24,7 @@ pub(super) fn output_shape(runtime: &str, dim: u32) -> Result<SlotShape> {
     let shape = match kind {
         "byte" | "byte-features" => checked_dense(kind, dim, 16)?,
         "ast-style" | "ast_style" => checked_dense(kind, dim, 8)?,
+        "stylometry" => checked_dense(kind, dim, 33)?,
         "gdelt-cameo" | "gdelt_cameo" => checked_dense(kind, dim, 16)?,
         "gdelt-actor-geo"
         | "gdelt_actor_geo"
@@ -94,6 +95,7 @@ fn encoder_from_kind(kind: &str, shape: SlotShape) -> Result<AlgorithmicEncoder>
     let encoder = match kind {
         "byte" | "byte-features" | "byte_features" => AlgorithmicEncoder::ByteFeatures,
         "ast-style" | "ast_style" => AlgorithmicEncoder::AstStyle,
+        "stylometry" => AlgorithmicEncoder::Stylometry,
         "gdelt-cameo" | "gdelt_cameo" => AlgorithmicEncoder::GdeltCameo,
         "gdelt-actor-geo" | "gdelt_actor_geo" => AlgorithmicEncoder::GdeltActorGeo {
             dim: sparse_shape_dim(kind, shape)?,

@@ -149,6 +149,7 @@ fn algorithmic_lens(spec: &LensSpec, kind: &str) -> Option<AlgorithmicLens> {
             spec.modality,
             sparse_dim(spec.output)?,
         )),
+        "stylometry" => Some(AlgorithmicLens::stylometry(&spec.name, spec.modality)),
         "sparse" | "sparse_keywords" | "sparse-keywords" => Some(AlgorithmicLens::sparse_keywords(
             &spec.name,
             spec.modality,

@@ -115,6 +115,7 @@ fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEncode
         "gdelt_source_event" | "gdelt-source-event" => Some(AlgorithmicEncoder::GdeltSourceEvent {
             dim: sparse_dim(shape)?,
         }),
+        "stylometry" => Some(AlgorithmicEncoder::Stylometry),
         "sparse" | "sparse_keywords" | "sparse-keywords" => {
             Some(AlgorithmicEncoder::SparseKeywords {
                 dim: sparse_dim(shape)?,

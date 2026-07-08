@@ -121,6 +121,7 @@ fn build_algorithmic_lens(
         "byte" | "byte-features" => AlgorithmicLens::byte_features(name, modality),
         "scalar" => AlgorithmicLens::scalar(name, modality),
         "ast-style" => AlgorithmicLens::ast_style(name, modality),
+        "stylometry" => AlgorithmicLens::stylometry(name, modality),
         "gdelt-cameo" | "gdelt_cameo" => AlgorithmicLens::gdelt_cameo(name, modality),
         "gdelt-actor-geo" | "gdelt_actor_geo" => AlgorithmicLens::gdelt_actor_geo(
             name,
