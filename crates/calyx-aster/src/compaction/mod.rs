@@ -2,19 +2,16 @@
 
 mod rolling;
 mod scan;
+mod scheduler;
 mod tiering;
 
 use crate::cf::ColumnFamily;
 use crate::sst::SstReader;
 use crate::storage_names::{SstName, classify_sst};
 use calyx_core::{CalyxError, Result};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 /// Default per-CF compaction target used for debt scoring (PRD 24 §8).
 pub const DEFAULT_COMPACTION_TARGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -25,6 +22,10 @@ const COMPACTION_ADOPTION_LAST_INDEX: usize = 9_999;
 pub(crate) use rolling::RollingSstWriter;
 use rolling::compact_shards_with_target;
 pub use scan::{catalog_from_vault_dir, catalog_from_vault_tiers};
+pub use scheduler::{
+    AdaptiveCompactionSchedule, CompactionScheduleDecision, CompactionScheduleHook,
+    CompactionScheduleState, CompactionScheduler, CompactionSchedulerOptions,
+};
 pub use tiering::{StorageTier, TierPlacement, TierWrite, TieringPolicy};
 
 /// One immutable SST file in the active shard set.
@@ -168,115 +169,6 @@ impl CompactionCatalog {
             }
         }
         cfs
-    }
-}
-
-/// Background compaction cadence and anti-storm controls.
-#[derive(Debug, Clone)]
-pub struct CompactionSchedulerOptions {
-    pub interval_ms: u64,
-    pub debt_trigger_score_milli: u64,
-    pub max_write_amp_milli: u64,
-    pub backoff_factor: u64,
-    pub max_interval_ms: u64,
-    pub output_root: PathBuf,
-    pub tiering_policy: Option<TieringPolicy>,
-}
-
-impl Default for CompactionSchedulerOptions {
-    fn default() -> Self {
-        Self {
-            interval_ms: 10_000,
-            debt_trigger_score_milli: 1_000,
-            max_write_amp_milli: 2_000,
-            backoff_factor: 2,
-            max_interval_ms: 60_000,
-            output_root: env::temp_dir().join("calyx-compaction-scheduler"),
-            tiering_policy: None,
-        }
-    }
-}
-
-/// Background thread that compacts CFs whose debt crosses the configured trigger.
-#[derive(Debug)]
-pub struct CompactionScheduler {
-    stop: Arc<AtomicBool>,
-    thread: JoinHandle<()>,
-}
-
-impl CompactionScheduler {
-    pub fn start(catalog: Arc<CompactionCatalog>, options: CompactionSchedulerOptions) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = stop.clone();
-        let thread = thread::spawn(move || {
-            let mut interval_ms = options.interval_ms.max(1);
-            while !thread_stop.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(interval_ms));
-                if thread_stop.load(Ordering::Acquire) {
-                    break;
-                }
-                // FIXME(PH46): replace fixed cadence with Anneal adaptive hook.
-                for cf in catalog.column_families() {
-                    let debt = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
-                    if debt.score_milli < options.debt_trigger_score_milli {
-                        continue;
-                    }
-                    // The scheduler itself is the only writer of this catalog,
-                    // so this input set matches the one compact_cf pins below.
-                    let inputs = catalog.shards_for_cf(cf);
-                    let dir = scheduler_output_dir(
-                        &options.output_root,
-                        options.tiering_policy.as_ref(),
-                        cf,
-                    );
-                    let output = match commit_domain_output_path(&dir, &inputs) {
-                        Ok(output) => output,
-                        Err(error) => {
-                            eprintln!(
-                                "calyx compaction scheduler error: cannot name commit-domain \
-                                 output for CF {} in {}: {error}",
-                                cf.name(),
-                                dir.display()
-                            );
-                            continue;
-                        }
-                    };
-                    match catalog.compact_cf(cf, output, CompactionThrottle::unlimited()) {
-                        Ok(CompactionResult::Compacted(report))
-                            if report.write_amp_milli > options.max_write_amp_milli =>
-                        {
-                            interval_ms = interval_ms
-                                .saturating_mul(options.backoff_factor.max(1))
-                                .min(options.max_interval_ms.max(1));
-                        }
-                        Ok(_) => {}
-                        Err(error) => eprintln!(
-                            "calyx compaction scheduler error: compact CF {} into {}: {error}",
-                            cf.name(),
-                            dir.display()
-                        ),
-                    }
-                }
-            }
-        });
-        Self { stop, thread }
-    }
-
-    pub fn stop(self) -> thread::Result<()> {
-        self.stop.store(true, Ordering::Release);
-        self.thread.join()
-    }
-}
-
-fn scheduler_output_dir(
-    root: &Path,
-    tiering_policy: Option<&TieringPolicy>,
-    cf: ColumnFamily,
-) -> PathBuf {
-    if let Some(policy) = tiering_policy {
-        policy.place_current_cf(cf).absolute_dir()
-    } else {
-        root.join(cf.name())
     }
 }
 
