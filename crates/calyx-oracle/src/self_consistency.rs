@@ -3,16 +3,12 @@
 use std::collections::BTreeMap;
 
 use calyx_assay::{MIN_ASSAY_SAMPLES, entropy_bits, ksg_mi_continuous_discrete};
-use calyx_aster::cf::ColumnFamily;
-use calyx_aster::recurrence::{Occurrence, read_series};
-use calyx_aster::vault::{AsterVault, encode};
-use calyx_core::{
-    AnchorValue, CalyxError, Clock, Constellation, LedgerRef, Result as CalyxResult, VaultStore,
-    content_address,
-};
+use calyx_aster::vault::AsterVault;
+use calyx_core::{Clock, LedgerRef, content_address};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
+use crate::evidence::{ObservationRow, OracleEvidence};
 use crate::{DomainId, OracleError, OracleSelfConsistency};
 
 pub const ORACLE_DOMAIN_METADATA_KEY: &str = "oracle.domain";
@@ -32,72 +28,59 @@ pub fn oracle_self_consistency<C>(
 where
     C: Clock,
 {
-    let series = domain_series(vault, &domain)?;
-    let stats = consistency_stats(&domain, &series)?;
+    let evidence = OracleEvidence::load(vault, &domain)?;
+    oracle_self_consistency_from_evidence(vault, &domain, &evidence, clock)
+}
+
+pub(crate) fn oracle_self_consistency_from_evidence<C>(
+    vault: &AsterVault<C>,
+    domain: &DomainId,
+    evidence: &OracleEvidence,
+    clock: &dyn Clock,
+) -> Result<OracleSelfConsistency, OracleError>
+where
+    C: Clock,
+{
+    let stats = consistency_stats(domain, evidence)?;
     let mut result = OracleSelfConsistency::with_provenance(
         stats.flakiness,
         stats.validity,
         stats.provisional,
         None,
     );
-    let provenance = write_ledger(vault, &domain, &stats, &result, clock)?;
+    let provenance = write_ledger(vault, domain, &stats, &result, clock)?;
     result.provenance = Some(provenance);
     Ok(result)
 }
 
-fn domain_series<C>(
-    vault: &AsterVault<C>,
-    domain: &DomainId,
-) -> Result<Vec<Vec<Occurrence>>, OracleError>
-where
-    C: Clock,
-{
-    let mut out = Vec::new();
-    for (_, bytes) in vault
-        .scan_cf_at(vault.snapshot(), ColumnFamily::Base)
-        .map_err(|_| OracleError::NoRecurrence {
-            domain: domain.clone(),
-        })?
-    {
-        let cx =
-            encode::decode_constellation_base(&bytes).map_err(|_| OracleError::NoRecurrence {
-                domain: domain.clone(),
-            })?;
-        if !matches_domain(&cx, domain) {
-            continue;
-        }
-        let recurrence = read_series(vault, cx.cx_id).map_err(|_| OracleError::NoRecurrence {
-            domain: domain.clone(),
-        })?;
-        out.push(recurrence.occurrences);
-    }
-    if out.is_empty() {
-        return Err(OracleError::DomainNotFound);
-    }
-    Ok(out)
-}
-
-fn matches_domain(cx: &Constellation, domain: &DomainId) -> bool {
-    cx.metadata_value(ORACLE_DOMAIN_METADATA_KEY) == Some(domain.as_str())
-        || cx.metadata_value(ORACLE_FALLBACK_DOMAIN_METADATA_KEY) == Some(domain.as_str())
-}
-
 fn consistency_stats(
     domain: &DomainId,
-    series: &[Vec<Occurrence>],
+    evidence: &OracleEvidence,
 ) -> Result<ConsistencyStats, OracleError> {
+    if evidence.stats.domain_rows_scanned == 0 {
+        return Err(OracleError::DomainNotFound);
+    }
     let mut total_pairs = 0_u64;
     let mut agreement_pairs = 0_u64;
     let mut validity_samples = Vec::new();
+    let mut by_cx = BTreeMap::<_, Vec<&ObservationRow>>::new();
+    for observation in &evidence.observations {
+        by_cx
+            .entry(observation.cx_id)
+            .or_default()
+            .push(observation);
+    }
 
-    for occurrences in series {
-        let observations = observations_from_series(domain, occurrences)?;
+    for observations in by_cx.values() {
         let mut counts = BTreeMap::<String, u64>::new();
-        for observation in &observations {
-            *counts.entry(observation.verdict.clone()).or_default() += 1;
-            if let Some(truth) = &observation.ground_truth {
+        for observation in observations {
+            let Some(verdict) = &observation.outcome_label else {
+                continue;
+            };
+            *counts.entry(verdict.clone()).or_default() += 1;
+            if let Some(truth) = &observation.ground_truth_label {
                 validity_samples.push(ValiditySample {
-                    verdict: observation.verdict.clone(),
+                    verdict: verdict.clone(),
                     ground_truth: truth.clone(),
                 });
             }
@@ -125,47 +108,12 @@ fn consistency_stats(
     })
 }
 
-fn observations_from_series(
-    domain: &DomainId,
-    occurrences: &[Occurrence],
-) -> Result<Vec<OracleObservation>, OracleError> {
-    let mut out = Vec::new();
-    for occurrence in occurrences {
-        if occurrence.context.bytes.is_empty() {
-            continue;
-        }
-        let parsed: RecurrenceEvidence = serde_json::from_slice(&occurrence.context.bytes)
-            .map_err(|_| OracleError::NoRecurrence {
-                domain: domain.clone(),
-            })?;
-        let Some(verdict) = parsed
-            .verdict_label()
-            .map_err(|_| OracleError::NoRecurrence {
-                domain: domain.clone(),
-            })?
-        else {
-            continue;
-        };
-        out.push(OracleObservation {
-            verdict,
-            ground_truth: parsed
-                .ground_truth_label()
-                .map_err(|_| OracleError::NoRecurrence {
-                    domain: domain.clone(),
-                })?,
-        });
-    }
-    Ok(out)
-}
-
-fn validity(domain: &DomainId, samples: &[ValiditySample]) -> Result<(f32, bool), OracleError> {
+fn validity(_domain: &DomainId, samples: &[ValiditySample]) -> Result<(f32, bool), OracleError> {
     if samples.is_empty() {
         return Ok((0.0, true));
     }
     if samples.len() < MIN_VALIDITY_SAMPLES {
-        return Err(OracleError::NoRecurrence {
-            domain: domain.clone(),
-        });
+        return Ok((0.0, true));
     }
     if samples
         .iter()
@@ -189,11 +137,8 @@ fn validity(domain: &DomainId, samples: &[ValiditySample]) -> Result<(f32, bool)
         .iter()
         .map(|sample| one_hot(verdict_index[&sample.verdict], verdict_index.len()))
         .collect::<Vec<_>>();
-    let estimate = ksg_mi_continuous_discrete(&x, &truth_codes, KSG_K).map_err(|_| {
-        OracleError::NoRecurrence {
-            domain: domain.clone(),
-        }
-    })?;
+    let estimate =
+        ksg_mi_continuous_discrete(&x, &truth_codes, KSG_K).map_err(OracleError::from)?;
     Ok(((estimate.bits / entropy).clamp(0.0, 1.0), false))
 }
 
@@ -218,12 +163,6 @@ where
             ActorId::Service(LEDGER_ACTOR.to_string()),
         )
         .map_err(|_| OracleError::LedgerWriteFailure)
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct OracleObservation {
-    verdict: String,
-    ground_truth: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -275,46 +214,6 @@ impl MeasurementPayload {
             provisional: stats.provisional,
             ts,
         }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct RecurrenceEvidence {
-    #[serde(default, rename = "oracle_verdict")]
-    oracle_verdict: Option<AnchorEvidence>,
-    #[serde(default, rename = "outcome_anchor")]
-    outcome_anchor: Option<AnchorEvidence>,
-    #[serde(default, rename = "ground_truth_anchor")]
-    ground_truth_anchor: Option<AnchorEvidence>,
-}
-
-impl RecurrenceEvidence {
-    fn verdict_label(&self) -> CalyxResult<Option<String>> {
-        self.oracle_verdict
-            .as_ref()
-            .or(self.outcome_anchor.as_ref())
-            .map(AnchorEvidence::label)
-            .transpose()
-    }
-
-    fn ground_truth_label(&self) -> CalyxResult<Option<String>> {
-        self.ground_truth_anchor
-            .as_ref()
-            .map(AnchorEvidence::label)
-            .transpose()
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct AnchorEvidence {
-    value: AnchorValue,
-}
-
-impl AnchorEvidence {
-    fn label(&self) -> CalyxResult<String> {
-        serde_json::to_string(&self.value).map_err(|error| {
-            CalyxError::aster_corrupt_shard(format!("anchor label encode: {error}"))
-        })
     }
 }
 

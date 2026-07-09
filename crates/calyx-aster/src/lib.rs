@@ -7,6 +7,7 @@ pub mod compaction;
 pub mod dedup;
 pub mod erase;
 mod file_lock;
+mod fsync;
 pub mod gc;
 pub mod index;
 pub mod layers;
@@ -35,6 +36,7 @@ pub mod supply_chain;
 pub mod timetravel;
 pub mod txn;
 pub mod vault;
+pub mod verify_restore;
 pub mod wal;
 
 pub use dedup::{

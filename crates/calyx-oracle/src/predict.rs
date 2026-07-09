@@ -1,34 +1,22 @@
 //! Vault-backed Oracle consequence prediction.
 
-mod context;
-
 use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
 
-use calyx_aster::cf::ColumnFamily;
-use calyx_aster::recurrence::read_series;
-use calyx_aster::vault::{AsterVault, encode};
-use calyx_core::{
-    AnchorValue, Clock, Constellation, LedgerRef, Panel, VaultStore, content_address,
-};
+use calyx_aster::vault::AsterVault;
+use calyx_core::{AnchorValue, Clock, LedgerRef, Panel, content_address};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
-use calyx_ward::{DEFAULT_TAU, GuardId, GuardVerdict, SlotVerdict};
+use calyx_ward::GuardVerdict;
 use serde::{Deserialize, Serialize};
 
-use context::{ConsequenceSeed, PredictionContext};
-
-use crate::{
-    Consequence, DomainId, OracleError, Prediction, SufficiencyBound, check_sufficiency,
-    oracle_self_consistency,
-};
-use crate::{ORACLE_DOMAIN_METADATA_KEY, ORACLE_FALLBACK_DOMAIN_METADATA_KEY};
+use crate::evidence::{ConsequenceSeed, OracleEvidence, OracleEvidenceStats};
+use crate::honesty_gate::check_sufficiency_with_store;
+use crate::self_consistency::oracle_self_consistency_from_evidence;
+use crate::{Consequence, DomainId, OracleError, Prediction, SufficiencyBound, UnitInterval};
 
 pub const ORACLE_ACTION_METADATA_KEY: &str = "oracle.action";
-const ORACLE_FALLBACK_ACTION_METADATA_KEY: &str = "action";
 const LEDGER_ACTOR: &str = "calyx-oracle";
 const LEDGER_TAG: &str = "oracle_predict_v1";
 const HOP_ATTENUATION: f32 = 0.7;
-const PROVISIONAL_GUARD_ID: &str = "018f48a4-9a79-74d2-8a5c-9ad7f6b8c104";
 
 /// Action plus the exact `panel_t` snapshot whose sufficiency gates prediction.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,25 +36,32 @@ pub fn oracle_predict<C>(
 where
     C: Clock,
 {
-    let bound = check_sufficiency(vault, &action.panel, domain.clone(), clock)?;
-    let evidence = prediction_evidence(vault, &action.action_id, &domain)?;
-    let posterior = posterior(&evidence.observations, &domain)?;
-    let consistency = oracle_self_consistency(vault, domain.clone(), clock)?;
+    let evidence = OracleEvidence::load(vault, &domain)?;
+    let bound = check_sufficiency_with_store(
+        &evidence.assay,
+        vault.vault_id(),
+        &action.panel,
+        domain.clone(),
+        clock,
+    )?;
+    let prediction_evidence = prediction_evidence(&evidence, &action.action_id, &domain)?;
+    let posterior = posterior(&prediction_evidence.observations, &domain)?;
+    let consistency = oracle_self_consistency_from_evidence(vault, &domain, &evidence, clock)?;
     let confidence = apply_confidence_ceiling(
-        posterior.raw_confidence,
-        consistency.ceiling,
-        bound.dpi_ceiling,
-    );
-    let guard = action
-        .guard
-        .clone()
-        .unwrap_or_else(|| provisional_guard(&action.panel));
+        UnitInterval::new(posterior.raw_confidence).unwrap_or(UnitInterval::ZERO),
+        UnitInterval::new(consistency.ceiling).unwrap_or(UnitInterval::ZERO),
+        bound.dpi_ceiling_unit,
+    )
+    .get();
+    let guard = action.guard.clone();
     let ledger_ref = write_prediction_ledger(
         vault,
         LedgerWriteInput {
             domain: &domain,
             action,
-            evidence: &evidence,
+            evidence: &prediction_evidence,
+            evidence_snapshot: evidence.snapshot,
+            evidence_stats: &evidence.stats,
             posterior: &posterior,
             bound: &bound,
             self_consistency_ceiling: consistency.ceiling,
@@ -75,7 +70,7 @@ where
         },
     )?;
     let consequences = first_order_consequences(
-        &evidence.observations,
+        &prediction_evidence.observations,
         &posterior.outcome_label,
         confidence,
         &ledger_ref,
@@ -90,44 +85,28 @@ where
     })
 }
 
-fn prediction_evidence<C>(
-    vault: &AsterVault<C>,
+fn prediction_evidence(
+    evidence: &OracleEvidence,
     action_id: &str,
     domain: &DomainId,
-) -> Result<PredictionEvidence, OracleError>
-where
-    C: Clock,
-{
+) -> Result<PredictionEvidence, OracleError> {
     let mut observations = Vec::new();
     let mut source_cx_ids = BTreeSet::new();
-    for (_, bytes) in vault
-        .scan_cf_at(vault.snapshot(), ColumnFamily::Base)
-        .map_err(|_| OracleError::NoRecurrence {
-            domain: domain.clone(),
-        })?
+    for row in evidence
+        .observations
+        .iter()
+        .filter(|row| row.matches_action(action_id))
     {
-        let cx =
-            encode::decode_constellation_base(&bytes).map_err(|_| OracleError::NoRecurrence {
-                domain: domain.clone(),
-            })?;
-        if !matches_domain(&cx, domain) {
+        let (Some(outcome), Some(outcome_label)) = (&row.outcome, &row.outcome_label) else {
             continue;
-        }
-        let base_action_match = matches_action(&cx, action_id);
-        collect_series(
-            vault,
-            &cx,
-            action_id,
-            domain,
-            base_action_match,
-            &mut observations,
-        )?;
-        if observations
-            .iter()
-            .any(|row| row.cx_id == cx.cx_id.to_string())
-        {
-            source_cx_ids.insert(cx.cx_id.to_string());
-        }
+        };
+        observations.push(OutcomeObservation {
+            cx_id: row.cx_id.to_string(),
+            outcome: outcome.clone(),
+            outcome_label: outcome_label.clone(),
+            consequences: row.consequences.clone(),
+        });
+        source_cx_ids.insert(row.cx_id.to_string());
     }
     if observations.is_empty() {
         return Err(OracleError::NoRecurrence {
@@ -138,49 +117,6 @@ where
         source_cx_ids: source_cx_ids.into_iter().collect(),
         observations,
     })
-}
-
-fn collect_series<C>(
-    vault: &AsterVault<C>,
-    cx: &Constellation,
-    action_id: &str,
-    domain: &DomainId,
-    base_action_match: bool,
-    observations: &mut Vec<OutcomeObservation>,
-) -> Result<(), OracleError>
-where
-    C: Clock,
-{
-    let series = read_series(vault, cx.cx_id).map_err(|_| OracleError::NoRecurrence {
-        domain: domain.clone(),
-    })?;
-    for occurrence in &series.occurrences {
-        if occurrence.context.bytes.is_empty() {
-            continue;
-        }
-        let parsed: PredictionContext =
-            serde_json::from_slice(&occurrence.context.bytes).map_err(|_| {
-                OracleError::NoRecurrence {
-                    domain: domain.clone(),
-                }
-            })?;
-        if !parsed.matches_action(action_id, base_action_match) {
-            continue;
-        }
-        let Some(outcome) = parsed.outcome() else {
-            continue;
-        };
-        let label = outcome_label(&outcome).map_err(|_| OracleError::NoRecurrence {
-            domain: domain.clone(),
-        })?;
-        observations.push(OutcomeObservation {
-            cx_id: cx.cx_id.to_string(),
-            outcome,
-            outcome_label: label,
-            consequences: parsed.consequences(),
-        });
-    }
-    Ok(())
 }
 
 fn posterior(
@@ -235,16 +171,12 @@ fn raw_confidence(top_count: u64, second_count: u64, total: u64) -> f32 {
     (support * separation * sample_support).clamp(0.0, 1.0)
 }
 
-fn apply_confidence_ceiling(raw: f32, self_consistency: f32, dpi_ceiling: f32) -> f32 {
-    unit(raw).min(unit(self_consistency)).min(unit(dpi_ceiling))
-}
-
-fn unit(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
+fn apply_confidence_ceiling(
+    raw: UnitInterval,
+    self_consistency: UnitInterval,
+    dpi_ceiling: UnitInterval,
+) -> UnitInterval {
+    raw.min(self_consistency).min(dpi_ceiling)
 }
 
 fn first_order_consequences(
@@ -312,13 +244,24 @@ where
         action_digest: hex_bytes(&content_address([input.action.action_id.as_bytes()])),
         outcome_digest: hex_bytes(&content_address([input.posterior.outcome_label.as_bytes()])),
         source_cx_ids: input.evidence.source_cx_ids.clone(),
+        evidence_snapshot: input.evidence_snapshot,
+        evidence_assay_scans: input.evidence_stats.assay_scans,
+        evidence_base_scans: input.evidence_stats.base_scans,
+        evidence_base_rows_scanned: input.evidence_stats.base_rows_scanned,
+        evidence_domain_rows_scanned: input.evidence_stats.domain_rows_scanned,
+        evidence_recurrence_range_scans: input.evidence_stats.recurrence_range_scans,
+        evidence_recurrence_rows_scanned: input.evidence_stats.recurrence_rows_scanned,
         recurrence_observations: input.posterior.total,
         top_count: input.posterior.top_count,
         second_count: input.posterior.second_count,
         distinct_outcomes: input.posterior.distinct_outcomes,
         raw_confidence: input.posterior.raw_confidence,
         self_consistency_ceiling: input.self_consistency_ceiling,
+        sufficiency_basis_bits: input.bound.i_panel_oracle,
+        anchor_entropy_bits: input.bound.anchor_entropy_bits,
         dpi_ceiling: input.bound.dpi_ceiling,
+        dpi_ceiling_deprecated: true,
+        dpi_ceiling_unit: input.bound.dpi_ceiling_unit,
         confidence: input.confidence,
         ts: input.clock.now(),
     };
@@ -331,35 +274,6 @@ where
             ActorId::Service(LEDGER_ACTOR.to_string()),
         )
         .map_err(|_| OracleError::LedgerWriteFailure)
-}
-
-fn provisional_guard(panel: &Panel) -> GuardVerdict {
-    GuardVerdict {
-        guard_id: GuardId::from_str(PROVISIONAL_GUARD_ID).expect("static guard id"),
-        overall_pass: true,
-        provisional: true,
-        per_slot: panel
-            .slots
-            .iter()
-            .map(|slot| SlotVerdict {
-                slot: slot.slot_id,
-                cos: 1.0,
-                tau: DEFAULT_TAU,
-                pass: true,
-            })
-            .collect(),
-        action: None,
-    }
-}
-
-fn matches_domain(cx: &Constellation, domain: &DomainId) -> bool {
-    cx.metadata_value(ORACLE_DOMAIN_METADATA_KEY) == Some(domain.as_str())
-        || cx.metadata_value(ORACLE_FALLBACK_DOMAIN_METADATA_KEY) == Some(domain.as_str())
-}
-
-fn matches_action(cx: &Constellation, action_id: &str) -> bool {
-    cx.metadata_value(ORACLE_ACTION_METADATA_KEY) == Some(action_id)
-        || cx.metadata_value(ORACLE_FALLBACK_ACTION_METADATA_KEY) == Some(action_id)
 }
 
 fn outcome_label(value: &AnchorValue) -> Result<String, serde_json::Error> {
@@ -432,13 +346,24 @@ struct PredictionLedgerPayload {
     action_digest: String,
     outcome_digest: String,
     source_cx_ids: Vec<String>,
+    evidence_snapshot: u64,
+    evidence_assay_scans: u64,
+    evidence_base_scans: u64,
+    evidence_base_rows_scanned: u64,
+    evidence_domain_rows_scanned: u64,
+    evidence_recurrence_range_scans: u64,
+    evidence_recurrence_rows_scanned: u64,
     recurrence_observations: u64,
     top_count: u64,
     second_count: u64,
     distinct_outcomes: u64,
     raw_confidence: f32,
     self_consistency_ceiling: f32,
-    dpi_ceiling: f32,
+    sufficiency_basis_bits: crate::Bits,
+    anchor_entropy_bits: crate::Bits,
+    dpi_ceiling: crate::Bits,
+    dpi_ceiling_deprecated: bool,
+    dpi_ceiling_unit: UnitInterval,
     confidence: f32,
     ts: u64,
 }
@@ -447,6 +372,8 @@ struct LedgerWriteInput<'a> {
     domain: &'a DomainId,
     action: &'a Action,
     evidence: &'a PredictionEvidence,
+    evidence_snapshot: u64,
+    evidence_stats: &'a OracleEvidenceStats,
     posterior: &'a OutcomePosterior,
     bound: &'a SufficiencyBound,
     self_consistency_ceiling: f32,

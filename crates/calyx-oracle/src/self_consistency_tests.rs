@@ -13,7 +13,7 @@ use proptest::prelude::*;
 use serde_json::json;
 
 use super::*;
-use crate::CALYX_ORACLE_NO_RECURRENCE;
+use crate::{CALYX_ORACLE_EVIDENCE_CORRUPT, CALYX_ORACLE_NO_RECURRENCE};
 
 const DOMAIN: &str = "issue430";
 
@@ -106,6 +106,31 @@ fn nine_recurrence_pairs_fail_closed() {
 }
 
 #[test]
+fn malformed_recurrence_row_fails_closed_as_evidence_corrupt() {
+    let vault = AsterVault::with_clock(vault_id(), b"issue430-salt", FixedClock::new(1));
+    let cx_id = CxId::from_bytes([42; 16]);
+    vault
+        .write_cf(
+            ColumnFamily::Base,
+            base_key(cx_id),
+            encode::encode_constellation_base(&constellation(cx_id)).expect("encode base"),
+        )
+        .expect("write base");
+    vault
+        .write_cf(
+            ColumnFamily::Recurrence,
+            recurrence_key(cx_id, 0),
+            b"not-json".to_vec(),
+        )
+        .expect("write corrupt recurrence");
+
+    let error = oracle_self_consistency(&vault, DomainId::from(DOMAIN), &FixedClock::new(550))
+        .expect_err("corrupt recurrence");
+
+    assert_eq!(error.code(), CALYX_ORACLE_EVIDENCE_CORRUPT);
+}
+
+#[test]
 fn missing_ground_truth_is_provisional_zero_validity() {
     let vault = vault_with_series(&[vec![v("pass", None); 6]]);
     let result = oracle_self_consistency(&vault, DomainId::from(DOMAIN), &FixedClock::new(600))
@@ -115,6 +140,47 @@ fn missing_ground_truth_is_provisional_zero_validity() {
     assert_eq!(result.validity, 0.0);
     assert_eq!(result.ceiling, 0.0);
     assert!(result.provisional);
+}
+
+#[test]
+fn sparse_ground_truth_samples_are_provisional_zero_validity() {
+    let vault = vault_with_series(&[vec![
+        v("pass", Some("pass")),
+        v("pass", None),
+        v("pass", None),
+        v("pass", None),
+        v("pass", None),
+        v("pass", None),
+    ]]);
+    let result = oracle_self_consistency(&vault, DomainId::from(DOMAIN), &FixedClock::new(650))
+        .expect("measure self consistency with one truth sample");
+
+    assert_close(result.flakiness, 0.0, 0.001);
+    assert_eq!(result.validity, 0.0);
+    assert_eq!(result.ceiling, 0.0);
+    assert!(result.provisional);
+}
+
+#[test]
+fn ksg_validity_failure_remains_assay_failure() {
+    let mut samples = Vec::new();
+    for _ in 0..47 {
+        samples.push(ValiditySample {
+            verdict: "pass".to_string(),
+            ground_truth: "pass".to_string(),
+        });
+    }
+    for _ in 0..3 {
+        samples.push(ValiditySample {
+            verdict: "pass".to_string(),
+            ground_truth: "fail".to_string(),
+        });
+    }
+
+    let error = validity(&DomainId::from(DOMAIN), &samples).expect_err("KSG should fail");
+
+    assert_eq!(error.code(), "CALYX_ASSAY_INSUFFICIENT_SAMPLES");
+    assert!(matches!(error, OracleError::AssayFailure { .. }));
 }
 
 #[test]

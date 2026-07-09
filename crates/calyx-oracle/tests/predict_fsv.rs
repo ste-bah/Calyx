@@ -18,8 +18,8 @@ use calyx_core::{
     VaultId, content_address,
 };
 use calyx_oracle::{
-    Action, CALYX_ORACLE_INSUFFICIENT, CALYX_ORACLE_NO_RECURRENCE, DomainId,
-    ORACLE_ACTION_METADATA_KEY, ORACLE_DOMAIN_METADATA_KEY, OracleError, oracle_predict,
+    Action, CALYX_ORACLE_EVIDENCE_CORRUPT, CALYX_ORACLE_INSUFFICIENT, CALYX_ORACLE_NO_RECURRENCE,
+    DomainId, ORACLE_ACTION_METADATA_KEY, ORACLE_DOMAIN_METADATA_KEY, OracleError, oracle_predict,
     oracle_self_consistency,
 };
 use serde_json::json;
@@ -60,16 +60,16 @@ fn ph49_fsv_swe_bench_deficit_refuses_and_caps_predictions() {
         OracleError::Insufficient { bound } => bound,
         other => panic!("expected insufficient, got {}", other.code()),
     };
-    assert!((0.40..=0.55).contains(&bound.i_panel_oracle));
+    assert!((0.40..=0.55).contains(&bound.i_panel_oracle.get()));
     assert!(!bound.per_sensor_deficit.is_empty());
     let deficit_sum: f32 = bound.per_sensor_deficit.iter().map(|(_, gap)| gap).sum();
-    assert!((deficit_sum - (1.0 - bound.i_panel_oracle)).abs() <= 0.10);
+    assert!((deficit_sum - (1.0 - bound.i_panel_oracle.get())).abs() <= 0.10);
     print_json(json!({
         "fsv": "ph49_swe_bench_form_only_deficit",
         "error_code": CALYX_ORACLE_INSUFFICIENT,
         "bound": bound,
         "per_sensor_deficit_sum": deficit_sum,
-        "expected_deficit_bits": 1.0 - bound.i_panel_oracle,
+        "expected_deficit_bits": 1.0 - bound.i_panel_oracle.get(),
     }));
 
     let self_consistency =
@@ -122,7 +122,7 @@ fn write_ceiling_scan(vault: &AsterVault<SystemClock>, panel: &Panel, clock: &dy
         )
         .expect("prediction under ceiling");
         assert!(prediction.confidence <= CEILING + f32::EPSILON);
-        assert!(prediction.confidence <= prediction.bound.dpi_ceiling + f32::EPSILON);
+        assert!(prediction.confidence <= prediction.bound.dpi_ceiling_unit.get() + f32::EPSILON);
         let row = json!({
             "idx": idx,
             "action_id": action_id,
@@ -200,12 +200,12 @@ fn verify_corrupt_recurrence_edge(root: &Path, panel: &Panel, clock: &dyn Clock)
         clock,
     )
     .expect_err("corrupt recurrence must fail closed");
-    assert_eq!(error.code(), CALYX_ORACLE_NO_RECURRENCE);
+    assert_eq!(error.code(), CALYX_ORACLE_EVIDENCE_CORRUPT);
     vault.flush().expect("flush corrupt vault");
     print_json(json!({
         "fsv": "ph49_corrupt_recurrence_edge",
         "error_code": error.code(),
-        "expected": CALYX_ORACLE_NO_RECURRENCE
+        "expected": CALYX_ORACLE_EVIDENCE_CORRUPT
     }));
 }
 

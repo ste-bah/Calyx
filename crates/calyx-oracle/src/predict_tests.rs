@@ -16,13 +16,23 @@ use calyx_core::{
 use proptest::prelude::*;
 use serde_json::json;
 
+use crate::ORACLE_DOMAIN_METADATA_KEY;
+
 use super::*;
 use crate::{
-    CALYX_ORACLE_INSUFFICIENT, CALYX_ORACLE_LEDGER_WRITE_FAILURE, CALYX_ORACLE_NO_RECURRENCE,
+    CALYX_ORACLE_EVIDENCE_CORRUPT, CALYX_ORACLE_INSUFFICIENT, CALYX_ORACLE_LEDGER_WRITE_FAILURE,
+    CALYX_ORACLE_NO_RECURRENCE,
 };
 
 const DOMAIN: &str = "issue432";
 const ACTION: &str = "action_A";
+
+#[path = "predict_tests/issue1345.rs"]
+mod issue1345;
+#[path = "predict_tests/issue1347.rs"]
+mod issue1347;
+#[path = "predict_tests/issue1348.rs"]
+mod issue1348;
 
 #[test]
 fn action_a_twenty_pass_observations_predict_pass_under_ceiling() {
@@ -51,17 +61,25 @@ fn action_a_twenty_pass_observations_predict_pass_under_ceiling() {
     assert_eq!(prediction.outcome, AnchorValue::Text("Pass".to_string()));
     assert!(prediction.confidence > 0.5);
     assert!(prediction.confidence <= 0.95 + f32::EPSILON);
-    assert!(prediction.confidence <= prediction.bound.dpi_ceiling);
+    assert!(prediction.confidence <= prediction.bound.dpi_ceiling_unit.get());
     assert!(!prediction.consequences.is_empty());
-    assert!(prediction.guard.provisional);
+    assert_eq!(prediction.guard, None);
+    assert!(serde_json::to_value(&prediction).unwrap()["guard"].is_null());
     let payload = ledger_payload(&vault, prediction.provenance);
     assert_eq!(payload["tag"], LEDGER_TAG);
     assert_eq!(payload["recurrence_observations"], 20);
+    assert_eq!(payload["evidence_assay_scans"], 1);
+    assert_eq!(payload["evidence_base_scans"], 1);
+    assert!(payload["evidence_snapshot"].as_u64().is_some());
+    assert_eq!(payload["source_cx_ids"].as_array().unwrap().len(), 20);
 }
 
 #[test]
 fn raw_confidence_is_capped_by_self_consistency_exactly() {
-    assert_close(apply_confidence_ceiling(0.9, 0.7, 1.0), 0.7);
+    assert_close(
+        apply_confidence_ceiling(unit(0.9), unit(0.7), unit(1.0)).get(),
+        0.7,
+    );
 }
 
 #[test]
@@ -98,6 +116,39 @@ fn no_matching_action_recurrence_fails_closed() {
     .expect_err("no action recurrence");
 
     assert_eq!(error.code(), CALYX_ORACLE_NO_RECURRENCE);
+}
+
+#[test]
+fn malformed_recurrence_row_fails_closed_as_evidence_corrupt() {
+    let vault = vault();
+    let panel = panel(&[1]);
+    put_sufficiency(&vault, &panel, 1.0, 0.8);
+    let cx_id = CxId::from_bytes([250; 16]);
+    vault
+        .write_cf(
+            ColumnFamily::Base,
+            base_key(cx_id),
+            encode::encode_constellation_base(&constellation(cx_id, DOMAIN, ACTION))
+                .expect("encode base"),
+        )
+        .expect("write base");
+    vault
+        .write_cf(
+            ColumnFamily::Recurrence,
+            recurrence_key(cx_id, 0),
+            b"not-json".to_vec(),
+        )
+        .expect("write corrupt recurrence");
+
+    let error = oracle_predict(
+        &vault,
+        &action(ACTION, panel),
+        DomainId::from(DOMAIN),
+        &FixedClock::new(906),
+    )
+    .expect_err("corrupt recurrence");
+
+    assert_eq!(error.code(), CALYX_ORACLE_EVIDENCE_CORRUPT);
 }
 
 #[test]
@@ -192,7 +243,14 @@ fn ledger_write_failure_fails_closed_without_prediction() {
 proptest! {
     #[test]
     fn confidence_cap_never_exceeds_dpi(raw in -1.0f32..2.0, ceiling in -1.0f32..2.0, dpi in 0.0f32..2.0) {
-        prop_assert!(apply_confidence_ceiling(raw, ceiling, dpi) <= dpi.clamp(0.0, 1.0) + f32::EPSILON);
+        let dpi = unit(dpi);
+        prop_assert!(
+            apply_confidence_ceiling(
+                UnitInterval::new(raw).unwrap_or(UnitInterval::ZERO),
+                UnitInterval::new(ceiling).unwrap_or(UnitInterval::ZERO),
+                dpi,
+            ).get() <= dpi.get() + f32::EPSILON
+        );
     }
 }
 
@@ -433,4 +491,8 @@ fn vault_id() -> VaultId {
 
 fn assert_close(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 1.0e-6);
+}
+
+fn unit(value: f32) -> UnitInterval {
+    UnitInterval::new(value).expect("unit interval")
 }
