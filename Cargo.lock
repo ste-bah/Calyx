@@ -547,6 +547,7 @@ dependencies = [
  "toml",
  "tracing",
  "ulid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -652,6 +653,21 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "calyx-leapable"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "calyx-aster",
+ "calyx-buildinfo",
+ "calyx-core",
+ "calyx-ledger",
+ "calyx-mcp",
+ "serde",
+ "serde_json",
+ "ulid",
 ]
 
 [[package]]
