@@ -5,6 +5,7 @@ use calyx_core::{Asymmetry, CalyxError, Input, Lens, LensId, Result, SlotVector}
 use serde::{Deserialize, Serialize};
 
 mod contract;
+mod reproduce;
 mod validation;
 
 use crate::frozen::FrozenLensContract;
