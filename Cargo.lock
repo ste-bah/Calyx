@@ -656,6 +656,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "calyx-leapable"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "calyx-aster",
+ "calyx-buildinfo",
+ "calyx-core",
+ "calyx-ledger",
+ "calyx-mcp",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "ulid",
+]
+
+[[package]]
 name = "calyx-ledger"
 version = "0.1.0"
 dependencies = [
@@ -728,7 +744,6 @@ dependencies = [
  "calyx-loom",
  "calyx-paths",
  "calyx-registry",
- "calyx-search",
  "calyx-sextant",
  "calyx-ward",
  "serde",
@@ -822,7 +837,6 @@ dependencies = [
 name = "calyx-registry"
 version = "0.1.0"
 dependencies = [
- "bincode_reloaded",
  "blake3",
  "calyx-assay",
  "calyx-aster",
@@ -876,6 +890,7 @@ dependencies = [
  "calyx-anneal",
  "calyx-aster",
  "calyx-core",
+ "calyx-forge",
  "calyx-fsv",
  "calyx-loom",
  "calyx-oracle",
@@ -904,6 +919,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "calyx-core",
+ "calyx-fsv",
  "proptest",
  "rand 0.8.6",
  "serde",

@@ -529,3 +529,7 @@ fn search_error_to_tool(error: calyx_search::SearchError) -> ToolError {
     }
 }
 
+#[cfg(test)]
+pub(super) fn index_cache_prepared_counts_for_tests() -> Vec<(u16, usize)> {
+    index_cache::prepared_counts_for_tests()
+}

@@ -2,11 +2,12 @@ use crate::quant::qjl::{qjl_bipolar_mean, read_qjl_section, sign_words};
 use crate::quant::{QuantLevel, QuantizedVec};
 use crate::{ForgeError, Result};
 
-use super::{TurboQuantCodec, level_steps, packed_len, unpack_codes};
+use super::{TurboQuantCodec, lloyd, packed_len, unpack_codes};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedQuant {
     pub codes: Vec<u8>,
+    pub widths: Vec<u8>,
     pub code_sum: u64,
     pub sign_words: Vec<u64>,
     pub scale: f32,
@@ -42,13 +43,12 @@ pub(crate) fn prepare(codec: &TurboQuantCodec, qv: &QuantizedVec) -> Result<Prep
     if residual.rademacher_seed != codec.rademacher().id {
         return Err(quant_error("prepare", qv.level, "rademacher_seed mismatch"));
     }
-    let codes = unpack_codes(&qv.bytes[..scalar_len], codec.rot_width, qv.level)
-        .into_iter()
-        .map(|code| code as u8)
-        .collect::<Vec<_>>();
+    let mixed = unpack_codes(&qv.bytes[..scalar_len], codec.rot_width, qv.level);
+    let codes = mixed.codes;
     let code_sum = codes.iter().map(|code| u64::from(*code)).sum();
     Ok(PreparedQuant {
         sign_words: sign_words(&residual.bits, codec.rot_width),
+        widths: mixed.widths,
         codes,
         code_sum,
         scale: qv.scale,
@@ -71,17 +71,8 @@ fn scalar_dot(a: &PreparedQuant, b: &PreparedQuant) -> f32 {
     if a.scale == 0.0 || b.scale == 0.0 {
         return 0.0;
     }
-    let code_dot = a
-        .codes
-        .iter()
-        .zip(b.codes.iter())
-        .map(|(left, right)| u64::from(*left) * u64::from(*right))
-        .sum::<u64>() as f32;
-    let steps = f32::from(level_steps(a.level) - 1);
-    let k_a = 2.0 * a.scale / steps;
-    let k_b = 2.0 * b.scale / steps;
-    k_a * k_b * code_dot - b.scale * k_a * a.code_sum as f32 - a.scale * k_b * b.code_sum as f32
-        + a.rot_width as f32 * a.scale * b.scale
+    let centroid_dot = lloyd::centroid_product_sum_mixed(&a.codes, &a.widths, &b.codes, &b.widths);
+    a.scale * b.scale * centroid_dot / a.rot_width as f32
 }
 
 fn quant_error(op: &str, level: QuantLevel, detail: impl Into<String>) -> ForgeError {

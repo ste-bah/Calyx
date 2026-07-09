@@ -74,6 +74,16 @@ fn search_accepts_batch_ingest_ledger_ref_when_payload_names_hit_cx() {
         .find(|hit| hit["cx_id"].as_str() == Some(expected_cx_id))
         .expect("second batch cx appears in MCP search hits");
     assert!(hit["provenance"].is_object());
+
+    // upstream TurboQuant index-cache coverage on the same search
+    let (builds, cache_hits) = super::engine::index_cache_stats_for_tests();
+    assert_eq!(builds, 1);
+    assert!(cache_hits >= 1, "cache hits={cache_hits}");
+    let prepared = super::engine::index_cache_prepared_counts_for_tests();
+    assert!(
+        prepared.iter().any(|(_, count)| *count > 0),
+        "prepared counts={prepared:?}"
+    );
 }
 
 #[test]
