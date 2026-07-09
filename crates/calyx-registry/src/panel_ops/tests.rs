@@ -3,16 +3,15 @@ use std::collections::BTreeMap;
 use calyx_assay::estimate::{EstimatorKind, MiEstimate, TrustTag};
 use calyx_assay::store::{AssayCacheKey, AssayStore, AssaySubject};
 use calyx_core::{
-    AnchorKind, Asymmetry, CalyxError, ConfidenceInterval, Input, Lens, LensId, Modality, Panel,
-    QuantPolicy, Result, Signal, SlotShape, SlotVector, VaultId,
+    AnchorKind, Asymmetry, ConfidenceInterval, Modality, Panel, QuantPolicy, Signal, SlotShape,
+    VaultId,
 };
 
 use super::*;
 use crate::runtime::algorithmic::AlgorithmicLens;
-use crate::spec::LensRuntime;
 use crate::{
     CapabilityCard, CapabilityGateThresholds, CapabilitySignalKind, CostMetrics, CoverageMetrics,
-    FrozenLensContract, LensSpec, MetricSource, NormPolicy, SeparationMetrics, SpreadMetrics,
+    MetricSource, SeparationMetrics, SpreadMetrics,
 };
 
 #[test]
@@ -73,29 +72,6 @@ fn apply_capability_gate_uses_existing_lifecycle_states() {
     assert_eq!(controller.panel().slots[0].state, SlotState::Retired);
 }
 
-#[test]
-fn list_panel_runtime_probe_marks_loaded_text_lens_failing_when_measure_fails() {
-    let mut registry = Registry::new();
-    let lens = FailingMeasureLens::new("loaded-but-unmeasurable");
-    let spec = loaded_onnx_spec_for(&lens);
-    let lens_id = registry
-        .register_frozen_with_spec(lens.clone(), lens.contract.clone(), spec)
-        .unwrap();
-    let panel = panel_with_slot(lens_id, None);
-
-    assert_eq!(registry.health(lens_id).unwrap(), LensHealth::Loaded);
-
-    let listing = list_panel_with_runtime_probe(&panel, &registry);
-
-    assert_eq!(
-        listing[0].health,
-        LensHealth::Failing {
-            code: "CALYX_LENS_UNREACHABLE".to_string(),
-            reason: "runtime probe measurement failed".to_string(),
-        }
-    );
-}
-
 fn registry_with_lens() -> (Registry, LensId) {
     let mut registry = Registry::new();
     let lens = AlgorithmicLens::byte_features("panel-assay-list", Modality::Text);
@@ -103,92 +79,6 @@ fn registry_with_lens() -> (Registry, LensId) {
         .register_frozen(lens.clone(), lens.contract().clone())
         .unwrap();
     (registry, lens_id)
-}
-
-#[derive(Clone)]
-struct FailingMeasureLens {
-    contract: FrozenLensContract,
-}
-
-impl FailingMeasureLens {
-    fn new(name: &str) -> Self {
-        Self {
-            contract: test_contract(name),
-        }
-    }
-}
-
-impl Lens for FailingMeasureLens {
-    fn id(&self) -> LensId {
-        self.contract.lens_id()
-    }
-
-    fn shape(&self) -> SlotShape {
-        SlotShape::Dense(1)
-    }
-
-    fn modality(&self) -> Modality {
-        Modality::Text
-    }
-
-    fn measure(&self, _input: &Input) -> Result<SlotVector> {
-        Err(CalyxError::lens_unreachable(
-            "runtime probe measurement failed",
-        ))
-    }
-}
-
-fn loaded_onnx_spec_for(lens: &FailingMeasureLens) -> LensSpec {
-    let root =
-        std::env::temp_dir().join(format!("calyx-panel-runtime-probe-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    let model = root.join(format!("{}.onnx", lens.contract.name()));
-    let tokenizer = root.join(format!("{}-tokenizer.json", lens.contract.name()));
-    let config = root.join(format!("{}-config.json", lens.contract.name()));
-    std::fs::write(&model, b"model").unwrap();
-    std::fs::write(&tokenizer, b"tokenizer").unwrap();
-    std::fs::write(&config, b"config").unwrap();
-    LensSpec {
-        name: lens.contract.name().to_string(),
-        runtime: LensRuntime::Onnx {
-            model_id: "unit/loaded-but-unmeasurable".to_string(),
-            files: vec![model, tokenizer, config],
-        },
-        output: SlotShape::Dense(1),
-        modality: Modality::Text,
-        weights_sha256: lens.contract.weights_sha256(),
-        corpus_hash: lens.contract.corpus_hash(),
-        norm_policy: NormPolicy::None,
-        max_batch: None,
-        axis: None,
-        asymmetry: Asymmetry::None,
-        quant_default: QuantPolicy::turboquant_default(),
-        truncate_dim: None,
-        recall_delta: crate::spec::default_recall_delta(),
-        retrieval_only: false,
-        excluded_from_dedup: false,
-    }
-}
-
-fn test_contract(name: &str) -> FrozenLensContract {
-    FrozenLensContract::new(
-        name,
-        test_hash(name, b"weights"),
-        test_hash(name, b"corpus"),
-        SlotShape::Dense(1),
-        Modality::Text,
-        crate::LensDType::F32,
-        NormPolicy::None,
-    )
-}
-
-fn test_hash(name: &str, suffix: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(name.as_bytes());
-    hasher.update(suffix);
-    hasher.finalize().into()
 }
 
 fn panel_with_slot(lens_id: LensId, bits: Option<f32>) -> Panel {

@@ -60,7 +60,7 @@ pub use lens::{
 pub use panel_ops::{
     AppliedPanelTemplate, CALYX_PANEL_LENS_MISSING, PanelCapabilityGateOutcome, PanelDiff,
     PanelSlotListing, ResolvedPanelLens, apply_capability_gate, apply_panel_template, list_panel,
-    list_panel_with_assay, list_panel_with_runtime_probe, swap_panel, swap_panel_to_target,
+    list_panel_with_assay, swap_panel, swap_panel_to_target,
 };
 pub use panels::{
     AlgorithmicPanelLens, InstantiatedPanel, MaterializedPanelTemplate, PanelLensRuntime,

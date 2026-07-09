@@ -22,7 +22,7 @@ use calyx_core::{CalyxError, Input, LensCost, LensId, Modality, Panel, Placement
 use calyx_registry::{
     LensHealth, PanelSlotListing, Registry, RegistryBatchLimitChange, RegistryBatchLimitUpdate,
     RegistrySnapshotMeasureStats, VaultRegistrySnapshot, apply_registry_snapshot_batch_limits,
-    lens_spec_from_manifest_path, list_panel_with_runtime_probe, load_vault_panel_state,
+    lens_spec_from_manifest_path, list_panel, load_vault_panel_state,
     measure_registry_snapshot_lens_batch_with_stats, set_vault_registry_batch_limits,
 };
 use serde::Serialize;
@@ -230,10 +230,8 @@ fn status_vault(vault: PathBuf, budget_path: Option<&Path>) -> CliResult {
         Some(path) => Some(read_budget(path)?),
         None => None,
     };
-    let (slots, remaining_budget) = vault_slot_status(
-        list_panel_with_runtime_probe(&state.panel, &state.registry),
-        budget,
-    );
+    let (slots, remaining_budget) =
+        vault_slot_status(list_panel(&state.panel, &state.registry), budget);
     let panel_ref = state
         .registry_snapshot
         .as_ref()

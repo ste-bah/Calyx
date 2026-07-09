@@ -5,7 +5,7 @@ use crate::spec::LensHealth;
 use crate::swap::{LifecycleOutcome, SwapController};
 use calyx_assay::store::{AssayCacheKey, AssayStore, AssaySubject};
 use calyx_core::{
-    CalyxError, Input, LensId, Modality, Panel, QuantPolicy, Slot, SlotId, SlotKey, SlotResource,
+    CalyxError, LensId, Modality, Panel, QuantPolicy, Slot, SlotId, SlotKey, SlotResource,
     SlotState, Ts,
 };
 use serde::{Deserialize, Serialize};
@@ -60,20 +60,6 @@ pub fn list_panel(panel: &Panel, registry: &Registry) -> Vec<PanelSlotListing> {
         .slots
         .iter()
         .map(|slot| listing_for_slot(slot, registry))
-        .collect()
-}
-
-pub fn list_panel_with_runtime_probe(panel: &Panel, registry: &Registry) -> Vec<PanelSlotListing> {
-    panel
-        .slots
-        .iter()
-        .map(|slot| {
-            let mut listing = listing_for_slot(slot, registry);
-            if let Some(input) = runtime_probe_input(slot) {
-                listing.health = registry.health_probe(slot.lens_id, &input);
-            }
-            listing
-        })
         .collect()
 }
 
@@ -305,21 +291,6 @@ fn missing_slot_health(slot: &Slot, err: CalyxError) -> LensHealth {
     LensHealth::Failing {
         code: "CALYX_LENS_UNREACHABLE".to_string(),
         reason: err.message,
-    }
-}
-
-fn runtime_probe_input(slot: &Slot) -> Option<Input> {
-    if slot.state == SlotState::Active
-        && slot.modality == Modality::Text
-        && !slot.retrieval_only
-        && !slot.excluded_from_dedup
-    {
-        Some(Input::new(
-            Modality::Text,
-            b"calyx panel status runtime health probe".to_vec(),
-        ))
-    } else {
-        None
     }
 }
 
