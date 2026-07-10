@@ -111,20 +111,6 @@ fn vault_path(name: &str) -> R<PathBuf> {
     ))
 }
 
-/// Deterministic per-page retrieval timestamp = the page file's mtime (epoch secs).
-/// This MUST NOT use wall-clock `now()`: absorb is called idempotently (on book
-/// finish and on every `/api/sequel`), and Calyx fails closed if an already-stored
-/// anchor is re-ingested with different metadata. mtime only changes when the page
-/// is actually rewritten -- and a rewritten page has a new content hash (new anchor)
-/// anyway -- so this keeps re-absorb a byte-identical no-op.
-fn file_mtime_secs(path: &std::path::Path) -> u64 {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 // ----------------------------------------------------------------- init
 
@@ -238,15 +224,19 @@ fn cmd_absorb(series: &str, book_dir: &str, book: u32) -> R<()> {
         hasher.update(text.as_bytes());
         let sha = hex(&hasher.finalize());
         let chapter = page_chapter.get(n).copied().unwrap_or(0);
-        // Deterministic per-page timestamp so re-absorb is a byte-identical no-op.
-        let ts = file_mtime_secs(path).to_string();
         let row = serde_json::json!({
             "text": text,
             "metadata": {
                 "source_dataset": format!("series:{series}"),
                 "source_sha256": sha,
                 "license": "series-memory",
-                "retrieval_ts": ts,
+                // retrieval_ts is a FIXED deterministic sentinel, NOT the file mtime or
+                // wall clock. absorb runs idempotently (on every /api/sequel), and Calyx
+                // fails closed if a stored anchor is re-ingested with drifted metadata.
+                // Content identity is already carried by source_sha256; a constant here
+                // keeps re-absorb a byte-identical no-op even after a page file is
+                // rewritten or restored (mtime-based values did not survive that).
+                "retrieval_ts": "0",
                 "source_url": format!("local://series/{}/book/{}/page/{}", slugify(series), book, n),
                 "series": series,
                 "book": book.to_string(),
@@ -263,7 +253,12 @@ fn cmd_absorb(series: &str, book_dir: &str, book: u32) -> R<()> {
     fs::write(&tmp, &jsonl).map_err(|e| format!("write {}: {e}", tmp.display()))?;
 
     let tmp_s = tmp.to_string_lossy().into_owned();
-    let (stdout, stderr) = run_calyx(&["ingest", &vault, "--batch", &tmp_s, "--output", "summary"])
+    // --idempotent: re-absorbing an already-stored page is a no-op keyed on the
+    // constellation anchor (the page text), so metadata that is not byte-identical
+    // (e.g. retrieval_ts after a page file was rewritten/restored) does NOT trip
+    // Calyx's fail-closed identity guard. absorb is called on every /api/sequel.
+    let (stdout, stderr) = run_calyx(
+        &["ingest", &vault, "--batch", &tmp_s, "--idempotent", "--output", "summary"])
         .map_err(|e| format!("ingest failed: {e}"))?;
     let _ = fs::remove_file(&tmp);
 
