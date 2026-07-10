@@ -111,9 +111,17 @@ fn vault_path(name: &str) -> R<PathBuf> {
     ))
 }
 
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+/// Deterministic per-page retrieval timestamp = the page file's mtime (epoch secs).
+/// This MUST NOT use wall-clock `now()`: absorb is called idempotently (on book
+/// finish and on every `/api/sequel`), and Calyx fails closed if an already-stored
+/// anchor is re-ingested with different metadata. mtime only changes when the page
+/// is actually rewritten -- and a rewritten page has a new content hash (new anchor)
+/// anyway -- so this keeps re-absorb a byte-identical no-op.
+fn file_mtime_secs(path: &std::path::Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
@@ -222,7 +230,6 @@ fn cmd_absorb(series: &str, book_dir: &str, book: u32) -> R<()> {
     }
 
     // build provenance-tagged ingest JSONL
-    let ts = now_epoch_secs().to_string();
     let mut jsonl = String::new();
     for (n, path) in &files {
         let text = fs::read_to_string(path)
@@ -231,6 +238,8 @@ fn cmd_absorb(series: &str, book_dir: &str, book: u32) -> R<()> {
         hasher.update(text.as_bytes());
         let sha = hex(&hasher.finalize());
         let chapter = page_chapter.get(n).copied().unwrap_or(0);
+        // Deterministic per-page timestamp so re-absorb is a byte-identical no-op.
+        let ts = file_mtime_secs(path).to_string();
         let row = serde_json::json!({
             "text": text,
             "metadata": {
