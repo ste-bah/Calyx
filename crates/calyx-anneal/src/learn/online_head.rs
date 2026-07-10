@@ -203,9 +203,9 @@ where
             });
         }
         let candidate_heads = self.candidate_heads(batch, lr, fisher_weight)?;
-        let prior_ptr = crate::ArtifactPtr::ConfigCacheKeyHash(heads_hash(self.sorted_heads()?));
+        let prior_ptr = crate::ArtifactPtr::ConfigCacheKeyHash(heads_hash(self.sorted_heads()?)?);
         let candidate_ptr =
-            crate::ArtifactPtr::ConfigCacheKeyHash(heads_hash(candidate_heads.clone()));
+            crate::ArtifactPtr::ConfigCacheKeyHash(heads_hash(candidate_heads.clone())?);
         let key = head_state_artifact_key();
         self.substrate.ensure_head_prior(key.clone(), prior_ptr)?;
         let description = format!(
@@ -222,7 +222,13 @@ where
         )? {
             ChangeOutcome::Promoted(change_id) => {
                 let rows = encode_head_rows(&candidate_heads)?;
-                self.storage.save_heads(rows)?;
+                if let Err(error) = self.storage.save_heads(rows) {
+                    self.substrate.rollback_head_change(
+                        change_id,
+                        format!("head update storage save failed: {}", error.code),
+                    )?;
+                    return Err(error);
+                }
                 let prior_heads = std::mem::take(&mut self.heads);
                 self.heads = candidate_heads
                     .into_iter()
@@ -439,22 +445,28 @@ fn default_heads() -> Result<Vec<OnlineHead>> {
 
 fn constellation_features(cx: &Constellation, len: usize) -> Vec<f32> {
     let mut features = Vec::with_capacity(len);
-    for index in 0..len {
-        let value = if index == 0 {
-            1.0
-        } else if let Some(value) = cx.scalars.values().nth(index - 1) {
-            *value as f32
-        } else {
-            cx.slots
-                .values()
-                .filter_map(|slot| slot.as_dense())
-                .flatten()
-                .nth(index.saturating_sub(1 + cx.scalars.len()))
-                .copied()
-                .unwrap_or(0.0)
-        };
-        features.push(value);
+    if len == 0 {
+        return features;
     }
+    features.push(1.0);
+    features.extend(
+        cx.scalars
+            .values()
+            .take(len.saturating_sub(features.len()))
+            .map(|value| *value as f32),
+    );
+    for value in cx
+        .slots
+        .values()
+        .filter_map(|slot| slot.as_dense())
+        .flatten()
+    {
+        if features.len() == len {
+            break;
+        }
+        features.push(*value);
+    }
+    features.resize(len, 0.0);
     features
 }
 

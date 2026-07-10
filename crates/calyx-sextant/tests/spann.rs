@@ -36,7 +36,7 @@ fn vectors(n: usize, dim: usize, seed: u64) -> Vec<(u32, Vec<f32>)> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     (0..n)
         .map(|idx| {
-            let mut v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            let mut v: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
             v[idx % dim] += 2.0;
             (idx as u32, v)
         })
@@ -129,10 +129,10 @@ fn posting_block_round_trips_sorted_ids_and_scores() {
     let mut next = 0_u32;
     let entries: Vec<PostingMember> = (0..200)
         .map(|_| {
-            next += rng.gen_range(1..5);
-            let nnz = rng.gen_range(1..6);
+            next += rng.random_range(1..5);
+            let nnz = rng.random_range(1..6);
             let vector: Vec<(u32, f32)> = (0..nnz)
-                .map(|j| (j as u32, rng.gen_range(-1.0_f32..1.0)))
+                .map(|j| (j as u32, rng.random_range(-1.0_f32..1.0)))
                 .collect();
             PostingMember::new(next, vector)
         })
@@ -249,6 +249,26 @@ fn spann_boundary_duplication_writes_member_to_adjacent_postings() {
 
     let hits = SextantIndex::search(&search, &vector, 1, Some(1)).expect("adapter search");
     assert_eq!(hits[0].cx_id, cx(42));
+}
+
+#[test]
+fn empty_centroid_assignment_fails_closed_and_lookup_is_indexed() {
+    let empty = SpannCentroidIndex::empty(2);
+    assert_eq!(
+        empty.assign(&[1.0, 0.0]).unwrap_err().code,
+        "CALYX_INDEX_INVALID_PARAMS"
+    );
+
+    let centroids = SpannCentroidIndex::from_parts(
+        2,
+        vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        Vec::new(),
+        vec![(42, 1), (7, 0)],
+    )
+    .expect("centroids");
+    assert_eq!(centroids.assignment(42), Some(1));
+    assert_eq!(centroids.assignment(7), Some(0));
+    assert_eq!(centroids.assignment(9), None);
 }
 
 #[test]

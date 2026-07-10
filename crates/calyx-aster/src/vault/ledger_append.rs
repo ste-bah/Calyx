@@ -3,7 +3,9 @@ use crate::cf::{ColumnFamily, anchor_key, base_key, ledger_key};
 use crate::ledger_view::parse_aster_ledger_seq;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
 use calyx_ledger::{
-    ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerHeadAnchor, LedgerRow, SubjectId,
+    ActorId, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerHeadAnchor, LedgerRow,
+    QueryId, ReproduceInputResolver, ReproduceLensRegistry, ReproduceResult, SubjectId,
+    reproduce_payload_bytes, reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
 };
 
 struct LedgerEntryInput {
@@ -17,6 +19,41 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    pub(crate) fn stage_raw_ledger_entry_locked(
+        &self,
+        rows: &mut Vec<encode::WriteRow>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<LedgerRef> {
+        let store = AsterRawLedgerStore { vault: self };
+        let appender = LedgerAppender::open(store, SystemClock)?;
+        let prepared = appender.prepare(kind, subject, payload, actor)?;
+        let ledger_ref = prepared.ledger_ref();
+        rows.push(encode::WriteRow {
+            cf: ColumnFamily::Ledger,
+            key: ledger_key(prepared.seq()),
+            value: prepared.bytes().to_vec(),
+        });
+        Ok(ledger_ref)
+    }
+
+    pub(crate) fn stage_raw_ingest_ledger_locked(
+        &self,
+        rows: &mut Vec<encode::WriteRow>,
+        subject: calyx_core::CxId,
+        payload: Vec<u8>,
+    ) -> Result<LedgerRef> {
+        self.stage_raw_ledger_entry_locked(
+            rows,
+            EntryKind::Ingest,
+            SubjectId::Cx(subject),
+            payload,
+            ActorId::Service("calyx-aster".to_string()),
+        )
+    }
+
     /// Adds an anchor and stamps the stored base row with the same ledger ref.
     pub fn anchor_with_ledger_entry(
         &self,
@@ -100,6 +137,32 @@ where
             }
             Ok(ledger_ref)
         })
+    }
+
+    /// Records a reproduce verdict as a `reproduce_v1` Ledger Admin row.
+    pub fn record_reproduce_with_input_resolver(
+        &self,
+        registry: &dyn ReproduceLensRegistry,
+        forge: &mut dyn ForgeBackend,
+        resolver: &dyn ReproduceInputResolver,
+        answer_id: &QueryId,
+    ) -> Result<ReproduceResult> {
+        if self.ledger_hook.is_none() {
+            let mut store = AsterRawLedgerStore { vault: self };
+            return reproduce_with_input_resolver(&mut store, registry, forge, resolver, answer_id);
+        }
+
+        let store = AsterRawLedgerStore { vault: self };
+        let result =
+            reproduce_verdict_with_input_resolver(&store, registry, forge, resolver, answer_id)?;
+        let payload = reproduce_payload_bytes(answer_id, &result, self.clock_now())?;
+        self.append_ledger_entry(
+            EntryKind::Admin,
+            SubjectId::Query(answer_id.clone()),
+            payload,
+            ActorId::Service("calyx-reproduce".to_string()),
+        )?;
+        Ok(result)
     }
 
     fn append_ledger_entry_without_hook(
@@ -259,10 +322,15 @@ where
     }
 
     fn head_anchor(&self) -> Result<Option<LedgerHeadAnchor>> {
-        match &self.vault.durable {
-            Some(durable) => crate::ledger_head::read_head_anchor(durable.root()),
-            None => Ok(None),
+        let Some(durable) = &self.vault.durable else {
+            return Ok(None);
+        };
+        let anchor = crate::ledger_head::read_head_anchor(durable.root())?;
+        if anchor.is_none() {
+            let rows = self.scan()?;
+            return crate::ledger_head::require_head_anchor_for_rows(durable.root(), anchor, &rows);
         }
+        Ok(anchor)
     }
 
     fn put_head_anchor(&mut self, anchor: &LedgerHeadAnchor) -> Result<()> {

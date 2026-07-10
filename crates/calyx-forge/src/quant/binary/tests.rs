@@ -58,7 +58,7 @@ fn normalize(vec: &mut [f32]) {
 
 fn random_unit(dim: usize, rng: &mut ChaCha8Rng) -> Vec<f32> {
     let mut vec = (0..dim)
-        .map(|_| rng.gen_range(-1.0..1.0))
+        .map(|_| rng.random_range(-1.0..1.0))
         .collect::<Vec<_>>();
     normalize(&mut vec);
     vec
@@ -67,7 +67,7 @@ fn random_unit(dim: usize, rng: &mut ChaCha8Rng) -> Vec<f32> {
 fn noisy_neighbor(query: &[f32], rng: &mut ChaCha8Rng, noise_scale: f32) -> Vec<f32> {
     let mut vec = query
         .iter()
-        .map(|value| *value + rng.gen_range(-noise_scale..noise_scale))
+        .map(|value| *value + rng.random_range(-noise_scale..noise_scale))
         .collect::<Vec<_>>();
     normalize(&mut vec);
     vec
@@ -188,6 +188,20 @@ fn binary_edges_dim1_keep_all_and_partial_byte() {
         first_hex(&encoded_one.bytes),
         first_hex(&encoded_partial.bytes)
     );
+}
+
+#[test]
+fn binary_prefilter_selects_top_k_with_stable_ties() {
+    let codec = BinaryCodec::new(fixed_seed(8, 0x68)).expect("codec");
+    let query = codec.encode(&unit_basis(8, 0)).expect("query");
+    let same_a = codec.encode(&unit_basis(8, 0)).expect("same a");
+    let same_b = same_a.clone();
+    let opposite = codec.encode(&negate(&unit_basis(8, 0))).expect("opposite");
+
+    let selected =
+        binary_prefilter(&query, &[opposite, same_b, same_a], 2).expect("select top two");
+
+    assert_eq!(selected, vec![1, 2]);
 }
 
 #[test]

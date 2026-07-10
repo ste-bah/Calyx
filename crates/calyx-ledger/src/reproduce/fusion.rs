@@ -10,9 +10,10 @@ use super::{
     ForgeBackend, QueryId, RemeasuredSlot, ReproduceInputResolver, ReproduceLensRegistry,
     build_reproduce_context, remeasure_slots, remeasure_slots_with_input_resolver,
 };
-use crate::append::{LedgerCfStore, LedgerRow};
-use crate::codec::{decode, encode};
-use crate::entry::{ActorId, HASH_BYTES, LedgerEntry, SubjectId};
+use crate::append::{LedgerCfStore, recover_tip};
+use crate::codec::encode;
+use crate::entry::{ActorId, LedgerEntry, SubjectId};
+use crate::head_anchor::LedgerHeadAnchor;
 use crate::kind::EntryKind;
 use crate::redaction::RedactionPolicy;
 
@@ -139,9 +140,9 @@ pub fn reproduce(
     forge: &mut dyn ForgeBackend,
     answer_id: &QueryId,
 ) -> Result<ReproduceResult> {
-    let ctx = build_reproduce_context(store, answer_id)?;
-    let remeasured = remeasure_slots(&ctx, registry, forge)?;
-    reproduce_from_remeasured(store, answer_id, &ctx.ledger_entries, &remeasured)
+    let result = reproduce_verdict(store, registry, forge, answer_id)?;
+    append_reproduce_entry(store, answer_id, &result)?;
+    Ok(result)
 }
 
 pub fn reproduce_with_input_resolver(
@@ -151,9 +152,33 @@ pub fn reproduce_with_input_resolver(
     resolver: &dyn ReproduceInputResolver,
     answer_id: &QueryId,
 ) -> Result<ReproduceResult> {
+    let result =
+        reproduce_verdict_with_input_resolver(store, registry, forge, resolver, answer_id)?;
+    append_reproduce_entry(store, answer_id, &result)?;
+    Ok(result)
+}
+
+pub fn reproduce_verdict(
+    store: &impl LedgerCfStore,
+    registry: &dyn ReproduceLensRegistry,
+    forge: &mut dyn ForgeBackend,
+    answer_id: &QueryId,
+) -> Result<ReproduceResult> {
+    let ctx = build_reproduce_context(store, answer_id)?;
+    let remeasured = remeasure_slots(&ctx, registry, forge)?;
+    reproduce_result_from_remeasured(&ctx.ledger_entries, &remeasured)
+}
+
+pub fn reproduce_verdict_with_input_resolver(
+    store: &impl LedgerCfStore,
+    registry: &dyn ReproduceLensRegistry,
+    forge: &mut dyn ForgeBackend,
+    resolver: &dyn ReproduceInputResolver,
+    answer_id: &QueryId,
+) -> Result<ReproduceResult> {
     let ctx = build_reproduce_context(store, answer_id)?;
     let remeasured = remeasure_slots_with_input_resolver(&ctx, registry, forge, resolver)?;
-    reproduce_from_remeasured(store, answer_id, &ctx.ledger_entries, &remeasured)
+    reproduce_result_from_remeasured(&ctx.ledger_entries, &remeasured)
 }
 
 pub fn append_reproduce_entry(
@@ -165,7 +190,7 @@ pub fn append_reproduce_entry(
     let ts = last_ts
         .checked_add(1)
         .ok_or_else(|| CalyxError::ledger_chain_broken("ledger timestamp exhausted"))?;
-    let payload = reproduce_payload(answer_id, result, ts)?;
+    let payload = reproduce_payload_bytes(answer_id, result, ts)?;
     RedactionPolicy::check_payload(&payload)?;
     let entry = LedgerEntry::new(
         seq,
@@ -177,6 +202,12 @@ pub fn append_reproduce_entry(
         ts,
     );
     store.put_new(seq, &encode(&entry))?;
+    // Advance the external head witness exactly as `LedgerAppender::commit_prepared`
+    // does. Without this the anchor stays stale, a later `LedgerAppender::open`
+    // recovers `next_seq = anchor.height` and the next commit collides at this
+    // reproduce row, permanently wedging an anchor-backed ledger.
+    let anchor = LedgerHeadAnchor::new(seq.saturating_add(1), entry.entry_hash)?;
+    store.put_head_anchor(&anchor)?;
     Ok(entry)
 }
 
@@ -191,9 +222,7 @@ pub fn assert_reproduced(result: &ReproduceResult) -> Result<()> {
     }
 }
 
-fn reproduce_from_remeasured(
-    store: &mut impl LedgerCfStore,
-    answer_id: &QueryId,
+fn reproduce_result_from_remeasured(
     ledger_entries: &[LedgerEntry],
     remeasured: &[RemeasuredSlot],
 ) -> Result<ReproduceResult> {
@@ -203,14 +232,12 @@ fn reproduce_from_remeasured(
     let reproduced_hits = rerun_fusion(remeasured, &fusion_weights)?;
     let (reproduced, max_drift) =
         assert_within_tolerance(&original_hits, &reproduced_hits, REPRODUCE_TOLERANCE);
-    let result = ReproduceResult {
+    Ok(ReproduceResult {
         reproduced,
         max_drift,
         original_hits,
         reproduced_hits,
-    };
-    append_reproduce_entry(store, answer_id, &result)?;
-    Ok(result)
+    })
 }
 
 fn answer_payload(ledger_entries: &[LedgerEntry]) -> Result<Value> {
@@ -279,38 +306,11 @@ fn ranked_indices(scores: &[f32]) -> Vec<usize> {
     indices
 }
 
-fn recover_tip(store: &impl LedgerCfStore) -> Result<(u64, [u8; HASH_BYTES], u64)> {
-    let mut next_seq = 0_u64;
-    let mut prev_hash = [0_u8; HASH_BYTES];
-    let mut last_ts = 0_u64;
-    for LedgerRow { seq, bytes } in store.scan()? {
-        if seq != next_seq {
-            return Err(CalyxError::ledger_chain_broken(format!(
-                "ledger seq gap before reproduce append: expected {next_seq}, found {seq}"
-            )));
-        }
-        let entry = decode(&bytes)?;
-        if entry.seq != seq {
-            return Err(CalyxError::ledger_corrupt(format!(
-                "ledger key seq {seq} != encoded seq {} before reproduce append",
-                entry.seq
-            )));
-        }
-        if entry.prev_hash != prev_hash {
-            return Err(CalyxError::ledger_chain_broken(format!(
-                "ledger seq {seq} prev_hash mismatch before reproduce append"
-            )));
-        }
-        prev_hash = entry.entry_hash;
-        last_ts = entry.ts;
-        next_seq = next_seq
-            .checked_add(1)
-            .ok_or_else(|| CalyxError::ledger_chain_broken("ledger sequence exhausted"))?;
-    }
-    Ok((next_seq, prev_hash, last_ts))
-}
-
-fn reproduce_payload(answer_id: &QueryId, result: &ReproduceResult, ts: u64) -> Result<Vec<u8>> {
+pub fn reproduce_payload_bytes(
+    answer_id: &QueryId,
+    result: &ReproduceResult,
+    ts: u64,
+) -> Result<Vec<u8>> {
     serde_json::to_vec(&serde_json::json!({
         "type": REPRODUCE_PAYLOAD_TAG,
         "answer_id": hex(answer_id),

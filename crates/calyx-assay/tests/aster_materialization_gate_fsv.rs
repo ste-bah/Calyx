@@ -64,7 +64,9 @@ fn aster_gate_errors_are_observable_by_default() {
     assert_eq!(err.code, "CALYX_STALE_DERIVED");
     assert_eq!(gate.last_error().unwrap().code, "CALYX_STALE_DERIVED");
     assert_eq!(gate.pair_gain_bits_fail_safe_lazy(slot(1), slot(2)), 0.0);
+    assert_eq!(gate.error_count(), 2);
     let fallback_plan = gate.materialization_plan_fail_safe_lazy(&[slot(1), slot(2)]);
+    assert_eq!(gate.error_count(), 3);
     assert_eq!(
         plan_count(
             &fallback_plan,
@@ -208,7 +210,7 @@ fn write_sample_vault(
             .then(|| Anchor {
                 kind: AnchorKind::Label("issue319-passfail".to_string()),
                 value: AnchorValue::Bool(labels[index]),
-                source: "issue319-grounded-synthetic".to_string(),
+                source: "uma:issue319-grounded-synthetic".to_string(),
                 observed_at: 1_785_400_000 + index as u64,
                 confidence: 1.0,
             })
@@ -274,7 +276,7 @@ fn persist_and_reload(dir: &Path, store: &LoomStore) -> serde_json::Value {
         "raw_cf_rows": raw_cf_rows,
         "sst_files": router.level_file_count(ColumnFamily::XTerm),
         "kind_counts": kind_counts(&loaded),
-        "agreement_edges": loaded.agreement_graph(),
+        "agreement_edges": loaded.agreement_graph().expect("agreement graph"),
     })
 }
 

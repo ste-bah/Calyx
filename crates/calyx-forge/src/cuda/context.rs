@@ -1,13 +1,14 @@
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use cudarc::driver::{CudaContext as CudarcContext, CudaModule};
+use cudarc::cublas::CudaBlas;
+use cudarc::driver::{CudaContext as CudarcContext, CudaFunction, CudaModule};
 
 use crate::{BackendKind, DeviceInfo, ForgeError, Result};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const MIN_FREE_VRAM_MIB: u64 = 4096;
-const CUDA_REMEDIATION: &str =
-    "Check that CUDA is installed and nvidia-smi shows an available CUDA GPU";
+const CUDA_REMEDIATION: &str = "Check that CUDA is installed at /usr/local/cuda-13.3 and nvidia-smi shows an available CUDA GPU";
 
 #[derive(Clone, Debug)]
 pub struct CudaContext {
@@ -18,8 +19,11 @@ pub struct CudaContext {
     compute_capability: (i32, i32),
     total_mem_mib: u64,
     free_mem_mib_at_init: u64,
+    blas: Arc<OnceLock<Arc<CudaBlas>>>,
     distance_module: Arc<OnceLock<Arc<CudaModule>>>,
+    mxfp4_module: Arc<OnceLock<Arc<CudaModule>>>,
     topk_module: Arc<OnceLock<Arc<CudaModule>>>,
+    kernel_functions: Arc<Mutex<HashMap<&'static str, Arc<CudaFunction>>>>,
 }
 
 impl CudaContext {
@@ -73,12 +77,38 @@ impl CudaContext {
         Ok(free_bytes)
     }
 
+    pub(crate) fn blas_cache(&self) -> &OnceLock<Arc<CudaBlas>> {
+        &self.blas
+    }
+
     pub(crate) fn distance_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
         &self.distance_module
     }
 
+    pub(crate) fn mxfp4_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.mxfp4_module
+    }
+
     pub(crate) fn topk_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
         &self.topk_module
+    }
+
+    pub(crate) fn cached_function(
+        &self,
+        module: &Arc<CudaModule>,
+        cache_key: &'static str,
+        function_name: &'static str,
+    ) -> std::result::Result<Arc<CudaFunction>, cudarc::driver::DriverError> {
+        let mut functions = self
+            .kernel_functions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(function) = functions.get(cache_key) {
+            return Ok(function.clone());
+        }
+        let function = Arc::new(module.load_function(function_name)?);
+        functions.insert(cache_key, function.clone());
+        Ok(function)
     }
 }
 
@@ -111,8 +141,11 @@ pub fn init_cuda(device_idx: u32, determinism: bool) -> Result<CudaContext> {
         compute_capability,
         total_mem_mib: bytes_to_mib(total_bytes),
         free_mem_mib_at_init: free_mem_mib,
+        blas: Arc::new(OnceLock::new()),
         distance_module: Arc::new(OnceLock::new()),
+        mxfp4_module: Arc::new(OnceLock::new()),
         topk_module: Arc::new(OnceLock::new()),
+        kernel_functions: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 

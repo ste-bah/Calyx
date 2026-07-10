@@ -251,6 +251,19 @@ pub(super) fn refresh_hook(
     Ok(())
 }
 
+pub(super) fn refresh_hook_from_recovery(
+    hook: &AsterLedgerHook,
+    recovery: &RecoveredBatches,
+    checkpoint: Option<CheckpointConfig>,
+) -> Result<()> {
+    let replacement = recover_hook_from_store(recovered_ledger_store(recovery)?, checkpoint)?
+        .into_inner()
+        .map_err(|_| CalyxError::ledger_group_commit_failed("new ledger hook lock poisoned"))?;
+    let mut guard = lock_hook(hook)?;
+    *guard = replacement;
+    Ok(())
+}
+
 pub(super) fn stage_ingest(
     hook: &DefaultLedgerHook<MemoryLedgerStore, SystemClock>,
     rows: &mut Vec<WriteRow>,
@@ -313,7 +326,7 @@ pub(super) fn commit_staged(
     Ok(data_ref)
 }
 
-fn ingest_payload(constellation: &Constellation) -> Vec<u8> {
+pub(super) fn ingest_payload(constellation: &Constellation) -> Vec<u8> {
     let mut payload = PayloadBuilder::default();
     let mut metadata = serde_json::Map::new();
     for key in [METADATA_CHUNK_ID, METADATA_DATABASE_NAME] {

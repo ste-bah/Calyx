@@ -86,7 +86,13 @@ pub struct BanditReadback {
     pub bandit: ConfigBandit,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
+struct BanditRowRef<'a> {
+    tag: String,
+    bandit: &'a ConfigBandit,
+}
+
+#[derive(Deserialize)]
 struct BanditRow {
     tag: String,
     bandit: ConfigBandit,
@@ -194,7 +200,10 @@ impl ConfigBandit {
         } else {
             arm.consecutive_wins = 0;
         }
-        if won && (self.hysteresis_wins == 0 || arm.consecutive_wins >= self.hysteresis_wins) {
+        if won
+            && arm_idx != self.incumbent_idx
+            && (self.hysteresis_wins == 0 || arm.consecutive_wins >= self.hysteresis_wins)
+        {
             self.incumbent_idx = arm_idx;
             for arm in &mut self.arms {
                 arm.consecutive_wins = 0;
@@ -271,8 +280,8 @@ impl ConfigBandit {
             return Ok(self.best_win_rate_index());
         }
         let mut rng = ChaCha8Rng::seed_from_u64(self.rng_seed);
-        let idx = if rng.gen_range(0.0..1.0) < epsilon {
-            rng.gen_range(0..self.arms.len())
+        let idx = if rng.random_range(0.0..1.0) < epsilon {
+            rng.random_range(0..self.arms.len())
         } else {
             self.best_win_rate_index()
         };
@@ -364,9 +373,9 @@ pub fn bandit_key(shape_key_hash: [u8; 32]) -> Vec<u8> {
 
 pub fn encode_config_bandit(bandit: &ConfigBandit) -> Result<Vec<u8>> {
     bandit.validate()?;
-    let row = BanditRow {
+    let row = BanditRowRef {
         tag: BANDIT_ROW_TAG.to_string(),
-        bandit: bandit.clone(),
+        bandit,
     };
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(&row, &mut bytes).map_err(|error| invalid_row(error.to_string()))?;
@@ -394,7 +403,7 @@ fn sample_beta(alpha: f64, beta: f64, rng: &mut ChaCha8Rng) -> f64 {
 
 fn sample_gamma(shape: f64, rng: &mut ChaCha8Rng) -> f64 {
     if shape == 1.0 {
-        return -rng.gen_range(f64::MIN_POSITIVE..1.0).ln();
+        return -rng.random_range(f64::MIN_POSITIVE..1.0).ln();
     }
     let d = shape - (1.0 / 3.0);
     let c = (1.0 / (9.0 * d)).sqrt();
@@ -405,7 +414,7 @@ fn sample_gamma(shape: f64, rng: &mut ChaCha8Rng) -> f64 {
             continue;
         }
         let v3 = v * v * v;
-        let u = rng.gen_range(0.0..1.0);
+        let u = rng.random_range(0.0..1.0);
         if u < 1.0 - 0.0331 * x.powi(4) {
             return d * v3;
         }
@@ -416,8 +425,8 @@ fn sample_gamma(shape: f64, rng: &mut ChaCha8Rng) -> f64 {
 }
 
 fn standard_normal(rng: &mut ChaCha8Rng) -> f64 {
-    let u1 = rng.gen_range(f64::MIN_POSITIVE..1.0);
-    let u2 = rng.gen_range(0.0..1.0);
+    let u1 = rng.random_range(f64::MIN_POSITIVE..1.0);
+    let u2 = rng.random_range(0.0..1.0);
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 

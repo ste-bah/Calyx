@@ -127,6 +127,7 @@ fn resource_budget_rejection_skips_substrate_and_hot_add() {
         total_ms: 1.0,
         ms_per_input: 1.0,
         vram_bytes: 512 * 1024 * 1024,
+        vram_observed: true,
         ram_bytes: 0,
         batch_ceiling: 1,
     });
@@ -303,6 +304,42 @@ fn hot_add_failure_restores_panel_and_rolls_back() {
     );
     assert_eq!(controller.panel().slots.len(), 1);
     assert_eq!(substrate.rolled_back, vec![ChangeId(421_006)]);
+}
+
+#[test]
+fn sufficiency_read_failure_after_hot_add_restores_panel_and_rolls_back() {
+    let clock = FixedClock::new(TEST_TS);
+    let mut controller = controller();
+    let mut substrate = TestSubstrate::promote(ChangeId(421_009));
+    let assay = FixtureAssay::new([0.20, 0.80], 1.00).fail_sufficiency_on_call(2);
+    let profiler = StaticProfiler::new(0.12);
+    let nmi = StaticNmi::new(0.10);
+    let mut hot_add = TestHotAdder::succeed();
+    let anchor = anchor();
+    let corpus = corpus();
+
+    let outcome = ProposeLens::new(&clock)
+        .propose_lens(ProposeLensRequest {
+            anchor: &anchor,
+            controller: &mut controller,
+            substrate: &mut substrate,
+            assay: &assay,
+            hot_add: &mut hot_add,
+            profiler: &profiler,
+            nmi: &nmi,
+            corpus: &corpus,
+        })
+        .unwrap();
+
+    assert_eq!(
+        outcome.terminal_state,
+        ProposalTerminalState::HotAddFailed {
+            code: "CALYX_ASSAY_UNAVAILABLE".to_string()
+        }
+    );
+    assert_eq!(controller.panel().slots.len(), 1);
+    assert_eq!(substrate.rolled_back, vec![ChangeId(421_009)]);
+    assert_eq!(hot_add.apply_calls, 1);
 }
 
 #[test]

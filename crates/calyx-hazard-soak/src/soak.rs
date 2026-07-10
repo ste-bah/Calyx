@@ -131,7 +131,7 @@ pub fn run_integrated_soak_at(root: &Path, n_ops: u64, seed: u64) -> Result<Soak
     let mut tombstone_values = 0_u64;
 
     for op in 0..n_ops {
-        match rng.gen_range(0..100) {
+        match rng.random_range(0..100) {
             0..=39 => write_op(
                 op,
                 WriteOpState {
@@ -389,6 +389,7 @@ impl BudgetProbe for StaticBudget {
             cpu_used_fraction: 0.05,
             vram_used_bytes: 0,
             nvml_available: true,
+            warning_code: None,
         }
     }
 }

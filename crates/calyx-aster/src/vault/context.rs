@@ -12,21 +12,26 @@
 //! recorded so the vault manifest can report it.
 
 use crate::cf::ColumnFamily;
-use crate::security::zfs::{ZfsEncryptionStatus, probe_zfs_encryption};
+use crate::security::zfs::{
+    ZfsEncryptionStatus, probe_zfs_encryption, probe_zfs_encryption_for_path,
+};
 use crate::vault::grant::GrantStore;
 use crate::vault::key::{CALYX_DECRYPTION_FAILED, VaultKey};
 use crate::vault::keyspace::KeyspaceGuard;
 use crate::vault::quota::{QuotaConfig, QuotaGuard};
 use calyx_core::{CalyxError, Result, Ts, VaultId};
 use calyx_ledger::ActorId;
-use rand::RngCore;
+use rand::TryRngCore;
 use rand::rngs::OsRng;
+use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// AES-GCM nonce length embedded at the front of every encrypted value.
 const VALUE_NONCE_LEN: usize = 12;
 /// AES-GCM authentication tag length appended by `VaultKey`.
 const VALUE_TAG_LEN: usize = 16;
+pub const CALYX_VAULT_KEY_SHREDDED: &str = "CALYX_VAULT_KEY_SHREDDED";
+pub const CALYX_VAULT_NONCE_RANDOM_FAILED: &str = "CALYX_VAULT_NONCE_RANDOM_FAILED";
 
 /// The single per-vault security aggregate threaded through every storage op.
 #[derive(Debug)]
@@ -62,6 +67,24 @@ impl VaultContext {
             grants: Arc::new(RwLock::new(GrantStore::new())),
             quota: QuotaGuard::new(vault_id, config),
             zfs_status: probe_zfs_encryption(zfs_dataset),
+        })
+    }
+
+    /// Builds a context and probes the dataset that actually hosts `vault_path`.
+    pub fn new_for_path(
+        vault_id: VaultId,
+        master_key: &[u8],
+        config: QuotaConfig,
+        vault_path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let key = VaultKey::derive(master_key, &vault_id)?;
+        Ok(Self {
+            vault_id,
+            key,
+            keyspace: KeyspaceGuard::new(vault_id),
+            grants: Arc::new(RwLock::new(GrantStore::new())),
+            quota: QuotaGuard::new(vault_id, config),
+            zfs_status: probe_zfs_encryption_for_path(vault_path),
         })
     }
 
@@ -119,8 +142,19 @@ impl VaultContext {
     /// Returns `nonce || ciphertext || tag`, with a fresh 96-bit nonce generated
     /// internally for every call. Callers never supply value nonces.
     pub fn encrypt_value(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        if self.key.is_shredded_for_erasure() {
+            return Err(CalyxError {
+                code: CALYX_VAULT_KEY_SHREDDED,
+                message: "vault key has been shredded for erasure".to_string(),
+                remediation: "close the erased vault handle and reopen from durable bytes only when policy allows a new key context",
+            });
+        }
         let mut nonce = [0_u8; VALUE_NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
+        OsRng.try_fill_bytes(&mut nonce).map_err(|error| CalyxError {
+            code: CALYX_VAULT_NONCE_RANDOM_FAILED,
+            message: format!("failed to generate AES-GCM value nonce: {error}"),
+            remediation: "verify the host random source is available before encrypting vault values",
+        })?;
         let mut ciphertext = self.key.encrypt(&nonce, plaintext, aad)?;
         let mut sealed = Vec::with_capacity(VALUE_NONCE_LEN + ciphertext.len());
         sealed.extend_from_slice(&nonce);

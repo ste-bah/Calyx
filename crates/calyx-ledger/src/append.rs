@@ -66,6 +66,22 @@ pub trait LedgerCfStore {
     /// Returns all rows sorted by sequence number.
     fn scan(&self) -> Result<Vec<LedgerRow>>;
 
+    /// Returns at most the newest `n` rows sorted by sequence number.
+    ///
+    /// The default full-scans [`scan`](Self::scan). Stores with ordered keys
+    /// should override this so status/readback paths do not decode the whole
+    /// append-only ledger for small recent windows.
+    fn scan_recent(&self, n: usize) -> Result<Vec<LedgerRow>> {
+        if n == usize::MAX {
+            return self.scan();
+        }
+        let mut rows = self.scan()?;
+        if n < rows.len() {
+            rows.drain(0..rows.len() - n);
+        }
+        Ok(rows)
+    }
+
     /// Reads one ledger row by sequence number.
     ///
     /// The default full-scans [`scan`](Self::scan). Override this for any store
@@ -275,6 +291,14 @@ where
             .collect()
     }
 
+    pub fn scan_recent_entries(&self, n: usize) -> Result<Vec<LedgerEntry>> {
+        self.store
+            .scan_recent(n)?
+            .into_iter()
+            .map(|row| decode(&row.bytes))
+            .collect()
+    }
+
     pub fn store(&self) -> &S {
         &self.store
     }
@@ -386,7 +410,14 @@ pub fn reject_tombstone(seq: u64) -> Result<()> {
     )))
 }
 
-fn recover_tip(store: &impl LedgerCfStore) -> Result<(u64, [u8; HASH_BYTES], u64)> {
+/// Recovers the appender tip from a store, honoring its external head anchor.
+///
+/// This is the single tip-recovery routine for every ledger write path. When
+/// the store exposes a [`LedgerHeadAnchor`] it takes the anchored fast path and
+/// fails closed on an end-truncated ledger; otherwise it validates the full
+/// hash chain by scan. Any additional write path (e.g. reproduce appends) must
+/// use this rather than re-deriving the tip, so the anchor stays authoritative.
+pub(crate) fn recover_tip(store: &impl LedgerCfStore) -> Result<(u64, [u8; HASH_BYTES], u64)> {
     if let Some(anchor) = store.head_anchor()? {
         if anchor.height == 0 {
             return Ok((0, [0_u8; HASH_BYTES], 0));

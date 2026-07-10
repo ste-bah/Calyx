@@ -5,7 +5,8 @@ use cudarc::driver::{CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 
 use crate::cpu::{check_finite, check_shape_2d};
-use crate::cuda::kernels::DISTANCE_PTX;
+use crate::cuda::kernels::{DISTANCE_CUBIN, DISTANCE_PTX};
+use crate::cuda::validate::{check_device_f32, read_checked_device_f32};
 use crate::{CudaContext, ForgeError, Result};
 
 const BLOCK_THREADS: u32 = 256;
@@ -106,12 +107,11 @@ pub fn cosine_host(
 ) -> Result<()> {
     distance_host(
         ctx,
-        "cosine_batch_gpu",
+        ("cosine_batch_gpu", "cosine_batch_f32", true),
         query,
         candidates,
         dim,
         out,
-        cosine_batch_gpu,
     )
 }
 
@@ -124,12 +124,11 @@ pub fn dot_host(
 ) -> Result<()> {
     distance_host(
         ctx,
-        "dot_batch_gpu",
+        ("dot_batch_gpu", "dot_batch_f32", false),
         query,
         candidates,
         dim,
         out,
-        dot_batch_gpu,
     )
 }
 
@@ -142,12 +141,11 @@ pub fn l2_host(
 ) -> Result<()> {
     distance_host(
         ctx,
-        "l2_batch_gpu",
+        ("l2_batch_gpu", "l2_batch_f32", false),
         query,
         candidates,
         dim,
         out,
-        l2_batch_gpu,
     )
 }
 
@@ -175,33 +173,21 @@ pub fn normalize_host(ctx: &CudaContext, vecs: &mut [f32], dim: usize) -> Result
     let mut vecs_dev = stream
         .clone_htod(vecs)
         .map_err(|err| device_unavailable(ctx, format!("normalize input copy failed: {err}")))?;
-    normalize_rows_gpu(ctx, &mut vecs_dev, rows, dim)?;
-    let result = stream
-        .clone_dtoh(&vecs_dev)
-        .map_err(|err| device_unavailable(ctx, format!("normalize output copy failed: {err}")))?;
-    check_finite(&result, "cuda normalize")?;
+    launch_normalize(ctx, &mut vecs_dev, rows, dim)?;
+    let result = read_checked_device_output(ctx, "normalize_rows_gpu", &vecs_dev, false)?;
     vecs.copy_from_slice(&result);
     Ok(())
 }
 
-type DistanceKernel = fn(
-    &CudaContext,
-    &CudaSlice<f32>,
-    &CudaSlice<f32>,
-    usize,
-    usize,
-    &mut CudaSlice<f32>,
-) -> Result<()>;
-
 fn distance_host(
     ctx: &CudaContext,
-    op: &'static str,
+    kernel: (&'static str, &'static str, bool),
     query: &[f32],
     candidates: &[f32],
     dim: usize,
     out: &mut [f32],
-    kernel: DistanceKernel,
 ) -> Result<()> {
+    let (op, kernel_name, sentinel) = kernel;
     validate_host_inputs(op, query, candidates, dim, out)?;
     out.fill(0.0);
     if out.is_empty() {
@@ -219,19 +205,18 @@ fn distance_host(
         .alloc_zeros(out.len())
         .map_err(|err| device_unavailable(ctx, format!("{op} output allocation failed: {err}")))?;
 
-    kernel(
+    launch_distance(
         ctx,
+        op,
+        kernel_name,
         &query_dev,
         &candidates_dev,
         dim,
         out.len(),
         &mut out_dev,
     )?;
-    let result = stream
-        .clone_dtoh(&out_dev)
-        .map_err(|err| device_unavailable(ctx, format!("{op} output copy failed: {err}")))?;
+    let result = read_checked_device_output(ctx, op, &out_dev, sentinel)?;
     out.copy_from_slice(&result);
-    check_finite(out, op)?;
     Ok(())
 }
 
@@ -261,8 +246,8 @@ fn launch_distance(
         remediation: "cuda distance n_cands exceeds grid dimension limit".to_string(),
     })?;
     let module = distance_module(ctx)?;
-    let func = module
-        .load_function(kernel_name)
+    let func = ctx
+        .cached_function(&module, distance_cache_key(kernel_name), kernel_name)
         .map_err(|err| device_unavailable(ctx, format!("{op} load function failed: {err}")))?;
     let stream = ctx.inner().default_stream();
     let cfg = LaunchConfig {
@@ -271,7 +256,7 @@ fn launch_distance(
         shared_mem_bytes: 0,
     };
 
-    let mut launch = stream.launch_builder(&func);
+    let mut launch = stream.launch_builder(func.as_ref());
     unsafe {
         launch
             .arg(query)
@@ -282,9 +267,6 @@ fn launch_distance(
             .launch(cfg)
     }
     .map_err(|err| device_unavailable(ctx, format!("{op} kernel launch failed: {err}")))?;
-    stream
-        .synchronize()
-        .map_err(|err| device_unavailable(ctx, format!("{op} stream sync failed: {err}")))?;
     Ok(())
 }
 
@@ -302,8 +284,8 @@ fn launch_normalize(
     })?;
     let dim_i32 = to_i32(dim, "dim")?;
     let module = distance_module(ctx)?;
-    let func = module
-        .load_function("normalize_rows_f32")
+    let func = ctx
+        .cached_function(&module, "distance.normalize_rows_f32", "normalize_rows_f32")
         .map_err(|err| device_unavailable(ctx, format!("normalize load function failed: {err}")))?;
     let stream = ctx.inner().default_stream();
     let cfg = LaunchConfig {
@@ -312,27 +294,57 @@ fn launch_normalize(
         shared_mem_bytes: 0,
     };
 
-    let mut launch = stream.launch_builder(&func);
+    let mut launch = stream.launch_builder(func.as_ref());
     unsafe { launch.arg(vecs).arg(&dim_i32).arg(&rows_i32).launch(cfg) }
         .map_err(|err| device_unavailable(ctx, format!("normalize kernel launch failed: {err}")))?;
-    stream
-        .synchronize()
-        .map_err(|err| device_unavailable(ctx, format!("normalize stream sync failed: {err}")))?;
     Ok(())
 }
 
-fn distance_module(ctx: &CudaContext) -> Result<Arc<CudaModule>> {
+pub(crate) fn distance_module(ctx: &CudaContext) -> Result<Arc<CudaModule>> {
     if let Some(module) = ctx.distance_module_cache().get() {
         return Ok(module.clone());
     }
+    match ctx
+        .inner()
+        .load_module(Ptx::from_binary(DISTANCE_CUBIN.to_vec()))
+    {
+        Ok(module) => {
+            let _ = ctx.distance_module_cache().set(module.clone());
+            Ok(module)
+        }
+        Err(cubin_err) => {
+            let module = distance_ptx_module(ctx, cubin_err)?;
+            let _ = ctx.distance_module_cache().set(module.clone());
+            Ok(module)
+        }
+    }
+}
+
+fn distance_cache_key(kernel_name: &'static str) -> &'static str {
+    match kernel_name {
+        "cosine_batch_f32" => "distance.cosine_batch_f32",
+        "dot_batch_f32" => "distance.dot_batch_f32",
+        "l2_batch_f32" => "distance.l2_batch_f32",
+        _ => kernel_name,
+    }
+}
+
+fn distance_ptx_module(
+    ctx: &CudaContext,
+    cubin_err: cudarc::driver::DriverError,
+) -> Result<Arc<CudaModule>> {
     let ptx = str::from_utf8(DISTANCE_PTX)
         .map_err(|err| device_unavailable(ctx, format!("distance PTX is not UTF-8: {err}")))?;
-    let module = ctx
-        .inner()
+    ctx.inner()
         .load_module(Ptx::from_src(ptx))
-        .map_err(|err| device_unavailable(ctx, format!("distance PTX load failed: {err}")))?;
-    let _ = ctx.distance_module_cache().set(module.clone());
-    Ok(module)
+        .map_err(|ptx_err| {
+            device_unavailable(
+                ctx,
+                format!(
+                    "distance CUBIN load failed: {cubin_err}; PTX fallback load failed: {ptx_err}"
+                ),
+            )
+        })
 }
 
 fn check_device_output(
@@ -341,7 +353,7 @@ fn check_device_output(
     out: &CudaSlice<f32>,
     sentinel: bool,
 ) -> Result<()> {
-    read_checked_device_output(ctx, op, out, sentinel).map(|_| ())
+    check_device_f32(ctx, op, out, sentinel, DISTANCE_REMEDIATION)
 }
 
 pub(crate) fn read_checked_device_output(
@@ -350,26 +362,7 @@ pub(crate) fn read_checked_device_output(
     out: &CudaSlice<f32>,
     sentinel: bool,
 ) -> Result<Vec<f32>> {
-    let values = ctx
-        .inner()
-        .default_stream()
-        .clone_dtoh(out)
-        .map_err(|err| device_unavailable(ctx, format!("{op} output readback failed: {err}")))?;
-    for (idx, value) in values.iter().enumerate() {
-        if sentinel && *value <= -1.5 {
-            return Err(numerical(
-                op,
-                format!("zero-norm query or candidate at index {idx}"),
-            ));
-        }
-        if !value.is_finite() {
-            return Err(numerical(
-                op,
-                format!("non-finite output at index {idx}: {value}"),
-            ));
-        }
-    }
-    Ok(values)
+    read_checked_device_f32(ctx, op, out, sentinel, DISTANCE_REMEDIATION)
 }
 
 fn validate_host_inputs(
@@ -434,14 +427,6 @@ fn to_i32(value: usize, name: &str) -> Result<i32> {
         got: vec![value],
         remediation: format!("cuda distance {name} exceeds i32 kernel argument limit"),
     })
-}
-
-fn numerical(op: &'static str, detail: String) -> ForgeError {
-    ForgeError::NumericalInvariant {
-        op: op.to_string(),
-        detail,
-        remediation: DISTANCE_REMEDIATION.to_string(),
-    }
 }
 
 fn device_unavailable(ctx: &CudaContext, detail: String) -> ForgeError {
