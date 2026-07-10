@@ -868,6 +868,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "calyx-series"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "calyx-sextant"
 version = "0.1.0"
 dependencies = [

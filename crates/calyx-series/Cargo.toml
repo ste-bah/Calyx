@@ -1,0 +1,16 @@
+[package]
+name = "calyx-series"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Series/saga memory for multi-book sagas: composes the calyx CLI (absorb/recall/bible). Additive; links no Calyx library."
+
+[[bin]]
+name = "calyx-series"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+sha2.workspace = true
