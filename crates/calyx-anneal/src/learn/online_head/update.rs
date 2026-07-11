@@ -1,18 +1,13 @@
-use calyx_core::{CalyxError, Clock, Result};
+use calyx_core::{CalyxError, Clock, Constellation, Result};
 use calyx_ledger::LedgerCfStore;
 
-use super::{HeadKind, OnlineHead, dot, invalid_row, validate_head};
+use super::features::constellation_features;
+use super::{OnlineHead, dot, invalid_row, validate_head};
 use crate::CALYX_ANNEAL_HEAD_UPDATE_REVERTED;
 use crate::{
-    ActionMetricSnapshot, AnnealAction, AnnealLedgerAction, AnnealLedgerActionPair,
-    AnnealSubstrate, ArtifactKey, ArtifactPtr, BudgetProbe, ChangeId, ChangeOutcome, ReplayEntry,
-    RollbackStorage, ShadowRevertReason, TripwireMetric,
+    AnnealLedgerAction, AnnealLedgerActionPair, AnnealSubstrate, ArtifactKey, ArtifactPtr,
+    BudgetProbe, ChangeId, ChangeOutcome, ReplayEntry, RollbackStorage, ShadowRevertReason,
 };
-
-#[derive(Clone, Debug)]
-pub struct HeadShadowProposal {
-    metrics: ActionMetricSnapshot,
-}
 
 pub trait HeadPromotionGate {
     fn ensure_head_prior(&mut self, key: ArtifactKey, ptr: ArtifactPtr) -> Result<()>;
@@ -20,8 +15,6 @@ pub trait HeadPromotionGate {
         &mut self,
         key: ArtifactKey,
         candidate_ptr: ArtifactPtr,
-        candidate: &HeadShadowProposal,
-        incumbent: &HeadShadowProposal,
         description: &str,
     ) -> Result<ChangeOutcome>;
     fn rollback_head_change(&mut self, _change_id: ChangeId, _description: String) -> Result<()> {
@@ -46,26 +39,6 @@ pub trait HeadPromotionGate {
     }
 }
 
-impl HeadShadowProposal {
-    pub(crate) fn stable() -> Self {
-        Self {
-            metrics: ActionMetricSnapshot::from_values([
-                (TripwireMetric::RecallAtK, 0.95),
-                (TripwireMetric::GuardFAR, 0.001),
-                (TripwireMetric::GuardFRR, 0.001),
-                (TripwireMetric::SearchP99, 50.0),
-                (TripwireMetric::IngestP95, 80.0),
-            ]),
-        }
-    }
-}
-
-impl AnnealAction for HeadShadowProposal {
-    fn apply_shadow(&self, _query: &crate::ReplayQuery) -> ActionMetricSnapshot {
-        self.metrics.clone()
-    }
-}
-
 impl<'a, R, L, C, P> HeadPromotionGate for AnnealSubstrate<'a, R, L, C, P>
 where
     R: RollbackStorage,
@@ -84,15 +57,11 @@ where
         &mut self,
         key: ArtifactKey,
         candidate_ptr: ArtifactPtr,
-        candidate: &HeadShadowProposal,
-        incumbent: &HeadShadowProposal,
         description: &str,
     ) -> Result<ChangeOutcome> {
-        self.propose_change_with_actions(
+        self.propose_artifact_change_with_actions(
             key,
             candidate_ptr,
-            candidate,
-            incumbent,
             AnnealLedgerActionPair::new(
                 AnnealLedgerAction::HeadUpdate,
                 AnnealLedgerAction::HeadUpdateReverted,
@@ -141,17 +110,28 @@ where
 pub(crate) fn apply_update(
     head: &OnlineHead,
     batch: &[ReplayEntry],
+    contexts: &[Constellation],
     lr: f32,
     fisher_weight: f32,
 ) -> Result<OnlineHead> {
+    if contexts.len() != batch.len() {
+        return Err(invalid_row(
+            "online head replay batch and feature contexts differ in length",
+        ));
+    }
     let len = head.params.len();
     let mut gradient = vec![0.0_f32; len];
     let mut observed_fisher = vec![0.0_f32; len];
     let scale = 1.0 / batch.len() as f32;
-    for entry in batch {
-        let features = entry_features(head.kind, len, entry);
+    for (entry, context) in batch.iter().zip(contexts) {
+        let features = constellation_features(context, len);
+        if !features.iter().all(|value| value.is_finite()) {
+            return Err(invalid_row(
+                "online head replay context contains non-finite features",
+            ));
+        }
         let prediction = dot(&head.params, &features);
-        let target = entry.surprise as f32;
+        let target = entry.target as f32;
         let error = prediction - target;
         for index in 0..len {
             let partial = error * features[index];
@@ -186,6 +166,9 @@ pub(crate) fn validate_update(batch: &[ReplayEntry], lr: f32, fisher_weight: f32
         ));
     }
     for entry in batch {
+        if !entry.target.is_finite() || !(entry.target as f32).is_finite() {
+            return Err(invalid_row("online head batch contains invalid target"));
+        }
         if !entry.surprise.is_finite() || entry.surprise < 0.0 {
             return Err(invalid_row("online head batch contains invalid surprise"));
         }
@@ -199,24 +182,4 @@ pub(crate) fn update_reverted(reason: ShadowRevertReason) -> CalyxError {
         message: format!("online head update reverted by substrate: {reason:?}"),
         remediation: "inspect anneal rollback and tripwire rows before retrying",
     }
-}
-
-fn entry_features(kind: HeadKind, len: usize, entry: &ReplayEntry) -> Vec<f32> {
-    let mut features = Vec::with_capacity(len);
-    let bytes = entry.cx_id.to_bytes();
-    for index in 0..len {
-        let value = match index {
-            0 => 1.0,
-            1 => entry.surprise as f32,
-            2 => entry.mistake_ref.surprise as f32,
-            3 => entry.mistake_ref.seq as f32 / (entry.mistake_ref.seq as f32 + 1.0),
-            _ => bytes[(index - 4) % bytes.len()] as f32 / 255.0,
-        };
-        features.push(match kind {
-            HeadKind::Predictor => value,
-            HeadKind::Calibrator => value * 0.5,
-            HeadKind::FusionWeights => value / len.max(1) as f32,
-        });
-    }
-    features
 }

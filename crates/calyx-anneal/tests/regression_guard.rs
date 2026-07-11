@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use calyx_anneal::{
     CALYX_ANNEAL_REGRESSION_RECURRED, ChangeId, ChangeOutcome, HeadKind, HeadPromotionGate,
-    HeadRegressionRollback, HeadShadowProposal, HeadStorage, MistakeLog, MistakeRef,
-    MistakeStorage, OnlineHead, OnlineHeadState, RegressionConfig, RegressionContextSource,
-    RegressionReport, ReplayEntry, ShadowRevertReason, decode_online_head,
+    HeadRegressionRollback, HeadStorage, MistakeLog, MistakeRef, MistakeStorage, OnlineHead,
+    OnlineHeadState, RegressionConfig, RegressionContextSource, RegressionReport, ReplayEntry,
+    ShadowRevertReason, decode_online_head,
 };
 use calyx_core::{
     AnchorKind, CalyxError, Constellation, CxFlags, CxId, FixedClock, InputRef, LedgerRef,
@@ -30,7 +30,7 @@ fn update_with_regression_promotes_after_no_recurrence_report() {
     .unwrap();
     let log = memory_log();
     let reference = log.append(cx_id(1), 0.0, 1.0, AnchorKind::Reward).unwrap();
-    let batch = [replay(reference, 1)];
+    let batch = [replay(reference, 1, 1.0)];
     let contexts = contexts([cx(1)]);
 
     let outcome = state
@@ -65,8 +65,8 @@ fn strict_regression_rolls_back_before_persisting_candidate_heads() {
     )
     .unwrap();
     let log = memory_log();
-    let reference = log.append(cx_id(2), 1.1, 1.0, AnchorKind::Reward).unwrap();
-    let batch = [replay(reference, 2)];
+    let reference = log.append(cx_id(2), 0.9, 0.0, AnchorKind::Reward).unwrap();
+    let batch = [replay(reference, 2, 0.0)];
     let contexts = contexts([cx(2)]);
 
     let err = state
@@ -74,7 +74,7 @@ fn strict_regression_rolls_back_before_persisting_candidate_heads() {
             &batch,
             &log,
             &contexts,
-            1.0,
+            3.0,
             0.0,
             RegressionConfig::strict(),
         )
@@ -190,8 +190,6 @@ impl HeadPromotionGate for ScriptedGate {
         &mut self,
         _key: calyx_anneal::ArtifactKey,
         _candidate_ptr: calyx_anneal::ArtifactPtr,
-        _candidate: &HeadShadowProposal,
-        _incumbent: &HeadShadowProposal,
         _description: &str,
     ) -> Result<ChangeOutcome> {
         if self.revert.load(Ordering::SeqCst) {
@@ -234,8 +232,8 @@ fn contexts(items: impl IntoIterator<Item = Constellation>) -> MemoryContexts {
     contexts
 }
 
-fn replay(reference: MistakeRef, seed: u8) -> ReplayEntry {
-    ReplayEntry::new(cx_id(seed), reference.surprise, reference, TEST_TS).unwrap()
+fn replay(reference: MistakeRef, seed: u8, target: f64) -> ReplayEntry {
+    ReplayEntry::new(cx_id(seed), target, reference.surprise, reference, TEST_TS).unwrap()
 }
 
 fn cx_id(seed: u8) -> CxId {

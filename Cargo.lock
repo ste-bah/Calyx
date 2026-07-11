@@ -886,6 +886,7 @@ dependencies = [
  "calyx-core",
  "calyx-forge",
  "calyx-fsv",
+ "calyx-ledger",
  "calyx-loom",
  "calyx-oracle",
  "calyx-paths",

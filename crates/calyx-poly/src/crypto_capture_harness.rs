@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use calyx_core::{VaultId, VaultStore};
+use calyx_core::{SystemClock, VaultId, VaultStore};
 
 pub use crate::crypto_capture_harness_types::{
     CRYPTO_CAPTURE_HARNESS_SCHEMA_VERSION, CRYPTO_CAPTURE_REPORT_FILE, CRYPTO_CAPTURE_STATE_FILE,
@@ -25,6 +25,7 @@ use crate::crypto_ingestor::{
 };
 use crate::diagnostics_store::{read_json, write_json};
 use crate::error::{PolyError, Result};
+use crate::live_calyx_native_evidence::LiveCalyxNativeEvidenceStore;
 use crate::model::Resolution;
 use crate::pending_forecast_register::{
     PendingForecastLedgerStore, PendingForecastRegister, PendingForecastWorkItem,
@@ -51,7 +52,7 @@ pub struct LiveCryptoCaptureRunner;
 
 impl<S> CryptoCaptureRunner<S> for LiveCryptoCaptureRunner
 where
-    S: VaultStore + PendingForecastLedgerStore,
+    S: VaultStore + PendingForecastLedgerStore + LiveCalyxNativeEvidenceStore,
 {
     fn run_capture_cycle(
         &mut self,
@@ -69,6 +70,7 @@ where
             vault_salt,
             output_root,
             config,
+            &SystemClock,
         )?
         .run)
     }

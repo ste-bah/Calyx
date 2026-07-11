@@ -16,7 +16,8 @@ pub use codec::{
     OperatorProposalReadback, decode_operator_proposal, decode_operator_proposal_rows,
     encode_operator_proposal, operator_proposal_key,
 };
-pub use gate::{OperatorPromotionGate, OperatorShadowProposal};
+pub use gate::OperatorPromotionGate;
+use gate::operator_ledger_details;
 pub use storage::{AsterOperatorProposalStorage, OperatorProposalStorage};
 
 pub const ANNEAL_OPERATOR_PROPOSAL_TAG: &str = "anneal_operator_proposal_v1";
@@ -146,30 +147,27 @@ impl<'a> ProposeOperator<'a> {
         let prior_ptr = prior_ptr(candidate_hash);
         let candidate_ptr = candidate_ptr(&operator, candidate_hash);
         request.gate.ensure_operator_prior(key.clone(), prior_ptr)?;
-        let shadow = OperatorShadowProposal::stable(
+        let details = operator_ledger_details(
             &proposal_id,
             &operator,
             deficit_total,
             refit_delta_j,
             shadow_delta_j,
         );
-        let incumbent = OperatorShadowProposal::stable_incumbent();
         let description = format!(
             "learned_operator_synthesis operator={} shadow_delta_j={shadow_delta_j:.6} refit_delta_j={refit_delta_j:.6} deficit_bits={deficit_total:.6}",
             operator_label(&operator)
         );
-        let (terminal_state, change_id) = match request.gate.propose_operator_change(
-            key,
-            candidate_ptr,
-            &shadow,
-            &incumbent,
-            &description,
-        )? {
-            ChangeOutcome::Promoted(change_id) => (OperatorTerminalState::Promoted, change_id),
-            ChangeOutcome::Reverted { reason, change_id } => {
-                (OperatorTerminalState::RolledBack { reason }, change_id)
-            }
-        };
+        let (terminal_state, change_id) =
+            match request
+                .gate
+                .propose_operator_change(key, candidate_ptr, details, &description)?
+            {
+                ChangeOutcome::Promoted(change_id) => (OperatorTerminalState::Promoted, change_id),
+                ChangeOutcome::Reverted { reason, change_id } => {
+                    (OperatorTerminalState::RolledBack { reason }, change_id)
+                }
+            };
         let record = OperatorProposalRecord {
             proposal_id,
             operator,
@@ -216,12 +214,8 @@ fn synthesize_operator(
         .map(|gap| gap.anchor_class.as_str())
         .unwrap_or("unknown");
     if prefers_kernel_scope(top_anchor) {
-        let before = validate_unit("kernel_recall_before", kernel_recall_before.unwrap_or(0.0))?;
-        let fallback_after = (before + deficit.total_bits_deficit.min(1.0)).min(1.0);
-        let after = validate_unit(
-            "kernel_recall_after",
-            kernel_recall_after.unwrap_or(fallback_after),
-        )?;
+        let before = require_kernel_recall("kernel_recall_before", kernel_recall_before)?;
+        let after = require_kernel_recall("kernel_recall_after", kernel_recall_after)?;
         let scope_hash = scope_hash(deficit)?;
         return Ok(ProposedOperator::KernelScope {
             scope: ScopeId::from_hash(scope_hash),
@@ -254,6 +248,17 @@ fn shadow_delta_j(
             kernel_recall_after - kernel_recall_before,
         ),
     }
+}
+
+fn require_kernel_recall(name: &'static str, value: Option<f64>) -> Result<f64> {
+    let value = value.ok_or_else(|| CalyxError {
+        code: super::CALYX_ASSAY_UNAVAILABLE,
+        message: format!(
+            "{name} is required for a kernel-scope operator proposal; no measured recall was supplied"
+        ),
+        remediation: "measure incumbent and candidate recall independently on the deterministic held-out replay before proposing a kernel-scope operator",
+    })?;
+    validate_unit(name, value)
 }
 
 fn validate_deficit(deficit: &DeficitMap) -> Result<()> {
