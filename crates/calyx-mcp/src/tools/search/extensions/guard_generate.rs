@@ -7,6 +7,7 @@ use calyx_ward::{GuardProfile, MatchedSlots, ProducedSlots, WardError, guard};
 use serde_json::{Value, json};
 
 use crate::server::{ToolError, ToolResult};
+use crate::tools::guard_measure::required_dense_vectors;
 
 use super::runtime::{NavRuntime, parse_cx_id};
 
@@ -26,7 +27,16 @@ pub(super) fn run(
             })?,
         };
     let matched = required_vectors(&runtime.docs, identity, &profile)?;
-    let produced = generated_vectors(runtime, candidate_text, &profile)?;
+    // Two measurement backends coexist (see guard_prefers_resident): upstream's
+    // local in-process measurement (portable, no resident) vs our resident-hybrid
+    // path (reuses a running GPU resident instead of cold-loading models per
+    // guard subprocess). Both must stay so upstream's required_dense_vectors
+    // merges cleanly on import.
+    let produced = if guard_prefers_resident() {
+        generated_vectors(runtime, candidate_text, &profile)?
+    } else {
+        required_dense_vectors(&runtime.state, candidate_text, &profile.required_slots)?
+    };
     let verdict = guard(&profile, &produced, &matched, true).map_err(ward_to_tool)?;
     let min_cos = verdict
         .per_slot
@@ -85,6 +95,19 @@ fn required_vectors(
         out.insert(*slot, values.to_vec());
     }
     Ok(out)
+}
+
+/// Guard measurement backend selector. Default = upstream's local in-process
+/// measurement (`required_dense_vectors`, portable, needs no resident). Set
+/// `CALYX_GUARD_MEASURE=resident` to reuse a running GPU resident (the book
+/// writer sets this in CALYX_ENV) so GPU slots are measured via the resident
+/// instead of cold-loading their models in every `calyx guard generate`
+/// subprocess.
+fn guard_prefers_resident() -> bool {
+    matches!(
+        std::env::var("CALYX_GUARD_MEASURE").ok().as_deref(),
+        Some("resident")
+    )
 }
 
 fn generated_vectors(
