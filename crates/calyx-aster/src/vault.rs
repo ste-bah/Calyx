@@ -30,13 +30,14 @@ mod scan;
 mod seq_readback;
 mod slot_backfill;
 mod slot_column;
+mod snapshot_lease;
 mod store;
 mod temporal_xterm;
 #[cfg(test)]
 use crate::cf::ledger_key;
 use crate::cf::{CfRouter, ColumnFamily, KeyRange, anchor_key, base_key, slot_key};
 use crate::dedup::DedupPolicy;
-use crate::mvcc::{Freshness, ReadBarrier, ReaderLease, Snapshot, VersionedCfStore};
+use crate::mvcc::{Freshness, ReadBarrier, Snapshot, VersionedCfStore};
 use crate::resource::{ResourceStatus, VramBudgetStatus, collect_resource_status};
 use crate::timetravel::RetentionHorizon;
 use crate::vault::durable::DurableVault;
@@ -48,6 +49,7 @@ use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemCloc
 use std::{path::Path, sync::Mutex};
 
 pub use anchor_compact::{AnchorCompactionConflict, AnchorCompactionReport};
+pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
 pub use htap::HtapDualRead;
@@ -69,33 +71,14 @@ pub use {context::VaultContext, durable::VaultOptions};
 /// mid-batch once GPU measure batches ran ~10s (CALYX_READER_LEASE_EXPIRED),
 /// aborting long ingest/index-rebuild scans. 300s matches the resident/lens
 /// worker timeout family; override with `CALYX_ASTER_READER_LEASE_MS`.
+// FORK OVERRIDE: upstream's default is 5s, which expired mid-batch once GPU
+// measure batches ran ~10s (CALYX_READER_LEASE_EXPIRED), aborting long
+// ingest/index-rebuild scans. 300s matches the resident/lens worker timeout
+// family. Upstream's snapshot_lease.rs / router_bridge.rs consume this const
+// directly, so keeping the value here preserves the fix. (The old runtime
+// env-knob reader_lease_ms() was dropped when upstream refactored the callers
+// to use the const; nothing set CALYX_ASTER_READER_LEASE_MS.)
 const DEFAULT_LEASE_MS: u64 = 300_000;
-const READER_LEASE_ENV: &str = "CALYX_ASTER_READER_LEASE_MS";
-
-/// Resolve the reader-lease lifetime once, honoring `CALYX_ASTER_READER_LEASE_MS`.
-/// A malformed or zero override is a tuning mistake, not a correctness hazard
-/// (the default is always safe), so it warns loudly and falls back rather than
-/// failing an infallible read path.
-fn reader_lease_ms() -> u64 {
-    use std::sync::OnceLock;
-    static RESOLVED: OnceLock<u64> = OnceLock::new();
-    *RESOLVED.get_or_init(|| {
-        let Some(raw) = std::env::var_os(READER_LEASE_ENV) else {
-            return DEFAULT_LEASE_MS;
-        };
-        match raw.to_str().map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
-            Some(ms) if ms > 0 => ms,
-            _ => {
-                eprintln!(
-                    "CALYX_ASTER_RUNTIME phase=reader_lease_config_invalid \
-                     {READER_LEASE_ENV}={raw:?} is not a positive integer of milliseconds; \
-                     using default {DEFAULT_LEASE_MS}"
-                );
-                DEFAULT_LEASE_MS
-            }
-        }
-    })
-}
 
 /// Single-vault Aster store with content-addressed ingest semantics.
 #[derive(Debug)]
@@ -298,8 +281,8 @@ where
         cf: ColumnFamily,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        self.rows
-            .read_at(self.snapshot_handle(snapshot), cf, key, &self.clock)
+        let snapshot = self.snapshot_handle(snapshot);
+        self.rows.read_at(snapshot.snapshot(), cf, key, &self.clock)
     }
 
     /// Reads one raw CF row using an already-pinned snapshot lease.
@@ -334,8 +317,8 @@ where
 
     /// Scans visible raw CF rows at `snapshot`; use `scan_cf_pages_at` for large data CFs.
     pub fn scan_cf_at(&self, snapshot: Seq, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.rows
-            .scan_cf_at(self.snapshot_handle(snapshot), cf, &self.clock)
+        let snapshot = self.snapshot_handle(snapshot);
+        self.rows.scan_cf_at(snapshot.snapshot(), cf, &self.clock)
     }
 
     /// Scans visible raw CF rows for a pinned lease; use `scan_cf_pages_snapshot` for large data.
@@ -354,8 +337,9 @@ where
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let snapshot = self.snapshot_handle(snapshot);
         self.rows
-            .scan_cf_range_at(self.snapshot_handle(snapshot), cf, range, &self.clock)
+            .scan_cf_range_at(snapshot.snapshot(), cf, range, &self.clock)
     }
 
     /// Scans visible raw CF rows in a key range using an already-pinned snapshot lease.
@@ -375,8 +359,9 @@ where
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<Vec<u8>>> {
+        let snapshot = self.snapshot_handle(snapshot);
         self.rows
-            .scan_cf_range_keys_at(self.snapshot_handle(snapshot), cf, range, &self.clock)
+            .scan_cf_range_keys_at(snapshot.snapshot(), cf, range, &self.clock)
     }
 
     /// Scans at most `limit` visible raw CF rows in key order after `after_key`.
@@ -388,8 +373,9 @@ where
         after_key: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let snapshot = self.snapshot_handle(snapshot);
         self.rows.scan_cf_range_page_at(
-            self.snapshot_handle(snapshot),
+            snapshot.snapshot(),
             cf,
             range,
             after_key,
@@ -427,11 +413,6 @@ where
         Ok(())
     }
 
-    fn snapshot_handle(&self, seq: Seq) -> Snapshot {
-        let lease = ReaderLease::new(0, seq, self.clock.now(), reader_lease_ms());
-        Snapshot::new(seq, Freshness::FreshDerived, lease)
-    }
-
     pub fn flush(&self) -> Result<()> {
         self.with_durable_commit_lock(|| self.flush_locked())
     }
@@ -447,8 +428,8 @@ where
 
     /// Pins an explicit reader lease tracked for oldest-pinned-seq accounting.
     ///
-    /// Unlike vault-internal snapshot handles, leases pinned here register in
-    /// the store lease registry and hold the oldest-pinned-seq gap open until
+    /// Unlike scoped vault-internal snapshot handles, explicit pins remain in
+    /// the store lease registry after one read call, until
     /// [`Self::release_reader`] or lease expiry.
     pub fn pin_reader(&self, freshness: Freshness, max_age_ms: u64) -> Snapshot {
         self.rows.pin_snapshot(freshness, &self.clock, max_age_ms)
