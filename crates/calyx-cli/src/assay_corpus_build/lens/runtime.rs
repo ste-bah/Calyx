@@ -5,7 +5,7 @@ use calyx_core::{Lens, Placement};
 use calyx_registry::{
     CandleLens, FastembedBgem3Lens, FastembedQwen3Lens, FastembedRerankerLens, FastembedSparseLens,
     LensRuntime, LensSpec as RegistryLensSpec, MultimodalAdapterLens, OnnxColbertLens, OnnxLens,
-    StaticLookupLens, TeiHttpLens,
+    StaticLookupLens, TeiHttpLens, read_tei_service_info, tei_endpoint_identity,
 };
 
 use super::BuildLens;
@@ -59,12 +59,18 @@ pub(super) fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<Bu
             }
         }
         LensRuntime::TeiHttp { endpoint } => {
+            let service = read_tei_service_info(&endpoint).map_err(lens_error)?;
+            let endpoint_identity = tei_endpoint_identity(&endpoint).map_err(lens_error)?;
             let lens = TeiHttpLens::new(&spec.name, endpoint, spec.modality, dim(spec.output));
             Ok(BuildLens {
                 name: spec.name.clone(),
                 manifest,
                 spec,
-                runtime_name: runtime,
+                runtime_name: service.runtime_identity(),
+                model_identity: Some(service.model_identity()),
+                model_dtype: Some(service.model_dtype),
+                endpoint_identity_sha256: Some(endpoint_identity.endpoint_sha256),
+                prompt_identity_sha256: endpoint_identity.prompt_sha256,
                 lens: Box::new(lens),
                 placement: Placement::Gpu,
                 default_vram_mb: f32::NAN,
@@ -111,6 +117,10 @@ fn cpu_build_lens(
         manifest,
         spec,
         runtime_name,
+        model_identity: None,
+        model_dtype: None,
+        endpoint_identity_sha256: None,
+        prompt_identity_sha256: None,
         lens,
         placement: Placement::Cpu,
         default_vram_mb: 0.0,
@@ -130,6 +140,10 @@ fn gpu_build_lens(
         manifest,
         spec,
         runtime_name,
+        model_identity: None,
+        model_dtype: None,
+        endpoint_identity_sha256: None,
+        prompt_identity_sha256: None,
         lens,
         placement: Placement::Gpu,
         default_vram_mb: paths_mb(files)?,

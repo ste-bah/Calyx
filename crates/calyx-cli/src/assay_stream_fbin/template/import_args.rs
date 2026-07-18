@@ -29,11 +29,16 @@ impl ImportArgs {
                 "--tei" => {
                     let name = next()?;
                     let endpoint = next()?;
-                    let dim = parse_u32("--tei <name> <endpoint> <dim>", &next()?)?;
+                    let dim = parse_u32(
+                        "--tei <name> <endpoint> <dim> <physical-model-artifact>",
+                        &next()?,
+                    )?;
+                    let weights_path = PathBuf::from(next()?);
                     direct_lenses.push(direct::DirectLensSource::Tei {
                         name,
                         endpoint,
                         dim,
+                        weights_path,
                     });
                 }
                 "--algorithmic" => {

@@ -30,6 +30,18 @@ pub(crate) struct StreamWorkerReport {
     pub(crate) name: String,
     pub(crate) lens_id: String,
     pub(crate) weights_sha256: String,
+    #[serde(default)]
+    pub(crate) physical_weights_sha256: String,
+    #[serde(default)]
+    pub(crate) measurement_identity_sha256: String,
+    #[serde(default)]
+    pub(crate) endpoint_identity_sha256: Option<String>,
+    #[serde(default)]
+    pub(crate) prompt_identity_sha256: Option<String>,
+    #[serde(default)]
+    pub(crate) model_identity: Option<String>,
+    #[serde(default)]
+    pub(crate) model_dtype: Option<String>,
     pub(crate) runtime: String,
     pub(crate) signal_kind: String,
     pub(crate) bits_about: f32,
@@ -62,6 +74,12 @@ impl StreamWorkerReport {
             name: self.name,
             lens_id: self.lens_id,
             weights_sha256: self.weights_sha256,
+            physical_weights_sha256: self.physical_weights_sha256,
+            measurement_identity_sha256: self.measurement_identity_sha256,
+            endpoint_identity_sha256: self.endpoint_identity_sha256,
+            prompt_identity_sha256: self.prompt_identity_sha256,
+            model_identity: self.model_identity,
+            model_dtype: self.model_dtype,
             runtime: self.runtime,
             signal_kind: self.signal_kind,
             bits_about: self.bits_about,
@@ -305,6 +323,12 @@ fn stream_selected(
         name: lens.name().to_string(),
         lens_id: lens.lens_id(),
         weights_sha256: lens.weights_sha256_hex(),
+        physical_weights_sha256: lens.weights_sha256_hex(),
+        measurement_identity_sha256: lens.measurement_identity_sha256_hex(),
+        endpoint_identity_sha256: lens.endpoint_identity_sha256(),
+        prompt_identity_sha256: lens.prompt_identity_sha256(),
+        model_identity: lens.model_identity(),
+        model_dtype: lens.model_dtype(),
         runtime: lens.runtime_name().to_string(),
         signal_kind: lens.signal_kind().to_string(),
         bits_about: selected.bits.bits_about,

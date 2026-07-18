@@ -78,6 +78,16 @@ pub(crate) struct LensEvidence {
     pub(crate) name: String,
     pub(crate) lens_id: String,
     pub(crate) weights_sha256: String,
+    pub(crate) physical_weights_sha256: String,
+    pub(crate) measurement_identity_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint_identity_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_identity_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model_dtype: Option<String>,
     pub(crate) runtime: String,
     pub(crate) signal_kind: String,
     pub(crate) bits_about: f32,

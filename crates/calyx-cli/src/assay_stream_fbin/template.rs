@@ -87,6 +87,7 @@ impl RuntimeTemplate {
 pub(crate) fn run_import(raw: &[String]) -> CliResult {
     let args = import_args::ImportArgs::parse(raw)?;
     let record = args.record()?;
+    validate_record(&record)?;
     let readback = write(&args.cf_root, &args.association_key, &record).map_err(CliError::Calyx)?;
     println!(
         "stream_fbin_lens_template_db cf_root={} association_key={} descriptors={} roster_sha256={} value_bytes={} value_sha256={} readback_matches={}",
@@ -240,7 +241,7 @@ fn descriptor_from_manifest(slot: usize, path: &Path) -> CliResult<LensTemplateD
         slot: u16::try_from(slot).map_err(|_| CliError::usage("lens template slot exceeds u16"))?,
         name: spec.name.clone(),
         lens_id: spec.lens_id().to_string(),
-        weights_sha256: hex_sha256(&spec.weights_sha256),
+        weights_sha256: hex_from_digest(&spec.weights_sha256),
         signal_kind: lens_spec_signal_kind_name(&spec).to_string(),
         dim: projected_slot_dim(spec.output) as usize,
         native_dim: dim(spec.output) as usize,
@@ -286,6 +287,7 @@ fn validate_record(record: &LensTemplateRecord) -> CliResult {
         ));
     }
     for descriptor in &record.descriptors {
+        direct::validate_attested_tei_descriptor(descriptor)?;
         if spec_sha256(&descriptor.spec)? != descriptor.spec_sha256 {
             return Err(local_error(
                 "CALYX_FSV_ASSAY_STREAM_FBIN_LENS_TEMPLATE_MISMATCH",
@@ -295,7 +297,7 @@ fn validate_record(record: &LensTemplateRecord) -> CliResult {
         }
         if descriptor.spec.name != descriptor.name
             || descriptor.spec.lens_id().to_string() != descriptor.lens_id
-            || hex_sha256(&descriptor.spec.weights_sha256) != descriptor.weights_sha256
+            || !descriptor_weights_match(descriptor)
             || lens_spec_signal_kind_name(&descriptor.spec) != descriptor.signal_kind
             || projected_slot_dim(descriptor.spec.output) as usize != descriptor.dim
             || dim(descriptor.spec.output) as usize != descriptor.native_dim
@@ -312,6 +314,17 @@ fn validate_record(record: &LensTemplateRecord) -> CliResult {
         }
     }
     Ok(())
+}
+
+fn descriptor_weights_match(descriptor: &LensTemplateDescriptor) -> bool {
+    if descriptor.weights_sha256 == hex_from_digest(&descriptor.spec.weights_sha256) {
+        return true;
+    }
+    // Before physical TEI attestation, template descriptors double-hashed the
+    // already-computed digest. Preserve read compatibility for local runtimes;
+    // TEI gate rows must use the actual physical digest and are rejected above.
+    !matches!(&descriptor.spec.runtime, LensRuntime::TeiHttp { .. })
+        && descriptor.weights_sha256 == hex_sha256(&descriptor.spec.weights_sha256)
 }
 
 fn normalize_manifest_paths(manifest: &mut LensForgeManifest, base_dir: &Path) {

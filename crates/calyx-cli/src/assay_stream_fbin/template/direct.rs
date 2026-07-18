@@ -1,7 +1,13 @@
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 
 use calyx_core::{Asymmetry, Modality, QuantPolicy};
-use calyx_registry::{AlgorithmicLens, FrozenLensContract, LensRuntime, LensSpec};
+use calyx_registry::{
+    AlgorithmicLens, FrozenLensContract, LensDType, LensRuntime, LensSpec, NormPolicy,
+    read_tei_service_info, tei_endpoint_identity,
+};
 use sha2::{Digest, Sha256};
 
 use crate::a35_signal::lens_spec_signal_kind_name;
@@ -11,7 +17,7 @@ use crate::lens_commands::support::dim;
 
 use super::super::local_error;
 use super::{
-    FORMAT, LensTemplateDescriptor, LensTemplateRecord, MODE, activation_status, hex_sha256,
+    FORMAT, LensTemplateDescriptor, LensTemplateRecord, MODE, activation_status, hex_from_digest,
     roster_sha256, spec_sha256,
 };
 
@@ -21,6 +27,7 @@ pub(super) enum DirectLensSource {
         name: String,
         endpoint: String,
         dim: u32,
+        weights_path: PathBuf,
     },
     Algorithmic {
         name: String,
@@ -77,7 +84,7 @@ fn descriptor_from_direct_source(
         slot: u16::try_from(slot).map_err(|_| CliError::usage("lens template slot exceeds u16"))?,
         name: spec.name.clone(),
         lens_id: spec.lens_id().to_string(),
-        weights_sha256: hex_sha256(&spec.weights_sha256),
+        weights_sha256: hex_from_digest(&spec.weights_sha256),
         signal_kind: lens_spec_signal_kind_name(&spec).to_string(),
         dim: projected_slot_dim(spec.output) as usize,
         native_dim: dim(spec.output) as usize,
@@ -112,13 +119,42 @@ fn direct_descriptor_parts(source: &DirectLensSource) -> CliResult<DirectDescrip
             name,
             endpoint,
             dim,
+            weights_path,
         } => {
             validate_direct_name(name)?;
             validate_direct_dim(*dim)?;
             if !endpoint.starts_with("http://") {
                 return Err(CliError::usage("--tei endpoint must be http://"));
             }
-            let contract = FrozenLensContract::tei_http(name, endpoint, Modality::Text, *dim);
+            if endpoint.contains("#rerank_query=") && *dim != 2 {
+                return Err(CliError::usage(
+                    "--tei reranker endpoint requires dim=2 for the frozen score-plus-bias projection",
+                ));
+            }
+            let (physical_weights_path, weights_sha256) = physical_weights(weights_path)?;
+            let service = read_tei_service_info(endpoint).map_err(|error| {
+                tei_attestation_error(
+                    format!("lens {name} live /info failed: {}", error.message),
+                    "restore the resident TEI service before importing its DB-native lens",
+                )
+            })?;
+            let endpoint_identity = tei_endpoint_identity(endpoint).map_err(|error| {
+                tei_attestation_error(
+                    format!("lens {name} endpoint identity failed: {}", error.message),
+                    "fix and freeze the TEI endpoint and reranker query",
+                )
+            })?;
+            require_revision_bound_path(&physical_weights_path, &service.model_sha, name)?;
+            let corpus_hash = digest(&[b"calyx-tei-measurement-v1", endpoint.as_bytes()]);
+            let contract = FrozenLensContract::new(
+                name,
+                weights_sha256,
+                corpus_hash,
+                calyx_core::SlotShape::Dense(*dim),
+                Modality::Text,
+                LensDType::F32,
+                NormPolicy::unit(),
+            );
             let mut spec = spec_from_contract(
                 name,
                 LensRuntime::TeiHttp {
@@ -127,19 +163,30 @@ fn direct_descriptor_parts(source: &DirectLensSource) -> CliResult<DirectDescrip
                 &contract,
             );
             spec.max_batch = Some(64);
+            let model_identity = service.model_identity();
+            let runtime_identity = service.runtime_identity();
+            let weights_hex = hex_digest(&weights_sha256);
+            let attestation_sha256 = direct_source_sha256(&[
+                "tei-http-attested-v1",
+                name,
+                endpoint,
+                &dim.to_string(),
+                &physical_weights_path.display().to_string(),
+                &weights_hex,
+                &model_identity,
+                &runtime_identity,
+                &service.model_dtype,
+                &endpoint_identity.endpoint_sha256,
+                endpoint_identity.prompt_sha256.as_deref().unwrap_or("none"),
+            ]);
             Ok(DirectDescriptorParts {
                 spec,
-                runtime: "tei_http".to_string(),
-                model_id: name.clone(),
+                runtime: runtime_identity,
+                model_id: model_identity,
                 endpoint: Some(endpoint.clone()),
-                dtype: "float16".to_string(),
-                source_path: format!("calyx-db-direct:tei-http:{name}"),
-                source_sha256: direct_source_sha256(&[
-                    "tei-http",
-                    name,
-                    endpoint,
-                    &dim.to_string(),
-                ]),
+                dtype: service.model_dtype,
+                source_path: physical_weights_path.display().to_string(),
+                source_sha256: attestation_sha256,
             })
         }
         DirectLensSource::Algorithmic { name, kind, dim } => {
@@ -169,6 +216,183 @@ fn direct_descriptor_parts(source: &DirectLensSource) -> CliResult<DirectDescrip
             })
         }
     }
+}
+
+pub(super) fn validate_attested_tei_descriptor(descriptor: &LensTemplateDescriptor) -> CliResult {
+    let LensRuntime::TeiHttp { endpoint } = &descriptor.spec.runtime else {
+        return Ok(());
+    };
+    if descriptor.endpoint.as_deref() != Some(endpoint.as_str()) {
+        return Err(tei_attestation_error(
+            format!(
+                "lens {} stored endpoint disagrees with its frozen spec",
+                descriptor.name
+            ),
+            "re-import the TEI lens from its physical artifact and live service",
+        ));
+    }
+    let (physical_weights_path, weights_sha256) =
+        physical_weights(Path::new(&descriptor.source_path))?;
+    let weights_hex = hex_digest(&weights_sha256);
+    if descriptor.weights_sha256 != weights_hex || descriptor.spec.weights_sha256 != weights_sha256
+    {
+        return Err(tei_attestation_error(
+            format!(
+                "lens {} physical weights {} hash {} disagrees with DB descriptor {}",
+                descriptor.name,
+                physical_weights_path.display(),
+                weights_hex,
+                descriptor.weights_sha256
+            ),
+            "restore the exact physical model artifact or import it as a new frozen lens",
+        ));
+    }
+    let service = read_tei_service_info(endpoint).map_err(|error| {
+        tei_attestation_error(
+            format!(
+                "lens {} live /info failed: {}",
+                descriptor.name, error.message
+            ),
+            "restore the attested TEI service and retry the gate",
+        )
+    })?;
+    let endpoint_identity = tei_endpoint_identity(endpoint).map_err(|error| {
+        tei_attestation_error(
+            format!(
+                "lens {} endpoint identity failed: {}",
+                descriptor.name, error.message
+            ),
+            "fix the frozen TEI endpoint and reranker query",
+        )
+    })?;
+    require_revision_bound_path(&physical_weights_path, &service.model_sha, &descriptor.name)?;
+    let expected_model = service.model_identity();
+    let expected_runtime = service.runtime_identity();
+    let expected_corpus = digest(&[b"calyx-tei-measurement-v1", endpoint.as_bytes()]);
+    let expected_attestation = direct_source_sha256(&[
+        "tei-http-attested-v1",
+        &descriptor.name,
+        endpoint,
+        &descriptor.native_dim.to_string(),
+        &physical_weights_path.display().to_string(),
+        &weights_hex,
+        &expected_model,
+        &expected_runtime,
+        &service.model_dtype,
+        &endpoint_identity.endpoint_sha256,
+        endpoint_identity.prompt_sha256.as_deref().unwrap_or("none"),
+    ]);
+    if descriptor.model_id != expected_model
+        || descriptor.runtime != expected_runtime
+        || descriptor.dtype != service.model_dtype
+        || descriptor.spec.corpus_hash != expected_corpus
+        || descriptor.import_manifest_sha256 != expected_attestation
+    {
+        return Err(tei_attestation_error(
+            format!(
+                "lens {} TEI attestation disagrees: model={} runtime={} dtype={} endpoint_sha256={} prompt_sha256={}",
+                descriptor.name,
+                expected_model,
+                expected_runtime,
+                service.model_dtype,
+                endpoint_identity.endpoint_sha256,
+                endpoint_identity.prompt_sha256.as_deref().unwrap_or("none")
+            ),
+            "do not admit this lens; restore the attested service or import the changed runtime as a new lens",
+        ));
+    }
+    Ok(())
+}
+
+fn physical_weights(path: &Path) -> CliResult<(PathBuf, [u8; 32])> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                tei_attestation_error(
+                    format!(
+                        "resolve current directory for {} failed: {error}",
+                        path.display()
+                    ),
+                    "pass an absolute physical model artifact path",
+                )
+            })?
+            .join(path)
+    };
+    if !absolute.exists() {
+        return Err(tei_attestation_error(
+            format!("physical TEI weights {} do not exist", absolute.display()),
+            "pass --tei <name> <endpoint> <dim> <physical-model-artifact>",
+        ));
+    }
+    let file = File::open(&absolute).map_err(|error| {
+        tei_attestation_error(
+            format!(
+                "open physical TEI weights {} failed: {error}",
+                absolute.display()
+            ),
+            "restore the physical model artifact before importing the lens",
+        )
+    })?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| {
+            tei_attestation_error(
+                format!(
+                    "hash physical TEI weights {} failed: {error}",
+                    absolute.display()
+                ),
+                "restore the physical model artifact before importing the lens",
+            )
+        })?;
+        if read == 0 {
+            return Ok((absolute, hasher.finalize().into()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn require_revision_bound_path(path: &Path, revision: &str, lens_name: &str) -> CliResult {
+    if path
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy() == revision)
+    {
+        return Ok(());
+    }
+    Err(tei_attestation_error(
+        format!(
+            "lens {lens_name} physical artifact path {} does not bind live model revision {revision}",
+            path.display()
+        ),
+        "use the immutable model artifact under its exact snapshot/revision directory",
+    ))
+}
+
+fn digest(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn tei_attestation_error(
+    message: impl Into<String>,
+    remediation: &'static str,
+) -> crate::error::CliError {
+    local_error(
+        "CALYX_FSV_ASSAY_STREAM_FBIN_TEI_ATTESTATION_MISMATCH",
+        message,
+        remediation,
+    )
 }
 
 fn algorithmic_lens(name: &str, kind: &str, dim: u32) -> CliResult<AlgorithmicLens> {

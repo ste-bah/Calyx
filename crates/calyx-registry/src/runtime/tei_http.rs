@@ -4,7 +4,9 @@ use std::str;
 use std::time::Duration;
 
 use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::frozen::FrozenLensContract;
 use crate::lens::ensure_input_modality;
@@ -15,6 +17,78 @@ pub const LEGACY_TEI_8088_ENDPOINT: &str = "http://127.0.0.1:8088/embed";
 pub const DEFAULT_TEI_MAX_BATCH: usize = 64;
 const RERANK_QUERY_FRAGMENT: &str = "rerank_query=";
 const RERANK_PROJECTION_DIM: u32 = 2;
+
+/// Physical model and executable identity reported by a live TEI service.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TeiServiceInfo {
+    pub model_id: String,
+    pub model_sha: String,
+    pub model_dtype: String,
+    pub version: String,
+    pub sha: String,
+}
+
+impl TeiServiceInfo {
+    /// Stable report identity for the exact resident TEI executable.
+    pub fn runtime_identity(&self) -> String {
+        format!("text-embeddings-inference:{}@{}", self.version, self.sha)
+    }
+
+    /// Stable report identity for the model and immutable source revision.
+    pub fn model_identity(&self) -> String {
+        format!("{}@{}", self.model_id, self.model_sha)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("model_id", self.model_id.as_str()),
+            ("model_sha", self.model_sha.as_str()),
+            ("model_dtype", self.model_dtype.as_str()),
+            ("version", self.version.as_str()),
+            ("sha", self.sha.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(CalyxError::lens_frozen_violation(format!(
+                    "TEI /info field {field} is absent; physical runtime identity is unprovable"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Independent endpoint and fixed-query identities for a TEI measurement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TeiEndpointIdentity {
+    pub endpoint_sha256: String,
+    pub measurement_sha256: String,
+    pub prompt_sha256: Option<String>,
+}
+
+/// Reads and validates the live service `/info` response for an embed/rerank endpoint.
+pub fn read_tei_service_info(endpoint: &str) -> Result<TeiServiceInfo> {
+    let base = endpoint.split('#').next().unwrap_or(endpoint);
+    let mut info_endpoint = HttpEndpoint::parse(base)?;
+    info_endpoint.path = "/info".to_string();
+    let body = get_json(&info_endpoint, Duration::from_secs(30))?;
+    let info: TeiServiceInfo = serde_json::from_slice(&body).map_err(|err| {
+        CalyxError::lens_frozen_violation(format!("TEI /info JSON parse failed: {err}"))
+    })?;
+    info.validate()?;
+    Ok(info)
+}
+
+/// Separates transport/service identity from a frozen reranker prompt.
+pub fn tei_endpoint_identity(endpoint: &str) -> Result<TeiEndpointIdentity> {
+    let base = endpoint.split('#').next().unwrap_or(endpoint);
+    let prompt_sha256 =
+        RerankEndpoint::parse(endpoint)?.map(|rerank| sha256_hex(rerank.query.as_bytes()));
+    Ok(TeiEndpointIdentity {
+        endpoint_sha256: sha256_hex(base.as_bytes()),
+        measurement_sha256: sha256_hex(endpoint.as_bytes()),
+        prompt_sha256,
+    })
+}
 
 /// Blocking HTTP TEI lens runtime.
 #[derive(Clone, Debug)]
@@ -218,6 +292,43 @@ fn post_json(endpoint: &str, body: &[u8], timeout: Duration) -> Result<Vec<u8>> 
         .read_to_end(&mut response)
         .map_err(|err| CalyxError::lens_unreachable(format!("read TEI response failed: {err}")))?;
     parse_http_response(&response)
+}
+
+fn get_json(endpoint: &HttpEndpoint, timeout: Duration) -> Result<Vec<u8>> {
+    let address = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .map_err(|err| CalyxError::lens_unreachable(format!("resolve TEI endpoint failed: {err}")))?
+        .next()
+        .ok_or_else(|| CalyxError::lens_unreachable("TEI endpoint resolved no addresses"))?;
+    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|err| {
+        CalyxError::lens_unreachable(format!("connect TEI endpoint failed: {err}"))
+    })?;
+    stream.set_read_timeout(Some(timeout)).map_err(|err| {
+        CalyxError::lens_unreachable(format!("set TEI read timeout failed: {err}"))
+    })?;
+    stream.set_write_timeout(Some(timeout)).map_err(|err| {
+        CalyxError::lens_unreachable(format!("set TEI write timeout failed: {err}"))
+    })?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        endpoint.path,
+        endpoint.authority()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| CalyxError::lens_unreachable(format!("write TEI request failed: {err}")))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|err| CalyxError::lens_unreachable(format!("read TEI response failed: {err}")))?;
+    parse_http_response(&response)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn parse_http_response(response: &[u8]) -> Result<Vec<u8>> {

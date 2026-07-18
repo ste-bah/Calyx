@@ -48,6 +48,30 @@ impl BuildLens {
             .collect()
     }
 
+    pub(crate) fn measurement_identity_sha256_hex(&self) -> String {
+        self.spec
+            .corpus_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub(crate) fn endpoint_identity_sha256(&self) -> Option<String> {
+        self.endpoint_identity_sha256.clone()
+    }
+
+    pub(crate) fn model_identity(&self) -> Option<String> {
+        self.model_identity.clone()
+    }
+
+    pub(crate) fn model_dtype(&self) -> Option<String> {
+        self.model_dtype.clone()
+    }
+
+    pub(crate) fn prompt_identity_sha256(&self) -> Option<String> {
+        self.prompt_identity_sha256.clone()
+    }
+
     pub(crate) fn signal_kind(&self) -> &'static str {
         crate::a35_signal::lens_spec_signal_kind_name(&self.spec)
     }

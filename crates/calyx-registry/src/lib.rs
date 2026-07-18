@@ -127,7 +127,10 @@ pub use runtime::qwen3::{
 pub use runtime::static_lookup::{
     StaticLookupDType, StaticLookupFileSpec, StaticLookupFiles, StaticLookupLens,
 };
-pub use runtime::tei_http::{DEFAULT_TEI_ENDPOINT, TeiHttpLens};
+pub use runtime::tei_http::{
+    DEFAULT_TEI_ENDPOINT, TeiEndpointIdentity, TeiHttpLens, TeiServiceInfo, read_tei_service_info,
+    tei_endpoint_identity,
+};
 pub use runtime_limit::{
     measure_registry_batch_with_runtime_limit, measure_registry_group_with_runtime_limit,
 };
