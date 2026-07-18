@@ -1,4 +1,16 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use calyx_core::{
+    Asymmetry, Constellation, CxFlags, InputRef, LedgerRef, LensId, Modality, QuantPolicy, Slot,
+    SlotId, SlotKey, SlotShape, SlotState, SlotVector, VaultId,
+};
+use calyx_registry::frozen::{NormPolicy, sha256_digest};
+use calyx_registry::{LensRuntime, LensSpec};
+
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn fixture_rows(dim: usize) -> Vec<(calyx_core::CxId, Vec<f32>)> {
     (0..6)

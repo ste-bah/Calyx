@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -18,6 +19,41 @@ use sha2::{Digest, Sha256};
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn write_algorithmic_catalog(root: &Path, count: usize) {
+    write_algorithmic_catalog_with(root, count, |_| Placement::Gpu);
+}
+
+pub(super) fn write_mixed_algorithmic_catalog(
+    root: &Path,
+    gpu_count: usize,
+    cpu_count: usize,
+) -> Vec<String> {
+    assert!(
+        gpu_count > 0,
+        "mixed resident FSV needs at least one GPU lens"
+    );
+    assert!(
+        cpu_count > 0,
+        "mixed resident FSV needs at least one CPU lens"
+    );
+    let total = gpu_count + cpu_count;
+    let cpu_slots = (gpu_count..total).collect::<BTreeSet<_>>();
+    write_algorithmic_catalog_with(root, total, |idx| {
+        if cpu_slots.contains(&idx) {
+            Placement::Cpu
+        } else {
+            Placement::Gpu
+        }
+    });
+    cpu_slots
+        .iter()
+        .map(|idx| format!("search-resident-lens-{idx:02}"))
+        .collect()
+}
+
+fn write_algorithmic_catalog_with<F>(root: &Path, count: usize, placement_for: F)
+where
+    F: Fn(usize) -> Placement,
+{
     let manifest_root = root.join("manifests");
     fs::create_dir_all(&manifest_root).expect("create manifest dir");
     let entries = (0..count)
@@ -44,6 +80,7 @@ pub(super) fn write_algorithmic_catalog(root: &Path, count: usize) {
                 truncate_dim: None,
                 recall_delta: calyx_registry::spec::default_recall_delta(),
                 max_batch: Some(4),
+                max_tokens: None,
                 batch_policy: None,
             };
             fs::write(
@@ -61,7 +98,7 @@ pub(super) fn write_algorithmic_catalog(root: &Path, count: usize) {
                 "weights_sha256": hex32(&spec.weights_sha256),
                 "manifest": manifest_path,
                 "cost": LensCost::default(),
-                "placement": Placement::Gpu,
+                "placement": placement_for(idx),
             })
         })
         .collect::<Vec<_>>();
@@ -92,14 +129,20 @@ pub(super) fn spawn_template_resident_service(
     root: &Path,
     template: &str,
     progress: &Path,
+    stderr_path: &Path,
 ) -> Child {
-    let mut command = resident_command(root, progress);
+    let mut command = resident_command(root, progress, stderr_path);
     command.arg("--template").arg(template);
     command.spawn().expect("spawn template resident service")
 }
 
-pub(super) fn spawn_vault_resident_service(root: &Path, vault: &Path, progress: &Path) -> Child {
-    let mut command = resident_command(root, progress);
+pub(super) fn spawn_vault_resident_service(
+    root: &Path,
+    vault: &Path,
+    progress: &Path,
+    stderr_path: &Path,
+) -> Child {
+    let mut command = resident_command(root, progress, stderr_path);
     command.arg("--vault").arg(vault);
     command.spawn().expect("spawn vault resident service")
 }
@@ -112,7 +155,7 @@ pub(super) fn read_ready(child: &mut Child) -> Value {
     serde_json::from_str(line.trim()).expect("parse resident ready")
 }
 
-pub(super) fn stop_resident_service(addr: &str, mut child: Child) -> Output {
+pub(super) fn stop_resident_service(addr: &str, mut child: Child, stderr_path: &Path) -> Output {
     let stop = Command::new(calyx_exe())
         .arg("panel")
         .arg("resident")
@@ -124,7 +167,9 @@ pub(super) fn stop_resident_service(addr: &str, mut child: Child) -> Output {
     if !stop.status.success() {
         child.kill().ok();
     }
-    child.wait_with_output().expect("wait resident service")
+    let mut output = child.wait_with_output().expect("wait resident service");
+    output.stderr = fs::read(stderr_path).expect("read drained resident service stderr");
+    output
 }
 
 pub(super) fn write_batch(root: &Path, name: &str, texts: &[&str]) -> PathBuf {
@@ -228,16 +273,20 @@ pub(super) fn search_index_state(vault_path: &Path) -> Value {
     })
 }
 
-pub(super) fn assert_index_matches_manifest(index: &Value) {
+pub(super) fn assert_index_matches_manifest(
+    index: &Value,
+    expected_slots: usize,
+    expected_len: u64,
+) {
     assert_eq!(
         index["manifest"]["format"],
         "calyx-search-index-manifest-v1"
     );
     let slots = index["manifest"]["slots"].as_array().unwrap();
-    assert_eq!(slots.len(), 10);
+    assert_eq!(slots.len(), expected_slots);
     for entry in slots {
         assert_eq!(entry["kind"], "flat_dense");
-        assert_eq!(entry["len"], 3);
+        assert_eq!(entry["len"], expected_len);
         let rel = entry["index_rel"].as_str().unwrap();
         let artifact = index["artifacts"]
             .as_array()
@@ -301,7 +350,8 @@ pub(super) fn temp_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("calyx-cli-{name}-{}-{id}", std::process::id()))
 }
 
-fn resident_command(root: &Path, progress: &Path) -> Command {
+fn resident_command(root: &Path, progress: &Path, stderr_path: &Path) -> Command {
+    let stderr = fs::File::create(stderr_path).expect("create resident service stderr log");
     let mut command = Command::new(calyx_exe());
     command
         .env("CALYX_HOME", root)
@@ -317,7 +367,7 @@ fn resident_command(root: &Path, progress: &Path) -> Command {
         .arg("--max-load-secs")
         .arg("30")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::from(stderr));
     command
 }
 

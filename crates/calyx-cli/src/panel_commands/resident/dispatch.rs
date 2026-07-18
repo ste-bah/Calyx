@@ -120,12 +120,28 @@ pub(crate) fn readiness(service: &ResidentService) -> ReadyResponse {
         ready_out: state.ready_out.clone(),
         max_resident_vram_mib: state.max_resident_vram_mib,
         declared_template_vram_mib: state.declared_template_vram_mib,
-        resident_overhead_multiplier: state.resident_overhead_multiplier,
+        resident_overhead_multiplier_milli: state.resident_overhead_multiplier_milli,
         estimated_resident_vram_mib: state.estimated_resident_vram_mib,
         max_load_secs: state.max_load_secs,
         load_parallelism: state.load_parallelism,
         load_ms: state.load_ms,
         probe_ms: state.probe_ms,
+        max_runtime_batch: service.max_runtime_batch,
+        capacity_probe_input_count: service.capacity_probe_input_count,
+        capacity_probe_ms: service.capacity_probe_ms,
+        capacity_probe_modalities: service.capacity_probe_modalities.clone(),
+        onnx_configured_shape_limit: service
+            .onnx_shape_budget
+            .map(|budget| budget.configured_shape_limit),
+        onnx_required_shape_count: service
+            .onnx_shape_budget
+            .map(|budget| budget.required_shape_count),
+        onnx_sequence_bucket_count: service
+            .onnx_shape_budget
+            .map(|budget| budget.sequence_bucket_count),
+        onnx_batch_bucket_count: service
+            .onnx_shape_budget
+            .map(|budget| budget.batch_bucket_count),
         slot_count: state.build.panel.slots.len(),
         slot_scope: state.slot_scope.iter().map(|slot| slot.get()).collect(),
         content_lens_count: state.content_lens_count,
@@ -135,6 +151,7 @@ pub(crate) fn readiness(service: &ResidentService) -> ReadyResponse {
         cpu_content_lens_count: state
             .content_lens_count
             .saturating_sub(state.gpu_content_lens_count),
+        cpu_excluded_slots: state.cpu_excluded_slots.clone(),
     }
 }
 
@@ -143,6 +160,7 @@ fn measure(
     modality: Modality,
     bytes: Vec<u8>,
 ) -> CliResult<MeasureResponse> {
+    super::stream::validate_measure_inputs(modality, std::slice::from_ref(&bytes))?;
     let started = Instant::now();
     let input = Input::new(modality, bytes);
     // #1153: single-input measure fans out across slots exactly like the

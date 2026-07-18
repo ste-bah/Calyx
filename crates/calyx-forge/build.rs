@@ -27,10 +27,64 @@ const KERNELS: &[Kernel] = &[
         cubin_env: "FORGE_TOPK_CUBIN_PATH",
     },
     Kernel {
+        name: "quant",
+        src: "src/cuda/kernels/quant.cu",
+        ptx_env: "FORGE_QUANT_PTX_PATH",
+        cubin_env: "FORGE_QUANT_CUBIN_PATH",
+    },
+    Kernel {
+        name: "packed_quant",
+        src: "src/cuda/kernels/packed_quant.cu",
+        ptx_env: "FORGE_PACKED_QUANT_PTX_PATH",
+        cubin_env: "FORGE_PACKED_QUANT_CUBIN_PATH",
+    },
+    Kernel {
+        name: "mxfp_quant",
+        src: "src/cuda/kernels/mxfp_quant.cu",
+        ptx_env: "FORGE_MXFP_QUANT_PTX_PATH",
+        cubin_env: "FORGE_MXFP_QUANT_CUBIN_PATH",
+    },
+    Kernel {
         name: "mxfp4_gemm",
         src: "src/cuda/kernels/mxfp4_gemm.cu",
         ptx_env: "FORGE_MXFP4_GEMM_PTX_PATH",
         cubin_env: "FORGE_MXFP4_GEMM_CUBIN_PATH",
+    },
+    Kernel {
+        name: "assay",
+        src: "src/cuda/kernels/assay.cu",
+        ptx_env: "FORGE_ASSAY_PTX_PATH",
+        cubin_env: "FORGE_ASSAY_CUBIN_PATH",
+    },
+    Kernel {
+        name: "algorithmic",
+        src: "src/cuda/kernels/algorithmic.cu",
+        ptx_env: "FORGE_ALGORITHMIC_PTX_PATH",
+        cubin_env: "FORGE_ALGORITHMIC_CUBIN_PATH",
+    },
+    Kernel {
+        name: "olap",
+        src: "src/cuda/kernels/olap.cu",
+        ptx_env: "FORGE_OLAP_PTX_PATH",
+        cubin_env: "FORGE_OLAP_CUBIN_PATH",
+    },
+    Kernel {
+        name: "energy",
+        src: "src/cuda/kernels/energy.cu",
+        ptx_env: "FORGE_ENERGY_PTX_PATH",
+        cubin_env: "FORGE_ENERGY_CUBIN_PATH",
+    },
+    Kernel {
+        name: "skill",
+        src: "src/cuda/kernels/skill.cu",
+        ptx_env: "FORGE_SKILL_PTX_PATH",
+        cubin_env: "FORGE_SKILL_CUBIN_PATH",
+    },
+    Kernel {
+        name: "loom",
+        src: "src/cuda/kernels/loom.cu",
+        ptx_env: "FORGE_LOOM_PTX_PATH",
+        cubin_env: "FORGE_LOOM_CUBIN_PATH",
     },
 ];
 

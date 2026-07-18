@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     ChangeOutcome, FrozenLensGuard, FrozenLensSource, HeadKind, HeadPromotionGate, HeadStorage,
     MistakeRef, OnlineHead, OnlineHeadState, RegressionContextSource, ReplayEntry,
@@ -13,11 +16,8 @@ use calyx_core::{
     Result,
 };
 use calyx_registry::{AlgorithmicLens, FrozenLensSnapshot, Registry};
-use serde_json::json;
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
 use fsv_support::write_json;
+use serde_json::json;
 
 const TEST_TS: u64 = 1_785_500_409;
 

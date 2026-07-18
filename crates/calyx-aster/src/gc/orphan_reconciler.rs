@@ -1,20 +1,93 @@
 //! PH58 orphan slot/index reconciler.
 
 use crate::cf::{ColumnFamily, base_key, slot_key};
-use crate::mvcc::tombstone_value;
 use crate::vault::AsterVault;
 use crate::vault::encode::{decode_constellation_base, encode_constellation_base};
 use calyx_core::{CalyxError, Clock, CxId, Result, SlotId};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, atomic::AtomicU64};
 use std::time::Duration;
 
 pub const CALYX_ORPHAN_RECONCILER_ERROR: &str = "CALYX_ORPHAN_RECONCILER_ERROR";
 const REBUILD_PREFIX: &[u8] = b"orphan_slot_rebuild\0";
 const REBUILD_METADATA_KEY: &str = "gc.orphan_reconciler";
 const REBUILD_METADATA_VALUE: &str = "slot_rebuild_queued";
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct OrphanIoCounts {
+    pub report_entry_visits: usize,
+    pub point_reads: usize,
+    pub group_commits: usize,
+    pub ledger_entries: usize,
+    pub ledger_commits: usize,
+    pub flushes: usize,
+    pub committed_rows: usize,
+    pub committed_bytes: usize,
+    pub max_chunk_rows: usize,
+    pub max_chunk_bytes: usize,
+    pub compaction_calls: BTreeMap<String, usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ORPHAN_IO_COUNTS: RefCell<OrphanIoCounts> = RefCell::new(OrphanIoCounts::default());
+}
+
+#[cfg(test)]
+pub(super) fn reset_orphan_io_counts() {
+    ORPHAN_IO_COUNTS.with(|counts| *counts.borrow_mut() = OrphanIoCounts::default());
+}
+
+#[cfg(test)]
+pub(super) fn orphan_io_counts() -> OrphanIoCounts {
+    ORPHAN_IO_COUNTS.with(|counts| counts.borrow().clone())
+}
+
+#[cfg(test)]
+fn record_report_entry_visit() {
+    ORPHAN_IO_COUNTS.with(|counts| counts.borrow_mut().report_entry_visits += 1);
+}
+
+#[cfg(test)]
+fn record_orphan_point_read() {
+    ORPHAN_IO_COUNTS.with(|counts| counts.borrow_mut().point_reads += 1);
+}
+
+#[cfg(test)]
+fn record_orphan_commit(rows: usize, bytes: usize, ledger_entries: usize) {
+    if rows == 0 && ledger_entries == 0 {
+        return;
+    }
+    ORPHAN_IO_COUNTS.with(|counts| {
+        let counts = &mut *counts.borrow_mut();
+        counts.group_commits += 1;
+        counts.flushes += 1;
+        counts.committed_rows += rows;
+        counts.committed_bytes += bytes;
+        counts.max_chunk_rows = counts.max_chunk_rows.max(rows);
+        counts.max_chunk_bytes = counts.max_chunk_bytes.max(bytes);
+        counts.ledger_entries += ledger_entries;
+        counts.ledger_commits += usize::from(ledger_entries > 0);
+    });
+}
+
+#[cfg(test)]
+fn record_orphan_compactions(cfs: &[ColumnFamily]) {
+    ORPHAN_IO_COUNTS.with(|counts| {
+        let counts = &mut *counts.borrow_mut();
+        for cf in cfs {
+            *counts
+                .compaction_calls
+                .entry(cf.name().to_string())
+                .or_default() += 1;
+        }
+    });
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanBaseEntry {
@@ -64,6 +137,24 @@ pub struct OrphanRepairResult {
     pub rate_limited: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanIndexRepair {
+    pub cx_id: CxId,
+    pub slots: Vec<SlotId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrphanIndexRepairOutcome {
+    pub cx_id: CxId,
+    pub purged_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrphanBaseRepairOutcome {
+    pub cx_id: CxId,
+    pub degraded: bool,
+}
+
 impl OrphanRepairResult {
     pub fn to_metrics_text(&self, vault_label: &str) -> String {
         let vault = escape_label(vault_label);
@@ -79,6 +170,43 @@ pub trait OrphanGcTarget {
     fn slot_index_entries(&self) -> Result<Vec<OrphanIndexEntry>>;
     fn purge_orphan_index(&self, cx_id: CxId, slots: &[SlotId]) -> Result<usize>;
     fn flag_orphan_base(&self, cx_id: CxId) -> Result<()>;
+
+    fn purge_orphan_indexes(
+        &self,
+        repairs: &[OrphanIndexRepair],
+    ) -> Result<Vec<OrphanIndexRepairOutcome>> {
+        repairs
+            .iter()
+            .map(|repair| {
+                self.purge_orphan_index(repair.cx_id, &repair.slots)
+                    .map(|purged_rows| OrphanIndexRepairOutcome {
+                        cx_id: repair.cx_id,
+                        purged_rows,
+                    })
+            })
+            .collect()
+    }
+
+    fn flag_orphan_bases(&self, cx_ids: &[CxId]) -> Result<Vec<OrphanBaseRepairOutcome>> {
+        cx_ids
+            .iter()
+            .map(|cx_id| {
+                self.flag_orphan_base(*cx_id)
+                    .map(|()| OrphanBaseRepairOutcome {
+                        cx_id: *cx_id,
+                        degraded: true,
+                    })
+            })
+            .collect()
+    }
+
+    /// Finishes the index-repair phase after every durable chunk has committed.
+    /// Real storage targets use this hook to compact each distinct affected CF
+    /// once for the entire run. Implementations must retain retryable state if
+    /// finalization fails.
+    fn finish_orphan_index_repairs(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -147,54 +275,6 @@ impl OrphanReconciler {
             inconsistencies,
         })
     }
-
-    pub fn repair<T>(&self, target: &T, report: &OrphanReport) -> Result<OrphanRepairResult>
-    where
-        T: OrphanGcTarget + ?Sized,
-    {
-        let mut remaining_budget = self.max_repairs_per_run;
-        let mut repaired_index = 0;
-        let mut degraded_base = 0;
-
-        for cx_id in &report.orphan_index {
-            if remaining_budget == 0 {
-                break;
-            }
-            let slots = report
-                .orphan_index_entries
-                .iter()
-                .filter_map(|entry| (entry.cx_id == *cx_id).then_some(entry.slot))
-                .collect::<Vec<_>>();
-            let purged = target.purge_orphan_index(*cx_id, &slots)?;
-            if purged > 0 {
-                repaired_index += 1;
-                remaining_budget -= 1;
-            }
-        }
-
-        for cx_id in &report.orphan_base {
-            if remaining_budget == 0 {
-                break;
-            }
-            target.flag_orphan_base(*cx_id)?;
-            degraded_base += 1;
-            remaining_budget -= 1;
-        }
-
-        let repaired = repaired_index + degraded_base;
-        let repairs_total = self
-            .orphan_repairs_total
-            .fetch_add(repaired as u64, Ordering::Relaxed)
-            + repaired as u64;
-        let remaining_inconsistencies = report.inconsistencies.saturating_sub(repaired);
-        Ok(OrphanRepairResult {
-            orphan_index_repaired: repaired_index,
-            orphan_base_degraded: degraded_base,
-            repairs_total,
-            remaining_inconsistencies,
-            rate_limited: remaining_inconsistencies > 0,
-        })
-    }
 }
 
 impl Default for OrphanReconciler {
@@ -207,6 +287,7 @@ pub struct VaultOrphanGcTarget<'a, C> {
     vault: &'a AsterVault<C>,
     slots: Vec<SlotId>,
     compact_after_tombstone: bool,
+    pending_compaction_cfs: Mutex<BTreeSet<ColumnFamily>>,
 }
 
 impl<'a, C> VaultOrphanGcTarget<'a, C> {
@@ -218,121 +299,13 @@ impl<'a, C> VaultOrphanGcTarget<'a, C> {
             vault,
             slots,
             compact_after_tombstone: true,
+            pending_compaction_cfs: Mutex::new(BTreeSet::new()),
         }
     }
 
     pub fn without_auto_compaction(mut self) -> Self {
         self.compact_after_tombstone = false;
         self
-    }
-}
-
-impl<C> OrphanGcTarget for VaultOrphanGcTarget<'_, C>
-where
-    C: Clock,
-{
-    fn base_entries(&self) -> Result<Vec<OrphanBaseEntry>> {
-        let mut entries = Vec::new();
-        for (key, bytes) in self
-            .vault
-            .scan_cf_at(self.vault.latest_seq(), ColumnFamily::Base)?
-        {
-            let cx_id = key_to_cx(&key)?;
-            let cx = decode_constellation_base(&bytes)?;
-            entries.push(OrphanBaseEntry {
-                cx_id,
-                expected_slots: cx.slots.keys().copied().collect(),
-                repair_queued: cx.flags.degraded
-                    && cx
-                        .metadata
-                        .get(REBUILD_METADATA_KEY)
-                        .is_some_and(|state| state == REBUILD_METADATA_VALUE),
-            });
-        }
-        entries.sort_by_key(|entry| entry.cx_id);
-        Ok(entries)
-    }
-
-    fn slot_index_entries(&self) -> Result<Vec<OrphanIndexEntry>> {
-        let mut entries = Vec::new();
-        for slot in &self.slots {
-            for (key, _) in self
-                .vault
-                .scan_cf_at(self.vault.latest_seq(), ColumnFamily::slot(*slot))?
-            {
-                entries.push(OrphanIndexEntry {
-                    cx_id: key_to_cx(&key)?,
-                    slot: *slot,
-                });
-            }
-        }
-        entries.sort_unstable();
-        Ok(entries)
-    }
-
-    fn purge_orphan_index(&self, cx_id: CxId, slots: &[SlotId]) -> Result<usize> {
-        let slots = if slots.is_empty() { &self.slots } else { slots };
-        let mut rows = Vec::new();
-        for slot in slots {
-            let cf = ColumnFamily::slot(*slot);
-            let key = slot_key(cx_id);
-            if self
-                .vault
-                .read_cf_at(self.vault.latest_seq(), cf, &key)?
-                .is_some()
-            {
-                rows.push((cf, key, tombstone_value()));
-            }
-        }
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let affected = rows.iter().map(|(cf, _, _)| *cf).collect::<Vec<_>>();
-        self.vault.write_cf_batch(rows)?;
-        if self.compact_after_tombstone {
-            self.vault.purge_tombstoned_cfs(&affected)?;
-        }
-        self.vault.append_ledger_entry(
-            EntryKind::Admin,
-            SubjectId::Cx(cx_id),
-            orphan_payload("orphan_index_purged", affected.len())?,
-            ActorId::System,
-        )?;
-        Ok(affected.len())
-    }
-
-    fn flag_orphan_base(&self, cx_id: CxId) -> Result<()> {
-        let key = base_key(cx_id);
-        let Some(bytes) =
-            self.vault
-                .read_cf_at(self.vault.latest_seq(), ColumnFamily::Base, &key)?
-        else {
-            return Err(orphan_error("base row disappeared before repair"));
-        };
-        let mut cx = decode_constellation_base(&bytes)?;
-        cx.flags.degraded = true;
-        cx.metadata.insert(
-            REBUILD_METADATA_KEY.to_string(),
-            REBUILD_METADATA_VALUE.to_string(),
-        );
-        let mut rebuild_key = REBUILD_PREFIX.to_vec();
-        rebuild_key.extend_from_slice(cx_id.as_bytes());
-        let rows = vec![
-            (ColumnFamily::Base, key, encode_constellation_base(&cx)?),
-            (
-                ColumnFamily::AnnealReplay,
-                rebuild_key,
-                orphan_payload("orphan_base_rebuild_requested", cx.slots.len())?,
-            ),
-        ];
-        self.vault.write_cf_batch(rows)?;
-        self.vault.append_ledger_entry(
-            EntryKind::Admin,
-            SubjectId::Cx(cx_id),
-            orphan_payload("orphan_base_degraded", cx.slots.len())?,
-            ActorId::System,
-        )?;
-        Ok(())
     }
 }
 
@@ -361,4 +334,8 @@ fn escape_label(value: &str) -> String {
 }
 
 #[cfg(test)]
+mod issue1548_scale_tests;
+mod repair;
+#[cfg(test)]
 mod tests;
+mod vault_target;

@@ -2,8 +2,6 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use calyx_aster::cf::ColumnFamily;
-use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, CxId, Result};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -11,14 +9,31 @@ use serde::{Deserialize, Serialize};
 
 use super::{MistakeEntry, MistakeLog, MistakeRef, MistakeStorage};
 use crate::LogicalTime;
-use crate::ledger_anneal::CALYX_ASTER_CF_UNAVAILABLE;
+pub use codec::{
+    decode_replay_rows, decode_replay_snapshot, encode_replay_snapshot, replay_snapshot_key,
+};
+use codec::{
+    encode_head, encode_row, entries_by_priority, load_replay_state, replay_checkpoint_key,
+    replay_delta_key,
+};
+use errors::{cf_unavailable, invalid_row};
+pub use storage::{AsterReplayStorage, ReplayStorage, ReplayWrite};
+
+mod codec;
+mod errors;
+mod storage;
 
 pub const DEFAULT_REPLAY_CAPACITY: usize = 4096;
+pub const DEFAULT_REPLAY_CHECKPOINT_INTERVAL: u64 = 256;
 pub const CALYX_ANNEAL_INVALID_CAPACITY: &str = "CALYX_ANNEAL_INVALID_CAPACITY";
 pub const CALYX_ANNEAL_REPLAY_INVALID_ROW: &str = "CALYX_ANNEAL_REPLAY_INVALID_ROW";
 
-const REPLAY_SNAPSHOT_TAG: &str = "anneal_replay_snapshot_v2";
-const REPLAY_SNAPSHOT_KEY: &[u8] = b"snapshot/v1";
+const LEGACY_SNAPSHOT_TAG: &str = "anneal_replay_snapshot_v2";
+const LEGACY_SNAPSHOT_KEY: &[u8] = b"snapshot/v1";
+const HEAD_TAG: &str = "anneal_replay_head_v3";
+const CHECKPOINT_TAG: &str = "anneal_replay_checkpoint_v3";
+const DELTA_TAG: &str = "anneal_replay_delta_v3";
+const HEAD_KEY: &[u8] = b"head/v3";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplayEntry {
@@ -36,56 +51,43 @@ pub struct ReplaySnapshot {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ReplaySnapshotRow {
+struct LegacySnapshotRow {
     tag: String,
     snapshot: ReplaySnapshot,
 }
 
-pub trait ReplayStorage: Send + Sync {
-    fn load_snapshot(&self) -> Result<Option<Vec<u8>>>;
-    fn save_snapshot(&self, value: &[u8]) -> Result<()>;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplayHeadRow {
+    tag: String,
+    generation: u64,
+    delta_seq: u64,
+    capacity: usize,
 }
 
-pub struct AsterReplayStorage<'a, C>
-where
-    C: Clock,
-{
-    vault: &'a AsterVault<C>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplayCheckpointRow {
+    tag: String,
+    generation: u64,
+    snapshot: ReplaySnapshot,
 }
 
-impl<'a, C> AsterReplayStorage<'a, C>
-where
-    C: Clock,
-{
-    pub const fn new(vault: &'a AsterVault<C>) -> Self {
-        Self { vault }
-    }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplayDeltaRow {
+    tag: String,
+    generation: u64,
+    seq: u64,
+    operation: ReplayDeltaOperation,
 }
 
-impl<C> ReplayStorage for AsterReplayStorage<'_, C>
-where
-    C: Clock,
-{
-    fn load_snapshot(&self) -> Result<Option<Vec<u8>>> {
-        self.vault
-            .read_cf_at(
-                self.vault.latest_seq(),
-                ColumnFamily::AnnealReplay,
-                &replay_snapshot_key(),
-            )
-            .map_err(|error| cf_unavailable("read anneal_replay CF", error))
-    }
-
-    fn save_snapshot(&self, value: &[u8]) -> Result<()> {
-        self.vault
-            .write_cf(
-                ColumnFamily::AnnealReplay,
-                replay_snapshot_key(),
-                value.to_vec(),
-            )
-            .map(|_| ())
-            .map_err(|error| cf_unavailable("write anneal_replay CF", error))
-    }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum ReplayDeltaOperation {
+    Add {
+        entry: ReplayEntry,
+    },
+    ReplaceMin {
+        evicted: ReplayEntry,
+        entry: ReplayEntry,
+    },
 }
 
 pub struct ReplayBuffer<S> {
@@ -93,6 +95,10 @@ pub struct ReplayBuffer<S> {
     capacity: usize,
     clock: Arc<dyn Clock>,
     storage: S,
+    generation: u64,
+    delta_seq: u64,
+    checkpoint_interval: u64,
+    live_keys: Vec<Vec<u8>>,
 }
 
 impl<S> ReplayBuffer<S>
@@ -100,17 +106,40 @@ where
     S: ReplayStorage,
 {
     pub fn open(storage: S, capacity: usize, clock: Arc<dyn Clock>) -> Result<Self> {
+        Self::open_with_checkpoint_interval(
+            storage,
+            capacity,
+            DEFAULT_REPLAY_CHECKPOINT_INTERVAL,
+            clock,
+        )
+    }
+
+    pub fn open_with_checkpoint_interval(
+        storage: S,
+        capacity: usize,
+        checkpoint_interval: u64,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         validate_capacity(capacity)?;
-        let heap = match storage.load_snapshot()? {
-            Some(bytes) => heap_from_entries(decode_replay_snapshot(&bytes)?.entries, capacity)?,
-            None => BinaryHeap::new(),
-        };
-        Ok(Self {
-            heap,
+        if checkpoint_interval == 0 {
+            return Err(invalid_row("replay checkpoint interval must be > 0"));
+        }
+        let rows = storage.scan_rows()?;
+        let loaded = load_replay_state(&rows, capacity)?;
+        let mut buffer = Self {
+            heap: loaded.heap,
             capacity,
             clock,
             storage,
-        })
+            generation: loaded.generation,
+            delta_seq: loaded.delta_seq,
+            checkpoint_interval,
+            live_keys: loaded.live_keys,
+        };
+        if loaded.legacy {
+            buffer.persist_checkpoint()?;
+        }
+        Ok(buffer)
     }
 
     pub fn open_default(storage: S, clock: Arc<dyn Clock>) -> Result<Self> {
@@ -123,12 +152,55 @@ where
         if admission == ReplayAdmission::Reject {
             return Ok(false);
         }
-        let value = encode_snapshot_entries(
-            self.capacity,
-            entries_after_admission(&self.heap, admission, entry.clone()),
-        )?;
-        self.storage.save_snapshot(&value)?;
+
+        if self.generation == 0 || self.delta_seq + 1 >= self.checkpoint_interval {
+            let mut next_heap = self.heap.clone();
+            apply_admission(&mut next_heap, admission, entry);
+            self.persist_heap_checkpoint(&next_heap)?;
+            self.heap = next_heap;
+            return Ok(true);
+        }
+
+        let next_seq = self
+            .delta_seq
+            .checked_add(1)
+            .ok_or_else(|| invalid_row("replay delta sequence overflow"))?;
+        let operation = match admission {
+            ReplayAdmission::Reject => unreachable!("rejected admission returned above"),
+            ReplayAdmission::Add => ReplayDeltaOperation::Add {
+                entry: entry.clone(),
+            },
+            ReplayAdmission::ReplaceMin => ReplayDeltaOperation::ReplaceMin {
+                evicted: self
+                    .heap
+                    .peek()
+                    .map(|row| row.0.clone())
+                    .ok_or_else(|| invalid_row("replace-min admission has no minimum entry"))?,
+                entry: entry.clone(),
+            },
+        };
+        let delta_key = replay_delta_key(self.generation, next_seq);
+        self.storage.commit(&[
+            ReplayWrite::Put {
+                key: delta_key.clone(),
+                value: encode_row(
+                    &ReplayDeltaRow {
+                        tag: DELTA_TAG.to_string(),
+                        generation: self.generation,
+                        seq: next_seq,
+                        operation,
+                    },
+                    "delta",
+                )?,
+            },
+            ReplayWrite::Put {
+                key: HEAD_KEY.to_vec(),
+                value: encode_head(self.generation, next_seq, self.capacity)?,
+            },
+        ])?;
         apply_admission(&mut self.heap, admission, entry);
+        self.delta_seq = next_seq;
+        self.live_keys.push(delta_key);
         Ok(true)
     }
 
@@ -151,16 +223,23 @@ where
         sampled
     }
 
+    /// Seeds the heap in memory and publishes one atomic checkpoint. This is
+    /// one durable commit regardless of how many recent mistakes are admitted.
     pub fn seed_from_log<M>(&mut self, log: &MistakeLog<M>, n: usize) -> Result<usize>
     where
         M: MistakeStorage,
     {
+        let mut next_heap = self.heap.clone();
         let mut accepted = 0;
         for row in log.readback_recent(n)? {
             let entry = ReplayEntry::from_mistake(row.seq, &row.entry)?;
-            if self.push(entry)? {
+            if push_into_heap(&mut next_heap, self.capacity, entry)? {
                 accepted += 1;
             }
+        }
+        if accepted != 0 {
+            self.persist_heap_checkpoint(&next_heap)?;
+            self.heap = next_heap;
         }
         Ok(accepted)
     }
@@ -178,13 +257,7 @@ where
     }
 
     pub fn entries_by_priority(&self) -> Vec<ReplayEntry> {
-        let mut entries = self
-            .heap
-            .iter()
-            .map(|entry| entry.0.clone())
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| right.cmp(left));
-        entries
+        entries_by_priority(&self.heap)
     }
 
     pub fn top_surprises(&self, n: usize) -> Vec<f64> {
@@ -210,6 +283,49 @@ where
         mistake_ref: MistakeRef,
     ) -> Result<ReplayEntry> {
         ReplayEntry::new(cx_id, target, surprise, mistake_ref, self.clock.now())
+    }
+
+    fn persist_checkpoint(&mut self) -> Result<()> {
+        let heap = self.heap.clone();
+        self.persist_heap_checkpoint(&heap)
+    }
+
+    fn persist_heap_checkpoint(&mut self, heap: &BinaryHeap<Reverse<ReplayEntry>>) -> Result<()> {
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid_row("replay checkpoint generation overflow"))?;
+        let checkpoint_key = replay_checkpoint_key(generation);
+        let snapshot = ReplaySnapshot {
+            capacity: self.capacity,
+            entries: entries_by_priority(heap),
+        };
+        let mut writes = Vec::with_capacity(self.live_keys.len() + 2);
+        for key in &self.live_keys {
+            if key.as_slice() != HEAD_KEY {
+                writes.push(ReplayWrite::Delete { key: key.clone() });
+            }
+        }
+        writes.push(ReplayWrite::Put {
+            key: checkpoint_key.clone(),
+            value: encode_row(
+                &ReplayCheckpointRow {
+                    tag: CHECKPOINT_TAG.to_string(),
+                    generation,
+                    snapshot,
+                },
+                "checkpoint",
+            )?,
+        });
+        writes.push(ReplayWrite::Put {
+            key: HEAD_KEY.to_vec(),
+            value: encode_head(generation, 0, self.capacity)?,
+        });
+        self.storage.commit(&writes)?;
+        self.generation = generation;
+        self.delta_seq = 0;
+        self.live_keys = vec![HEAD_KEY.to_vec(), checkpoint_key];
+        Ok(())
     }
 }
 
@@ -275,56 +391,6 @@ impl Ord for ReplayEntry {
     }
 }
 
-pub fn replay_snapshot_key() -> Vec<u8> {
-    REPLAY_SNAPSHOT_KEY.to_vec()
-}
-
-pub fn encode_replay_snapshot(snapshot: &ReplaySnapshot) -> Result<Vec<u8>> {
-    validate_capacity(snapshot.capacity)?;
-    for entry in &snapshot.entries {
-        validate_entry(entry)?;
-    }
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(
-        &ReplaySnapshotRow {
-            tag: REPLAY_SNAPSHOT_TAG.to_string(),
-            snapshot: snapshot.clone(),
-        },
-        &mut bytes,
-    )
-    .map_err(|error| invalid_row(format!("encode anneal_replay snapshot: {error}")))?;
-    Ok(bytes)
-}
-
-pub fn decode_replay_snapshot(bytes: &[u8]) -> Result<ReplaySnapshot> {
-    let row: ReplaySnapshotRow = ciborium::de::from_reader(bytes)
-        .map_err(|error| invalid_row(format!("decode anneal_replay snapshot: {error}")))?;
-    if row.tag != REPLAY_SNAPSHOT_TAG {
-        return Err(invalid_row("anneal_replay snapshot has invalid tag"));
-    }
-    validate_capacity(row.snapshot.capacity)?;
-    for entry in &row.snapshot.entries {
-        validate_entry(entry)?;
-    }
-    Ok(row.snapshot)
-}
-
-fn encode_snapshot_entries(capacity: usize, entries: Vec<ReplayEntry>) -> Result<Vec<u8>> {
-    encode_replay_snapshot(&ReplaySnapshot { capacity, entries })
-}
-
-fn heap_from_entries(
-    entries: Vec<ReplayEntry>,
-    capacity: usize,
-) -> Result<BinaryHeap<Reverse<ReplayEntry>>> {
-    let mut heap = BinaryHeap::new();
-    for entry in entries {
-        validate_entry(&entry)?;
-        push_into_heap(&mut heap, capacity, entry)?;
-    }
-    Ok(heap)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReplayAdmission {
     Reject,
@@ -379,25 +445,6 @@ fn apply_admission(
     }
 }
 
-fn entries_after_admission(
-    heap: &BinaryHeap<Reverse<ReplayEntry>>,
-    admission: ReplayAdmission,
-    entry: ReplayEntry,
-) -> Vec<ReplayEntry> {
-    let mut entries = heap.iter().map(|entry| entry.0.clone()).collect::<Vec<_>>();
-    if admission == ReplayAdmission::ReplaceMin
-        && let Some(min_entry) = heap.peek().map(|entry| &entry.0)
-        && let Some(index) = entries.iter().position(|entry| entry == min_entry)
-    {
-        entries.swap_remove(index);
-    }
-    if admission != ReplayAdmission::Reject {
-        entries.push(entry);
-    }
-    entries.sort_by(|left, right| right.cmp(left));
-    entries
-}
-
 fn weighted_index(entries: &[ReplayEntry], draw: f64) -> usize {
     let mut cumulative = 0.0;
     for (index, entry) in entries.iter().enumerate() {
@@ -441,18 +488,5 @@ fn validate_entry(entry: &ReplayEntry) -> Result<()> {
     Ok(())
 }
 
-fn invalid_row(message: impl Into<String>) -> CalyxError {
-    CalyxError {
-        code: CALYX_ANNEAL_REPLAY_INVALID_ROW,
-        message: message.into(),
-        remediation: "repair or quarantine anneal_replay CF snapshot before learning",
-    }
-}
-
-fn cf_unavailable(context: &str, error: CalyxError) -> CalyxError {
-    CalyxError {
-        code: CALYX_ASTER_CF_UNAVAILABLE,
-        message: format!("{context}: {}: {}", error.code, error.message),
-        remediation: "restore Aster anneal_replay CF availability",
-    }
-}
+#[cfg(test)]
+mod fsv_tests;

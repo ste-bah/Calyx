@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use crate::error::{CliError, CliResult};
 use crate::lens_commands::flags::value;
 
+pub(super) const DEFAULT_QWEN3_COMMISSION_MAX_TOKENS: usize = 8_192;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CommissionRuntime {
     OnnxInt8,
@@ -104,6 +106,7 @@ pub(super) struct CommissionFlags {
     norm_explicit: bool,
     pub(super) quant_target: String,
     pub(super) max_batch: Option<usize>,
+    pub(super) max_tokens: Option<usize>,
     pub(super) allow_batch_1: Option<String>,
     pub(super) skip_batch_preflight: Option<String>,
     pub(super) preflight_cap: Option<usize>,
@@ -125,6 +128,7 @@ impl CommissionFlags {
         let mut norm_explicit = false;
         let mut quant_target = "avx2".to_string();
         let mut max_batch = None;
+        let mut max_tokens = None;
         let mut allow_batch_1 = None;
         let mut skip_batch_preflight = None;
         let mut preflight_cap = None;
@@ -187,6 +191,13 @@ impl CommissionFlags {
                         "--max-batch",
                     )?);
                 }
+                "--max-tokens" => {
+                    idx += 1;
+                    max_tokens = Some(parse_positive_usize(
+                        value(args, idx, "--max-tokens")?,
+                        "--max-tokens",
+                    )?);
+                }
                 "--allow-batch-1" => {
                     idx += 1;
                     allow_batch_1 = Some(require_reason(
@@ -219,6 +230,11 @@ impl CommissionFlags {
         let hf = require_nonempty(hf, "--hf")?;
         let runtime = runtime.ok_or_else(|| CliError::usage("--runtime is required"))?;
         validate_quant_target(&quant_target)?;
+        if max_tokens.is_some() && !matches!(runtime, CommissionRuntime::FastembedQwen3) {
+            return Err(CliError::usage(
+                "--max-tokens is currently supported only with --runtime fastembed-qwen3",
+            ));
+        }
         Ok(Self {
             hf,
             runtime,
@@ -234,6 +250,7 @@ impl CommissionFlags {
             norm_explicit,
             quant_target,
             max_batch,
+            max_tokens,
             allow_batch_1,
             skip_batch_preflight,
             preflight_cap,
@@ -306,6 +323,7 @@ impl CommissionFlags {
             norm_explicit: false,
             quant_target: "avx2".to_string(),
             max_batch: None,
+            max_tokens: None,
             allow_batch_1: None,
             skip_batch_preflight: None,
             preflight_cap: None,
@@ -348,6 +366,18 @@ fn parse_positive_usize(raw: &str, flag: &str) -> CliResult<usize> {
         return Err(CliError::usage(format!("{flag} must be > 0")));
     }
     Ok(value)
+}
+
+pub(super) fn qwen3_max_tokens_for_manifest(flags: &CommissionFlags) -> Option<usize> {
+    if matches!(flags.runtime, CommissionRuntime::FastembedQwen3) {
+        Some(
+            flags
+                .max_tokens
+                .unwrap_or(DEFAULT_QWEN3_COMMISSION_MAX_TOKENS),
+        )
+    } else {
+        None
+    }
 }
 
 fn sanitize_path_token(raw: &str) -> String {

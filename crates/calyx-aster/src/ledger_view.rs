@@ -7,27 +7,107 @@
 //! any append attempt is a `CALYX_LEDGER_APPEND_ONLY_VIOLATION`.
 
 mod point_read;
+mod query_index;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CalyxError, Result as CalyxResult};
-use calyx_ledger::{LedgerCfStore, LedgerHeadAnchor, LedgerRow};
+use calyx_ledger::{
+    LedgerCfStore, LedgerEntry, LedgerHeadAnchor, LedgerRow, LedgerSnapshot, decode,
+};
 
-use crate::cf::{CfRouter, ColumnFamily};
+use crate::cf::ColumnFamily;
 use crate::compaction::TieringPolicy;
 use crate::manifest::ManifestStore;
-use crate::sst::SstEntry;
+use crate::sst::{SstEntry, shared_reader};
 use crate::vault::encode::decode_write_batch;
 use crate::wal::{replay_dir_after, stream_records};
 pub use point_read::{LedgerPointReadTierStats, LedgerPointReadTrace};
-use point_read::{read_sst_ledger_rows, unresolved_seqs};
+use point_read::{complete_ledger_sst_candidates, read_sst_ledger_rows, unresolved_seqs};
+pub use query_index::{LedgerQueryOpenStats, LedgerQuerySnapshot, LedgerQueryVisitStats};
+use rayon::prelude::*;
 
 /// Read-only snapshot of a vault's Ledger column family (SSTs + WAL).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsterLedgerCfStore {
     rows: Vec<LedgerRow>,
     anchor: Option<LedgerHeadAnchor>,
+}
+
+/// Physical work performed by one stable reverse-ledger query.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LedgerReverseReadStats {
+    pub snapshot_height: u64,
+    pub batches_read: u64,
+    pub rows_visited: u64,
+}
+
+/// Visits Ledger rows from newest to oldest while holding the durable commit
+/// lock for the complete query. SST, active-WAL, and retained-WAL duplicates
+/// retain the same byte-equality and torn-tail checks as point reads.
+///
+/// Returning `true` from `visit` stops the query. At most `batch_size - 1`
+/// extra physical rows are fetched beyond the logical stop point.
+pub fn visit_ledger_reverse(
+    vault: &Path,
+    batch_size: usize,
+    mut visit: impl FnMut(&LedgerEntry) -> CalyxResult<bool>,
+) -> CalyxResult<LedgerReverseReadStats> {
+    if batch_size == 0 {
+        return Err(CalyxError::ledger_corrupt(
+            "reverse ledger query batch_size must be > 0",
+        ));
+    }
+    let _commit_guard = crate::file_lock::FileLockGuard::acquire(&durable_commit_lock_path(vault))?;
+    let anchor = crate::ledger_head::read_head_anchor(vault)?;
+    let Some(anchor) = anchor else {
+        let store =
+            AsterLedgerCfStore::open_with_layout(vault, AsterVaultLayout::read(vault)?, None)?;
+        if store.rows.is_empty() {
+            return Ok(LedgerReverseReadStats::default());
+        }
+        return Err(CalyxError::ledger_corrupt(
+            "ledger rows exist without a durable head anchor",
+        ));
+    };
+    let mut stats = LedgerReverseReadStats {
+        snapshot_height: anchor.height,
+        ..LedgerReverseReadStats::default()
+    };
+    let mut end = anchor.height;
+    while end != 0 {
+        let start = end.saturating_sub(batch_size as u64);
+        let wanted = (start..end).collect::<BTreeSet<_>>();
+        let rows = read_ledger_seqs_unlocked_traced(vault, &wanted, None)?.0;
+        stats.batches_read += 1;
+        for seq in (start..end).rev() {
+            let row = rows.get(&seq).ok_or_else(|| {
+                CalyxError::ledger_chain_broken(format!(
+                    "reverse ledger snapshot at height {} is missing seq {seq}",
+                    anchor.height
+                ))
+            })?;
+            let entry = decode(&row.bytes)?;
+            if entry.seq != seq {
+                return Err(CalyxError::ledger_corrupt(format!(
+                    "reverse ledger row key {seq} does not match encoded seq {}",
+                    entry.seq
+                )));
+            }
+            if seq + 1 == anchor.height && entry.entry_hash != anchor.tip_hash {
+                return Err(CalyxError::ledger_chain_broken(format!(
+                    "reverse ledger head hash mismatch at seq {seq}"
+                )));
+            }
+            stats.rows_visited += 1;
+            if visit(&entry)? {
+                return Ok(stats);
+            }
+        }
+        end = start;
+    }
+    Ok(stats)
 }
 
 impl AsterLedgerCfStore {
@@ -51,35 +131,29 @@ impl AsterLedgerCfStore {
     fn open_with_layout(
         vault: &Path,
         layout: AsterVaultLayout,
-        tiering_policy: Option<&TieringPolicy>,
+        _tiering_policy: Option<&TieringPolicy>,
     ) -> CalyxResult<Self> {
         let mut rows = BTreeMap::new();
 
         if !layout.ledger_cf_dirs.is_empty() {
-            let router = CfRouter::open_selected_cfs_with_tiering(
-                vault,
-                0,
-                [ColumnFamily::Ledger],
-                tiering_policy.cloned(),
-            )?;
-            for entry in router.iter_cf(ColumnFamily::Ledger)? {
-                insert_sst_entry(&mut rows, entry)?;
-            }
+            read_all_sst_ledger_rows(&layout.ledger_cf_dirs, &mut rows)?;
         }
 
         if layout.has_wal {
-            let replay = replay_dir_after(vault.join("wal"), layout.wal_replay_floor_seq)?;
-            if let Some(torn) = replay.torn_tail {
-                return Err(torn.error());
-            }
-            for record in replay.records {
+            // This stable view is also the duplicate-conflict source of truth:
+            // compare retained WAL rows even when an SST already resolves the
+            // sequence. Targeted point reads intentionally skip resolved WAL
+            // rows; a generation-bound reusable view cannot weaken that
+            // append-only equality check.
+            stream_records(vault.join("wal"), |record| {
                 for row in decode_write_batch(&record.payload)? {
                     if row.cf == ColumnFamily::Ledger {
                         let seq = parse_aster_ledger_seq(&row.key)?;
                         insert_ledger_bytes(&mut rows, seq, row.value)?;
                     }
                 }
-            }
+                Ok(())
+            })?;
         }
 
         let rows = rows
@@ -241,8 +315,16 @@ impl LedgerCfStore for AsterLedgerCfStore {
         Ok(self.rows.clone())
     }
 
+    fn snapshot(&self) -> CalyxResult<LedgerSnapshot<'_>> {
+        Ok(LedgerSnapshot::borrowed(&self.rows, self.anchor.as_ref()))
+    }
+
     fn read_seq(&self, seq: u64) -> CalyxResult<Option<LedgerRow>> {
-        Ok(self.rows.iter().find(|row| row.seq == seq).cloned())
+        Ok(self
+            .rows
+            .binary_search_by_key(&seq, |row| row.seq)
+            .ok()
+            .map(|index| self.rows[index].clone()))
     }
 
     fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> CalyxResult<()> {
@@ -260,7 +342,6 @@ impl LedgerCfStore for AsterLedgerCfStore {
 struct AsterVaultLayout {
     ledger_cf_dirs: Vec<PathBuf>,
     has_wal: bool,
-    wal_replay_floor_seq: u64,
 }
 
 impl AsterVaultLayout {
@@ -282,7 +363,6 @@ impl AsterVaultLayout {
         let layout = Self {
             ledger_cf_dirs: ledger_cf_dirs(vault, tiering_policy)?,
             has_wal: vault.join("wal").is_dir(),
-            wal_replay_floor_seq: wal_replay_floor_seq(vault)?,
         };
         if layout.ledger_cf_dirs.is_empty() && !layout.has_wal {
             return Err(CalyxError::ledger_corrupt(format!(
@@ -344,6 +424,25 @@ fn wal_replay_floor_seq(vault: &Path) -> CalyxResult<u64> {
 fn insert_sst_entry(rows: &mut BTreeMap<u64, Vec<u8>>, entry: SstEntry) -> CalyxResult<()> {
     let seq = parse_aster_ledger_seq(&entry.key)?;
     insert_ledger_bytes(rows, seq, entry.value)
+}
+
+fn read_all_sst_ledger_rows(
+    ledger_dirs: &[PathBuf],
+    rows: &mut BTreeMap<u64, Vec<u8>>,
+) -> CalyxResult<()> {
+    let files = complete_ledger_sst_candidates(ledger_dirs, &BTreeSet::new())?;
+    let mut per_file = files
+        .par_iter()
+        .enumerate()
+        .map(|(index, path)| Ok((index, shared_reader(path)?.iter()?)))
+        .collect::<CalyxResult<Vec<_>>>()?;
+    per_file.sort_by_key(|(index, _)| *index);
+    for (_, entries) in per_file {
+        for entry in entries {
+            insert_sst_entry(rows, entry)?;
+        }
+    }
+    Ok(())
 }
 
 fn insert_ledger_bytes(

@@ -57,6 +57,19 @@ impl Flags {
                         Some(value(args, idx, "--a37-admission-card")?.into());
                 }
                 "--require-a37-gate" => flags.require_a37_gate = true,
+                "--resident-addr" => {
+                    idx += 1;
+                    let raw = value(args, idx, "--resident-addr")?;
+                    let addr = raw.parse::<SocketAddr>().map_err(|error| {
+                        CliError::usage(format!("invalid --resident-addr {raw}: {error}"))
+                    })?;
+                    if !addr.ip().is_loopback() {
+                        return Err(CliError::usage(format!(
+                            "--resident-addr must be loopback, got {addr}"
+                        )));
+                    }
+                    flags.resident_addr = Some(addr);
+                }
                 other => return Err(CliError::usage(format!("unexpected template flag {other}"))),
             }
             idx += 1;

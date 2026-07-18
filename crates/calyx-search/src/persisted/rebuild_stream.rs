@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use calyx_core::{Constellation, CxId, SlotId};
+use calyx_core::SlotId;
 
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::AsterVault;
@@ -10,12 +10,16 @@ use rayon::prelude::*;
 
 #[path = "rebuild_scan.rs"]
 mod rebuild_scan;
-use rebuild_scan::{SlotRows, collect_slot_rows_from_cf, load_base_docs_at};
+use rebuild_scan::{
+    LoadedBaseDocs, ScannedSlotRows, collect_or_build_slot_from_cf, load_base_docs_at,
+};
 
 use super::rebuild::{RebuildProgress, previous_manifest, prune_stale_index_artifacts};
 use super::rebuild_plan::{
-    SlotBuildPlan, bounded_parallel_slot_count, configured_rebuild_reader_lease_ms,
-    configured_rebuild_scan_page_rows, slot_build_plans, validate_parallel_rebuild_config,
+    DiskAnnBuildPolicy, SlotBuildPlan, bounded_parallel_slot_count,
+    configured_diskann_build_policy, configured_rebuild_reader_lease_ms,
+    configured_rebuild_scan_page_rows, manifest_backend, slot_build_plans,
+    validate_parallel_rebuild_config,
 };
 use super::*;
 
@@ -37,6 +41,30 @@ where
 pub(super) fn rebuild_for_vault_with_progress<F>(
     vault_dir: &Path,
     vault: &AsterVault,
+    progress: F,
+) -> CliResult
+where
+    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+{
+    rebuild_for_vault_with_slot_filter(vault_dir, vault, None, progress)
+}
+
+pub(super) fn rebuild_for_vault_with_active_slots_progress<F>(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    active_slots: &BTreeSet<SlotId>,
+    progress: F,
+) -> CliResult
+where
+    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+{
+    rebuild_for_vault_with_slot_filter(vault_dir, vault, Some(active_slots), progress)
+}
+
+fn rebuild_for_vault_with_slot_filter<F>(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    active_slots: Option<&BTreeSet<SlotId>>,
     mut progress: F,
 ) -> CliResult
 where
@@ -68,17 +96,32 @@ where
     progress(RebuildProgress::phase("load_docs_start"))?;
     let page_rows = configured_rebuild_scan_page_rows()?;
     let base_docs = load_base_docs_at(vault, guard.snapshot(), page_rows, &mut progress)?;
+    let retained_slot_payloads = base_docs.retained_slot_payloads();
+    if retained_slot_payloads != 0 {
+        return Err(stale(format!(
+            "search rebuild retained {retained_slot_payloads} duplicate Base slot payloads after planning"
+        )));
+    }
     progress(RebuildProgress {
         rows: Some(base_docs.len()),
         base_seq: Some(base_seq),
+        detail: Some(format!(
+            "slot_memberships={} retained_base_slot_payloads={retained_slot_payloads}",
+            base_docs.slot_memberships()
+        )),
         ..RebuildProgress::phase("load_docs_ok")
     })?;
+    let build_policy = configured_diskann_build_policy()?;
     let summary = rebuild_from_base_with_progress(
         vault_dir,
         vault,
         guard.snapshot(),
         &base_docs,
-        page_rows,
+        RebuildOptions {
+            page_rows,
+            active_slots,
+            build_policy,
+        },
         &mut progress,
     )?;
     progress(RebuildProgress {
@@ -91,17 +134,29 @@ where
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct RebuildOptions<'a> {
+    page_rows: usize,
+    active_slots: Option<&'a BTreeSet<SlotId>>,
+    build_policy: DiskAnnBuildPolicy,
+}
+
 fn rebuild_from_base_with_progress<F>(
     vault_dir: &Path,
     vault: &AsterVault,
     snapshot: Snapshot,
-    base_docs: &BTreeMap<CxId, Constellation>,
-    page_rows: usize,
+    base_docs: &LoadedBaseDocs,
+    options: RebuildOptions<'_>,
     progress: &mut F,
 ) -> CliResult<RebuildSummary>
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
+    let RebuildOptions {
+        page_rows,
+        active_slots,
+        build_policy,
+    } = options;
     let root = vault_dir.join(INDEX_ROOT);
     fs::create_dir_all(&root)?;
     let base_seq = snapshot.seq();
@@ -109,11 +164,16 @@ where
     let previous_manifest = previous_manifest(vault_dir)?;
     progress(RebuildProgress::phase("previous_manifest_ok"))?;
 
-    let plans = slot_build_plans(base_docs, previous_manifest.as_ref());
+    let plans = slot_build_plans(
+        &base_docs.ids_by_slot,
+        previous_manifest.as_ref(),
+        active_slots,
+    );
     if plans.is_empty()
         && previous_manifest
             .as_ref()
             .is_some_and(|manifest| !manifest.slots.is_empty())
+        && active_slots.is_none_or(|slots| !slots.is_empty())
     {
         return Err(stale(
             "base CF scan produced no searchable slots but the previous search manifest was non-empty; refusing to replace it with an empty manifest",
@@ -147,8 +207,8 @@ where
                     vault,
                     snapshot,
                     plan,
-                    previous_manifest.as_ref(),
                     page_rows,
+                    build_policy,
                     Some(&progress_lock),
                 )
             })
@@ -185,7 +245,7 @@ where
                 base_seq: Some(base_seq),
                 ..RebuildProgress::phase("filter_start")
             })?;
-            let entry = filter::write(vault_dir, &root, base_docs, base_seq)?;
+            let entry = filter::write(vault_dir, &root, &base_docs.docs, base_seq)?;
             write_staged_filter_artifact(&root, base_seq, &entry)?;
             progress(RebuildProgress {
                 rows: Some(base_docs.len()),
@@ -196,13 +256,27 @@ where
         }
     };
 
+    let (backend, backend_source, cuvs_compiled) = manifest_backend(build_policy);
     let manifest = SearchIndexManifest {
         format: MANIFEST_FORMAT.to_string(),
         base_seq,
+        diskann_build_backend: Some(backend),
+        diskann_build_backend_source: Some(backend_source),
+        sextant_cuvs_compiled: Some(cuvs_compiled),
         filter: Some(filter),
         slots: entries,
     };
+    progress(RebuildProgress {
+        rows: Some(manifest.slots.len()),
+        base_seq: Some(base_seq),
+        ..RebuildProgress::phase("manifest_validate_start")
+    })?;
     validate_staged_manifest_artifacts(vault_dir, &manifest)?;
+    progress(RebuildProgress {
+        rows: Some(manifest.slots.len()),
+        base_seq: Some(base_seq),
+        ..RebuildProgress::phase("manifest_validate_ok")
+    })?;
     let manifest_path = manifest_path(vault_dir);
     progress(RebuildProgress::manifest(
         "manifest_write_start",
@@ -266,8 +340,8 @@ fn build_slot_entry<F>(
     vault: &AsterVault,
     snapshot: Snapshot,
     plan: &SlotBuildPlan,
-    previous_manifest: Option<&SearchIndexManifest>,
     page_rows: usize,
+    build_policy: DiskAnnBuildPolicy,
     progress: Option<&SharedRebuildProgress<'_, F>>,
 ) -> CliResult<BuiltSlot>
 where
@@ -288,7 +362,19 @@ where
         }
         return Ok(built);
     }
-    let rows = collect_slot_rows_from_cf(vault, snapshot, plan, page_rows, progress)?;
+    if let Some(progress) = progress {
+        emit_shared_progress(
+            progress,
+            RebuildProgress::slot(
+                "slot_index_write_start",
+                plan.slot,
+                Some(plan.expected_ids.len()),
+                Some(base_seq),
+            ),
+        )?;
+    }
+    let rows =
+        collect_or_build_slot_from_cf(vault_dir, root, vault, snapshot, plan, page_rows, progress)?;
     let row_count = rows.len();
     if let Some(progress) = progress {
         emit_shared_progress(
@@ -300,52 +386,25 @@ where
                 Some(base_seq),
             ),
         )?;
-        emit_shared_progress(
-            progress,
-            RebuildProgress::slot(
-                "slot_index_write_start",
-                plan.slot,
-                Some(row_count),
-                Some(base_seq),
-            ),
-        )?;
     }
     let entry = match rows {
-        SlotRows::Dense(rows) => OptionalSearchIndexEntry::Some(dense::write_with_progress(
+        ScannedSlotRows::Dense(rows) => OptionalSearchIndexEntry::Some(dense::write_with_progress(
             vault_dir,
             root,
             plan.slot,
             rows,
             base_seq,
+            build_policy,
             |event| match progress {
                 Some(progress) => emit_shared_progress(progress, event),
                 None => Ok(()),
             },
         )?),
-        SlotRows::Sparse(rows) => OptionalSearchIndexEntry::Some(sparse::write(
+        ScannedSlotRows::Sparse(rows) => OptionalSearchIndexEntry::Some(sparse::write(
             vault_dir, root, plan.slot, rows, base_seq,
         )?),
-        SlotRows::Multi(rows) => {
-            let previous = previous_manifest.and_then(|manifest| {
-                manifest
-                    .slots
-                    .iter()
-                    .find(|entry| entry.slot == plan.slot.get())
-            });
-            OptionalSearchIndexEntry::Some(multi::write(
-                vault_dir,
-                root,
-                plan.slot,
-                rows,
-                base_seq,
-                previous,
-                &mut |event| match progress {
-                    Some(progress) => emit_shared_progress(progress, event),
-                    None => Ok(()),
-                },
-            )?)
-        }
-        SlotRows::AbsentOnly => OptionalSearchIndexEntry::None {
+        ScannedSlotRows::MultiEntry(entry) => OptionalSearchIndexEntry::Some(entry),
+        ScannedSlotRows::AbsentOnly => OptionalSearchIndexEntry::None {
             slot: plan.slot.get(),
         },
     };

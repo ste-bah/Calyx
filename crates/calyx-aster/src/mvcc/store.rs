@@ -11,7 +11,7 @@ use crate::mvcc::{
 use crate::resource::{
     LeaseRegistry, LeaseView, MemtableCfStatus, MemtableStatus, ResourceCounters,
 };
-use crate::sst::{SstEntry, SstSummary};
+use crate::sst::SstSummary;
 use calyx_core::{Clock, Result, Seq, Ts};
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -27,9 +27,8 @@ struct VersionedValue {
     value: Vec<u8>,
 }
 
-type CfKey = (ColumnFamily, Vec<u8>);
 type VersionChain = Vec<VersionedValue>;
-type RowTable = BTreeMap<CfKey, VersionChain>;
+type RowTable = BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, VersionChain>>;
 
 /// One CF/key read requested against a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +72,12 @@ pub struct VersionedCfStore {
     resource_counters: Arc<ResourceCounters>,
     snapshot_gc: SnapshotGcReclaimer,
     snapshot_gc_counters: SnapshotGcCounters,
+    #[cfg(test)]
+    batch_barrier_phases: AtomicU64,
+    #[cfg(test)]
+    batch_row_phases: AtomicU64,
+    #[cfg(test)]
+    batch_router_phases: AtomicU64,
 }
 
 impl VersionedCfStore {
@@ -89,6 +94,12 @@ impl VersionedCfStore {
             resource_counters: Arc::new(ResourceCounters::default()),
             snapshot_gc: SnapshotGcReclaimer::default(),
             snapshot_gc_counters: SnapshotGcCounters::default(),
+            #[cfg(test)]
+            batch_barrier_phases: AtomicU64::new(0),
+            #[cfg(test)]
+            batch_row_phases: AtomicU64::new(0),
+            #[cfg(test)]
+            batch_router_phases: AtomicU64::new(0),
         }
     }
 
@@ -106,6 +117,12 @@ impl VersionedCfStore {
             resource_counters,
             snapshot_gc: SnapshotGcReclaimer::default(),
             snapshot_gc_counters: SnapshotGcCounters::default(),
+            #[cfg(test)]
+            batch_barrier_phases: AtomicU64::new(0),
+            #[cfg(test)]
+            batch_row_phases: AtomicU64::new(0),
+            #[cfg(test)]
+            batch_router_phases: AtomicU64::new(0),
         }
     }
 
@@ -129,7 +146,7 @@ impl VersionedCfStore {
     }
 
     /// Latest committed seq whose batch wrote derived-search-content inputs.
-    /// See [`crate::cf::ColumnFamily::feeds_derived_search_content`].
+    /// See [`crate::cf::ColumnFamily::feeds_persistent_search_index`].
     pub fn derived_content_seq(&self) -> Seq {
         self.derived_content_seq.load(Ordering::Acquire)
     }
@@ -287,7 +304,7 @@ impl VersionedCfStore {
         // commit path's time-index seqno prediction).
         if rows
             .iter()
-            .any(|(cf, _, _)| cf.feeds_derived_search_content())
+            .any(|(cf, _, _)| cf.feeds_persistent_search_index())
         {
             self.derived_content_seq
                 .fetch_max(self.current_seq() + 1, Ordering::AcqRel);
@@ -295,7 +312,9 @@ impl VersionedCfStore {
         let seq = self.seqs.allocate();
         for (cf, key, value) in rows {
             table
-                .entry((cf, key))
+                .entry(cf)
+                .or_default()
+                .entry(key)
                 .or_default()
                 .push(VersionedValue { seq, value });
         }
@@ -316,13 +335,15 @@ impl VersionedCfStore {
         let mut table = self.rows.write().expect("mvcc row table poisoned");
         if rows
             .iter()
-            .any(|(cf, _, _)| cf.feeds_derived_search_content())
+            .any(|(cf, _, _)| cf.feeds_persistent_search_index())
         {
             self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
         }
         for (cf, key, value) in rows {
             table
-                .entry((cf, key))
+                .entry(cf)
+                .or_default()
+                .entry(key)
                 .or_default()
                 .push(VersionedValue { seq, value });
         }
@@ -336,7 +357,8 @@ impl VersionedCfStore {
         self.rows
             .read()
             .expect("mvcc row table poisoned")
-            .contains_key(&(cf, key.to_vec()))
+            .get(&cf)
+            .is_some_and(|rows| rows.contains_key(key))
     }
 
     pub fn flush_all_cfs(&self) -> Result<Vec<SstSummary>> {
@@ -351,6 +373,18 @@ impl VersionedCfStore {
         // the safe direction (issue #1138).
         let commit_watermark = self.current_seq();
         router.flush_pending_at(commit_watermark)
+    }
+
+    /// Rebuilds one CF's router SST level from disk after live compaction
+    /// reclaimed merged input files. No-op for router-less stores. Holding
+    /// the router write lock makes the swap atomic for every reader that
+    /// goes through the router.
+    pub fn reload_router_cf_level(&self, cf: ColumnFamily) -> Result<()> {
+        let mut router = self.router.write().expect("mvcc router poisoned");
+        match router.as_mut() {
+            Some(router) => router.reload_cf_level(cf),
+            None => Ok(()),
+        }
     }
 
     pub fn install_read_barrier(&self, barrier: ReadBarrier) {
@@ -377,6 +411,15 @@ impl VersionedCfStore {
             .read()
             .expect("mvcc read barriers poisoned")
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_read_phase_counts(&self) -> (u64, u64, u64) {
+        (
+            self.batch_barrier_phases.load(Ordering::Relaxed),
+            self.batch_row_phases.load(Ordering::Relaxed),
+            self.batch_router_phases.load(Ordering::Relaxed),
+        )
     }
 }
 

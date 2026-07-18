@@ -1,10 +1,15 @@
 [package]
+autotests = false
 name = "calyx-aster"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[features]
+default = []
+cuda = ["calyx-forge/cuda"]
 
 [dependencies]
 aes-gcm.workspace = true
@@ -46,4 +51,34 @@ nix.workspace = true
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
 ] }
+
+# BEGIN generated integration harnesses (issue #1546)
+
+[[test]]
+name = "__calyx_integration_isolated_issue460_kv_unsigned_ns_index_fsv"
+path = "tests/__calyx_integration_isolated_issue460_kv_unsigned_ns_index_fsv.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_leapable_issue1977_durability_fsv"
+path = "tests/__calyx_integration_isolated_leapable_issue1977_durability_fsv.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_ph61_integration"
+path = "tests/__calyx_integration_isolated_ph61_integration.rs"
+
+[[test]]
+name = "__calyx_integration_platform_0"
+path = "tests/__calyx_integration_platform_0.rs"
+
+[[test]]
+name = "__calyx_integration_suite_0"
+path = "tests/__calyx_integration_suite_0.rs"
+
+[[test]]
+name = "__calyx_integration_suite_1"
+path = "tests/__calyx_integration_suite_1.rs"
+
+# END generated integration harnesses (issue #1546)

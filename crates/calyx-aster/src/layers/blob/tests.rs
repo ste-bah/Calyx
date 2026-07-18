@@ -61,6 +61,84 @@ fn put_get_round_trips_and_manifest_matches_hash() {
 }
 
 #[test]
+fn content_addressed_put_and_coherent_read_return_committed_state() {
+    let vault = AsterVault::with_clock(vault_id(), b"issue1549", FixedClock::new(1_549));
+    let layer = BlobLayer::new(&vault);
+    let col = blob_collection();
+    let data = synthetic(BLOB_CHUNK_SIZE + 17);
+    let expected_hash = *blake3::hash(&data).as_bytes();
+    let mut expected_id = [0_u8; 16];
+    expected_id.copy_from_slice(&expected_hash[..16]);
+    eprintln!(
+        "ISSUE1549_HAPPY before_seq={} manifest_present=false bytes={}",
+        vault.latest_seq(),
+        data.len()
+    );
+
+    reset_blob_io_counts();
+    let put = layer.blob_put_content_addressed(&col, &data).unwrap();
+
+    assert_eq!(
+        blob_io_counts(),
+        BlobIoCounts {
+            hash_calls: 1,
+            hash_bytes: data.len(),
+            chunk_group_commits: 1,
+            chunk_rows_written: 2,
+            ..BlobIoCounts::default()
+        }
+    );
+    assert_eq!(put.blob_id, BlobId::from_bytes(expected_id));
+    assert_eq!(put.manifest.content_hash, expected_hash);
+    assert_eq!(put.manifest.total_bytes, data.len() as u64);
+    assert_eq!(put.manifest.chunk_count, 2);
+    assert_eq!(put.seq, vault.latest_seq());
+
+    reset_blob_io_counts();
+    let persisted_manifest = layer.blob_manifest(&col, put.blob_id).unwrap().unwrap();
+    assert_eq!(
+        blob_io_counts(),
+        BlobIoCounts {
+            snapshot_pins: 1,
+            manifest_reads: 1,
+            manifest_decodes: 1,
+            ..BlobIoCounts::default()
+        }
+    );
+    assert_eq!(persisted_manifest, put.manifest);
+
+    reset_blob_io_counts();
+    let read = layer.blob_read(&col, put.blob_id).unwrap().unwrap();
+    assert_eq!(
+        blob_io_counts(),
+        BlobIoCounts {
+            hash_calls: 1,
+            hash_bytes: data.len(),
+            snapshot_pins: 1,
+            manifest_reads: 1,
+            manifest_decodes: 1,
+            chunk_reads: 2,
+            ..BlobIoCounts::default()
+        }
+    );
+    assert_eq!(read.manifest, put.manifest);
+    assert_eq!(read.data, data);
+    eprintln!(
+        "ISSUE1549_HAPPY after_seq={} blob_id={} manifest_bytes={} chunks={} readback_hash={}",
+        vault.latest_seq(),
+        hex_bytes(put.blob_id.as_bytes()),
+        read.manifest.total_bytes,
+        read.manifest.chunk_count,
+        hex_bytes(blake3::hash(&read.data).as_bytes())
+    );
+    eprintln!(
+        "ISSUE1549_IO_COUNTS put_hash_calls=1 put_hash_bytes={} put_manifest_reads=0 read_hash_calls=1 read_hash_bytes={} read_snapshot_pins=1 read_manifest_reads=1 read_manifest_decodes=1 read_chunk_reads=2",
+        data.len(),
+        data.len()
+    );
+}
+
+#[test]
 fn payload_spanning_three_chunks_reassembles() {
     let vault = AsterVault::with_clock(vault_id(), b"salt", FixedClock::new(1));
     let layer = BlobLayer::new(&vault);
@@ -143,6 +221,7 @@ fn edge_cases_fail_closed_with_exact_codes() {
 
     // (1) empty payload -> 0 chunks, manifest total_bytes=0, get == Some(b"").
     let empty_id = BlobId::from_text("empty");
+    eprintln!("ISSUE1549_EDGE empty before manifest_present=false chunk_rows=0");
     layer.blob_put(&col, empty_id, b"").unwrap();
     let manifest = layer.blob_manifest(&col, empty_id).unwrap().unwrap();
     assert_eq!(manifest.chunk_count, 0);
@@ -150,17 +229,25 @@ fn edge_cases_fail_closed_with_exact_codes() {
     assert_eq!(&manifest.content_hash, blake3::hash(b"").as_bytes());
     assert_eq!(manifest.created_at_ms, Some(1));
     assert_eq!(layer.blob_get(&col, empty_id).unwrap(), Some(Vec::new()));
+    eprintln!("ISSUE1549_EDGE empty after manifest_present=true chunk_rows=0 bytes=0");
 
     // (2) absent blob -> None.
+    eprintln!("ISSUE1549_EDGE absent before manifest_present=false");
     assert_eq!(
         layer.blob_get(&col, BlobId::from_text("ghost")).unwrap(),
         None
     );
+    eprintln!("ISSUE1549_EDGE absent after manifest_present=false read=None");
 
     // (3) flip one byte in a chunk row -> corrupt on get (hash mismatch).
     let corrupt_id = BlobId::from_text("corrupt");
     let data = synthetic(1000);
     layer.blob_put(&col, corrupt_id, &data).unwrap();
+    eprintln!(
+        "ISSUE1549_EDGE corrupt before manifest_hash={} stored_chunk_hash={}",
+        hex_bytes(blake3::hash(&data).as_bytes()),
+        hex_bytes(blake3::hash(&data).as_bytes())
+    );
     let mut tampered = data.clone();
     tampered[0] ^= 0xff;
     vault
@@ -169,6 +256,19 @@ fn edge_cases_fail_closed_with_exact_codes() {
     assert_eq!(
         layer.blob_get(&col, corrupt_id).unwrap_err().code,
         "CALYX_ASTER_CORRUPT_SHARD"
+    );
+    let persisted_tampered = vault
+        .read_cf_at(
+            vault.latest_seq(),
+            ColumnFamily::Blob,
+            &chunk_key(&col, corrupt_id, 0),
+        )
+        .unwrap()
+        .unwrap();
+    eprintln!(
+        "ISSUE1549_EDGE corrupt after manifest_hash={} stored_chunk_hash={} read_error=CALYX_ASTER_CORRUPT_SHARD",
+        hex_bytes(blake3::hash(&data).as_bytes()),
+        hex_bytes(blake3::hash(&persisted_tampered).as_bytes())
     );
 
     // (4) wrong collection mode -> invalid argument.
@@ -256,6 +356,86 @@ fn missing_manifest_with_orphan_chunks_reads_none_not_partial() {
     assert_eq!(layer.blob_get(&col, id).unwrap(), None);
 }
 
+#[test]
+fn failure_between_bounded_chunk_groups_is_invisible_after_cold_reopen() {
+    let root = std::env::temp_dir().join(format!(
+        "calyx-issue1584-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::remove_dir_all(&root).ok();
+    let col = blob_collection();
+    let data = synthetic(BLOB_CHUNK_GROUP_VALUE_BYTES + BLOB_CHUNK_SIZE);
+    let hash = *blake3::hash(&data).as_bytes();
+    let mut id = [0_u8; BLOB_ID_BYTES];
+    id.copy_from_slice(&hash[..BLOB_ID_BYTES]);
+    let blob_id = BlobId::from_bytes(id);
+    let vault = AsterVault::new_durable(
+        &root,
+        vault_id(),
+        b"issue1584-bounded-chunk-failure".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let layer = BlobLayer::new(&vault);
+
+    reset_blob_io_counts();
+    FAIL_CHUNK_GROUP.set(Some(1));
+    let error = layer.blob_put_content_addressed(&col, &data).unwrap_err();
+    let counts = blob_io_counts();
+    assert_eq!(error.code, "CALYX_DISK_PRESSURE");
+    assert!(error.message.contains("blob chunk group 1 failed"));
+    assert!(error.message.contains("first_chunk=128"));
+    assert_eq!(counts.chunk_group_commits, 1);
+    assert_eq!(counts.chunk_rows_written, 128);
+    assert!(
+        vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Blob,
+                &chunk_key(&col, blob_id, 0),
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Blob,
+                &chunk_key(&col, blob_id, 128),
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(layer.blob_manifest(&col, blob_id).unwrap(), None);
+    drop(vault);
+
+    let reopened = AsterVault::open(
+        &root,
+        vault_id(),
+        b"issue1584-bounded-chunk-failure".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let reopened_layer = BlobLayer::new(&reopened);
+    assert_eq!(reopened_layer.blob_manifest(&col, blob_id).unwrap(), None);
+    assert_eq!(reopened_layer.blob_read(&col, blob_id).unwrap(), None);
+    assert!(
+        reopened
+            .read_cf_at(
+                reopened.latest_seq(),
+                ColumnFamily::Blob,
+                &chunk_key(&col, blob_id, 0),
+            )
+            .unwrap()
+            .is_some()
+    );
+    drop(reopened);
+    reset_blob_io_counts();
+    fs::remove_dir_all(root).unwrap();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
     #[test]
@@ -275,88 +455,7 @@ proptest! {
     }
 }
 
-#[test]
-fn durable_blob_fsv_writes_readback_artifacts() {
-    let fsv_root = calyx_fsv::fsv_root("CALYX_FSV_ROOT");
-    let dir = fsv_root
-        .as_ref()
-        .map(|root| root.join("blob-vault"))
-        .unwrap_or_else(|| temp_dir("blob-fsv"));
-    fs::remove_dir_all(&dir).ok();
-
-    let vault = AsterVault::new_durable(
-        &dir,
-        vault_id(),
-        b"blob-fsv-salt".to_vec(),
-        VaultOptions::default(),
-    )
-    .unwrap();
-    let layer = BlobLayer::new(&vault);
-    let col = blob_collection();
-    create_collection(&vault, col.clone()).unwrap();
-
-    let id = BlobId::from_text("b1");
-    let data = synthetic(2 * 1024 * 1024); // 2 MiB -> 8 chunks
-    let expected_hash = *blake3::hash(&data).as_bytes();
-    layer.blob_put(&col, id, &data).unwrap();
-
-    vault.flush().unwrap();
-    drop(vault);
-
-    let reopened = AsterVault::open(
-        &dir,
-        vault_id(),
-        b"blob-fsv-salt".to_vec(),
-        VaultOptions::default(),
-    )
-    .unwrap();
-    let reopened_layer = BlobLayer::new(&reopened);
-
-    let manifest = reopened_layer.blob_manifest(&col, id).unwrap().unwrap();
-    assert_eq!(manifest.chunk_count, 8);
-    assert_eq!(manifest.total_bytes, data.len() as u64);
-    assert_eq!(manifest.content_hash, expected_hash);
-    // Byte-exact round-trip across a cold reopen (the `cmp` equivalent).
-    let roundtrip = reopened_layer.blob_get(&col, id).unwrap().unwrap();
-    assert_eq!(roundtrip, data);
-
-    let cf_files = physical_files(&dir.join("cf").join("blob"));
-    assert!(!cf_files.is_empty(), "cf/blob must hold on-disk shards");
-
-    let ck = chunk_key(&col, id, 0);
-    let mk = manifest_key(&col, id);
-    let readback = serde_json::json!({
-        "issue": 454,
-        "layer": "blob",
-        "source_of_truth": dir.display().to_string(),
-        "cf": ColumnFamily::Blob.name(),
-        "chunk_key_hex": hex_bytes(&ck),
-        "chunk_disc": format!("{:#04x}", ck[0]),
-        "chunk_kind": format!("{:#04x}", ck[1]),
-        "manifest_key_hex": hex_bytes(&mk),
-        "manifest_kind": format!("{:#04x}", mk[1]),
-        "manifest_chunk_count": manifest.chunk_count,
-        "manifest_total_bytes": manifest.total_bytes,
-        "manifest_created_at_ms": manifest.created_at_ms,
-        "content_hash_hex": hex_bytes(&manifest.content_hash),
-        "roundtrip_byte_exact": roundtrip == data,
-        "blob_cf_files": cf_files,
-    });
-    assert_eq!(readback["roundtrip_byte_exact"], serde_json::json!(true));
-
-    if let Some(root) = fsv_root {
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("ph53-blob-readback.json"),
-            serde_json::to_vec_pretty(&readback).unwrap(),
-        )
-        .unwrap();
-        println!("ph53_blob_fsv_root={}", root.display());
-        println!("{}", serde_json::to_string_pretty(&readback).unwrap());
-    } else {
-        fs::remove_dir_all(dir).ok();
-    }
-}
+mod durable_fsv;
 
 fn physical_files(dir: &std::path::Path) -> Vec<serde_json::Value> {
     let mut files = Vec::new();

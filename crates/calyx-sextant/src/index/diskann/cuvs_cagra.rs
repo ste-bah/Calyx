@@ -1,6 +1,8 @@
 use std::collections::HashSet;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
+use std::fs::{self, File};
 use std::os::raw::c_void;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 
@@ -8,9 +10,10 @@ use calyx_core::Result;
 use cuvs_sys as ffi;
 
 use super::build::{
-    DiskAnnBuildMetric, DiskAnnBuildParams, medoid, normalize, write_graph_from_adjacency,
-    write_graph_from_adjacency_f32,
+    DiskAnnBuildMetric, DiskAnnBuildParams, cagra_dataset_sidecar_path, cagra_sidecar_path, medoid,
+    normalize, write_graph_from_adjacency, write_graph_from_adjacency_f32,
 };
+use super::cagra_dataset;
 use super::graph::invalid;
 use crate::error::{CALYX_INDEX_IO, sextant_error};
 
@@ -20,19 +23,24 @@ pub(super) fn build_diskann_graph_cuvs_cagra(
     params: DiskAnnBuildParams,
     metric: DiskAnnBuildMetric,
 ) -> Result<()> {
+    let sidecar = cagra_sidecar_path(path);
+    let dataset_sidecar = cagra_dataset_sidecar_path(path);
     if vectors.len() == 1 {
+        remove_if_present(&sidecar, "remove unsupported singleton CAGRA asset")?;
+        remove_if_present(
+            &dataset_sidecar,
+            "remove unsupported singleton CAGRA dataset asset",
+        )?;
         return write_cagra_graph(path, vectors, params, 0, &[Vec::new()], metric);
     }
     let space = cagra_build_space(vectors, metric);
     let entry = medoid(&space, metric);
     let graph_degree = params.m_max.min(vectors.len() - 1);
     let mut dataset = flatten(&space, params.dim);
-
     let res = Resources::new()?;
     let index_params = CagraParams::new()?;
     index_params.configure(&params, graph_degree);
     let index = CagraIndex::new()?;
-
     let mut dataset_shape = [vectors.len() as i64, params.dim as i64];
     let mut dataset_tensor =
         host_tensor(dataset.as_mut_ptr().cast(), &mut dataset_shape, dtype_f32());
@@ -42,10 +50,50 @@ pub(super) fn build_diskann_graph_cuvs_cagra(
     )?;
     check(unsafe { ffi::cuvsStreamSync(res.0) }, "sync after build")?;
     index.verify(vectors.len(), params.dim, graph_degree)?;
-
     let graph = index.copy_graph_to_host(&res, vectors.len(), graph_degree)?;
     let adjacency = graph_to_adjacency(&graph, vectors.len(), graph_degree, params.m_max)?;
-    write_cagra_graph(path, vectors, params, entry, &adjacency, metric)
+    let tmp = sidecar.with_extension("cagra.tmp");
+    if let Some(parent) = tmp.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error("create CAGRA asset directory", parent, error))?;
+    }
+    remove_if_present(&tmp, "remove stale temporary CAGRA asset")?;
+    index.serialize(&res, &tmp)?;
+    File::open(&tmp)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| io_error("sync temporary CAGRA asset", &tmp, error))?;
+    let dataset_tmp = match cagra_dataset::prepare(&dataset_sidecar, &space, metric) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+    };
+
+    // The generation is unavailable until all paired artifacts are published.
+    remove_if_present(&sidecar, "invalidate prior CAGRA asset")?;
+    remove_if_present(&dataset_sidecar, "invalidate prior CAGRA dataset asset")?;
+    if let Err(error) = write_cagra_graph(path, vectors, params, entry, &adjacency, metric) {
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&dataset_tmp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&tmp, &sidecar) {
+        let _ = fs::remove_file(&dataset_tmp);
+        return Err(io_error("publish CAGRA serving asset", &sidecar, error));
+    }
+    if let Err(error) = fs::rename(&dataset_tmp, &dataset_sidecar) {
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&dataset_tmp);
+        return Err(io_error(
+            "publish CAGRA dataset serving asset",
+            &dataset_sidecar,
+            error,
+        ));
+    }
+    sync_parent(&sidecar)
 }
 
 fn write_cagra_graph(
@@ -84,15 +132,12 @@ fn flatten(norm: &[Vec<f32>], dim: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn cagra_build_space_preserves_raw_l2_magnitude() {
         let vectors = vec![(0, vec![3.0_f32, 4.0]), (1, vec![6.0, 8.0])];
-
         let raw = cagra_build_space(&vectors, DiskAnnBuildMetric::RawL2);
         assert_eq!(raw[0], vec![3.0, 4.0]);
         assert_eq!(raw[1], vec![6.0, 8.0]);
-
         let unit = cagra_build_space(&vectors, DiskAnnBuildMetric::UnitL2);
         assert!((unit[0][0] - 0.6).abs() <= f32::EPSILON);
         assert!((unit[0][1] - 0.8).abs() <= f32::EPSILON);
@@ -263,6 +308,23 @@ impl CagraIndex {
         drop_view(&mut graph_view);
         result
     }
+
+    fn serialize(&self, res: &Resources, path: &Path) -> Result<()> {
+        let filename = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            sextant_error(
+                CALYX_INDEX_IO,
+                format!("CAGRA asset path contains NUL: {}", path.display()),
+            )
+        })?;
+        check(
+            unsafe { ffi::cuvsCagraSerialize(res.0, filename.as_ptr(), self.0, true) },
+            "serialize serving asset",
+        )?;
+        check(
+            unsafe { ffi::cuvsStreamSync(res.0) },
+            "sync serialized serving asset",
+        )
+    }
 }
 
 impl Drop for CagraIndex {
@@ -402,5 +464,32 @@ fn cuvs_error(stage: &str, detail: impl std::fmt::Display) -> calyx_core::CalyxE
     sextant_error(
         CALYX_INDEX_IO,
         format!("diskann cuvs-cagra {stage}: {detail}; last_error={last}"),
+    )
+}
+
+fn remove_if_present(path: &Path, stage: &'static str) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(stage, path, error)),
+    }
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        sextant_error(
+            CALYX_INDEX_IO,
+            format!("CAGRA asset has no parent: {}", path.display()),
+        )
+    })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| io_error("sync CAGRA asset directory", parent, error))
+}
+
+fn io_error(stage: &'static str, path: &Path, error: std::io::Error) -> calyx_core::CalyxError {
+    sextant_error(
+        CALYX_INDEX_IO,
+        format!("diskann cuvs-cagra {stage} {}: {error}", path.display()),
     )
 }

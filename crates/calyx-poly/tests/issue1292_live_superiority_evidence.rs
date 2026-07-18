@@ -1,7 +1,7 @@
-#[path = "live_calyx_native_evidence_support.rs"]
-mod evidence_support;
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=live_calyx_native_evidence_support.rs alias=__calyx_shared_live_calyx_native_evidence_support_rs local=evidence_support visibility=private
+use crate::__calyx_shared_live_calyx_native_evidence_support_rs as evidence_support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use calyx_anneal::{GoodhartViolation, RegressionReport};
 use calyx_aster::vault::{AsterVault, VaultOptions};

@@ -1,0 +1,150 @@
+{
+  "format": "calyx-cuyahoga-corrections-v2",
+  "policy": "Apply only when every bound archive identity, row ID, source value, source-value digest, expected opinion ID, and final decision partition matches exactly; any mismatch aborts publication.",
+  "source_binding": {
+    "snapshot_date": "2026-06-30",
+    "dockets_archive_sha256": "1396df61e95e18ff290c59ba6968fd90e4145fcb9cf83e2bb1a3745fd065aa59",
+    "clusters_archive_sha256": "bddbd5ca78377ef2fe56ed2ef506e12afe291b6fc7fc31fac6721f4de33b182f",
+    "opinions_archive_sha256": "65db4902a4ae42c48ef9958f52600dedca5401c194d3611d0b2672cfc6dd4d9c"
+  },
+  "corrections": [
+    {
+      "correction_id": "cl-20260630-reversed-case-docket-2748659",
+      "docket_id": 2593342,
+      "cluster_id": 2748659,
+      "expected_opinions": [{"opinion_id": 2748659, "partition": "accepted"}],
+      "changes": {
+        "case_name": {
+          "from": "100980",
+          "from_sha256": "ce9d095eefef288d994cd3aec89ccf1be529b9ec146606a958c214f6cd5c7ca3",
+          "to": "State v. Scott",
+          "to_sha256": "de893b019b02fa1035b755a4d69fc618c7c5088417957ff5f98882e8d1d4de46"
+        },
+        "docket_number": {
+          "from": "State v. Scott",
+          "from_sha256": "de893b019b02fa1035b755a4d69fc618c7c5088417957ff5f98882e8d1d4de46",
+          "to": "100980",
+          "to_sha256": "ce9d095eefef288d994cd3aec89ccf1be529b9ec146606a958c214f6cd5c7ca3"
+        }
+      },
+      "evidence": {
+        "source": "CourtListener 2026-06-30 bulk dockets/clusters/opinions join",
+        "observation": "The decimal appellate docket is stored in case_name and the case caption is stored in docket_number; the exact pair is reversed.",
+        "production_cx_id_observed_before_correction": "2938520b5f8d7b2fb4f7d3bfffe1a295"
+      }
+    },
+    {
+      "correction_id": "cl-20260630-reversed-case-docket-2753578",
+      "docket_id": 2607299,
+      "cluster_id": 2753578,
+      "expected_opinions": [{"opinion_id": 2753578, "partition": "accepted"}],
+      "changes": {
+        "case_name": {
+          "from": "100885",
+          "from_sha256": "b8e6402ee3484fe9f973f62ad726b6d01c3b28c2c1515af6a38e640cbe6e78fe",
+          "to": "State v. Bullitt",
+          "to_sha256": "402893c61ee6c0e7bedc71d1c901f11db55d9aa8b382f79e798ec8655b6f1662"
+        },
+        "docket_number": {
+          "from": "State v. Bullitt",
+          "from_sha256": "402893c61ee6c0e7bedc71d1c901f11db55d9aa8b382f79e798ec8655b6f1662",
+          "to": "100885",
+          "to_sha256": "b8e6402ee3484fe9f973f62ad726b6d01c3b28c2c1515af6a38e640cbe6e78fe"
+        }
+      },
+      "evidence": {
+        "source": "CourtListener 2026-06-30 bulk dockets/clusters/opinions join",
+        "observation": "The decimal appellate docket is stored in case_name and the case caption is stored in docket_number; the exact pair is reversed.",
+        "production_cx_id_observed_before_correction": "39899f964443bc78ac73c7c48be822f2"
+      }
+    },
+    {
+      "correction_id": "cl-20260630-reversed-case-docket-4298573",
+      "docket_id": 7532664,
+      "cluster_id": 4521320,
+      "expected_opinions": [{"opinion_id": 4298573, "partition": "rejected"}],
+      "changes": {
+        "case_name": {
+          "from": "27795",
+          "from_sha256": "31e29536ea2d28e3423416a60fed0e163b919f87953855db91ce468b9f14beef",
+          "to": "Biltmore Tower Apts. v. Dalton",
+          "to_sha256": "40b63c9547c41a60dbd2cf4d34b7cd303f0f2f9897454dcb4d516c66ecdb597d"
+        },
+        "docket_number": {
+          "from": "Biltmore Tower Apts. v. Dalton",
+          "from_sha256": "40b63c9547c41a60dbd2cf4d34b7cd303f0f2f9897454dcb4d516c66ecdb597d",
+          "to": "27795",
+          "to_sha256": "31e29536ea2d28e3423416a60fed0e163b919f87953855db91ce468b9f14beef"
+        }
+      },
+      "evidence": {
+        "source": "CourtListener 2026-06-30 bulk dockets/clusters/opinions join",
+        "observation": "The Second District appellate docket is stored in case_name and the case caption is stored in docket_number; the exact pair is reversed. Opinion 4298573 is explicitly rejected from the Eighth District corpus.",
+        "docket_source": {
+          "logical_record_number": 54635902,
+          "physical_line": 54636029,
+          "stable_source_row_sha256": "b4d9e7d902e204fd566882cdb842873bd2b70c07c36eb694e628d2f0e7d1b61f"
+        },
+        "cluster_source": {
+          "logical_record_number": 8662067,
+          "physical_line": 68866229,
+          "stable_source_row_sha256": "e41a199d055b65b5ec83b69a981d691104c204c4dbcedc39353aa4fd7ddf70d4"
+        },
+        "issuing_district_evidence": [
+          "official Supreme Court of Ohio ROD path /rod/docs/pdf/2/2018/2018-Ohio-2963.pdf",
+          "caption text names SECOND APPELLATE DISTRICT MONTGOMERY COUNTY"
+        ]
+      }
+    },
+    {
+      "correction_id": "cl-20260630-reversed-case-docket-10771254",
+      "docket_id": 69498717,
+      "cluster_id": 10304666,
+      "expected_opinions": [{"opinion_id": 10771254, "partition": "accepted"}],
+      "changes": {
+        "case_name": {
+          "from": "113703",
+          "from_sha256": "b1f767cb6b0ca4f969787d0c7173af17366c466331f5131675252d5518179dec",
+          "to": "Pepper Pike v. R.E.S.",
+          "to_sha256": "5ea9f24b84d6ccc16b511e6cd6d329d4a8bf594e7612f8be4753534d0e3ea1b3"
+        },
+        "docket_number": {
+          "from": "Pepper Pike v. R.E.S.",
+          "from_sha256": "5ea9f24b84d6ccc16b511e6cd6d329d4a8bf594e7612f8be4753534d0e3ea1b3",
+          "to": "113703",
+          "to_sha256": "b1f767cb6b0ca4f969787d0c7173af17366c466331f5131675252d5518179dec"
+        }
+      },
+      "evidence": {
+        "source": "CourtListener 2026-06-30 bulk dockets/clusters/opinions join",
+        "observation": "The decimal appellate docket is stored in case_name and the case caption is stored in docket_number; the exact pair is reversed.",
+        "production_cx_id_observed_before_correction": "ffe23a75d2c54990cd8e37c615113783"
+      }
+    },
+    {
+      "correction_id": "cl-20260630-reversed-case-docket-11101864",
+      "docket_id": 70827619,
+      "cluster_id": 10635277,
+      "expected_opinions": [{"opinion_id": 11101864, "partition": "accepted"}],
+      "changes": {
+        "case_name": {
+          "from": "114476",
+          "from_sha256": "f2de851703fab33b46f623975fb5e11bd1576018de7e88c8ecfceba276848967",
+          "to": "Roll v. Gertburg Licata Co., LPA",
+          "to_sha256": "6f4d1c7a65ed80fe54f26b5fe1345e2fda6a4027573aebc5c6cde08f8b7ee4a6"
+        },
+        "docket_number": {
+          "from": "Roll v. Gertburg Licata Co., LPA",
+          "from_sha256": "6f4d1c7a65ed80fe54f26b5fe1345e2fda6a4027573aebc5c6cde08f8b7ee4a6",
+          "to": "114476",
+          "to_sha256": "f2de851703fab33b46f623975fb5e11bd1576018de7e88c8ecfceba276848967"
+        }
+      },
+      "evidence": {
+        "source": "CourtListener 2026-06-30 bulk dockets/clusters/opinions join",
+        "observation": "The decimal appellate docket is stored in case_name and the case caption is stored in docket_number; the exact pair is reversed.",
+        "production_cx_id_observed_before_correction": "aed9b759ccaf0c7152ca6b9c6e3588c3"
+      }
+    }
+  ]
+}

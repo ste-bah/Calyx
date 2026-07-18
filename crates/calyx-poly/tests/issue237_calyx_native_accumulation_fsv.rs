@@ -3,8 +3,8 @@
 //! Source of truth: prior capture-state JSON files for the exclusion set, plus the newly persisted
 //! live capture-state JSON and CalyxNative forecast artifacts when a distinct market is available.
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use std::collections::BTreeSet;
 use std::fs;

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::Path;
 use std::str::FromStr;
@@ -20,6 +21,8 @@ use crate::error::{CliError, CliResult};
 use crate::ledger_store::AsterLedgerCfStore;
 use crate::output::print_json;
 
+#[path = "provenance/kernel_reproduce.rs"]
+mod kernel_reproduce;
 mod lineage_support;
 #[path = "provenance/reproduce_record.rs"]
 mod reproduce_record;
@@ -42,6 +45,7 @@ pub(crate) struct ReproduceArgs {
     pub vault: String,
     pub answer_id: String,
     pub record: bool,
+    pub resident_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,26 +108,37 @@ pub(crate) fn parse_verify_chain(rest: &[String]) -> CliResult<Subcommand> {
 
 pub(crate) fn parse_reproduce(rest: &[String]) -> CliResult<Subcommand> {
     let mut record = false;
+    let mut resident_addr = None;
     let mut positional = Vec::new();
-    for arg in rest {
-        match arg.as_str() {
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
             "--record" if record => {
                 return Err(CliError::usage(
                     "reproduce received duplicate --record flag",
                 ));
             }
             "--record" => record = true,
+            "--resident-addr" => {
+                index += 1;
+                let raw = rest
+                    .get(index)
+                    .ok_or_else(|| CliError::usage("--resident-addr requires a value"))?;
+                resident_addr = Some(super::search::parse_resident_addr(raw)?);
+            }
             flag if flag.starts_with("--") => {
                 return Err(CliError::usage(format!("unexpected reproduce flag {flag}")));
             }
-            _ => positional.push(arg.clone()),
+            _ => positional.push(rest[index].clone()),
         }
+        index += 1;
     }
     match positional.as_slice() {
         [vault, answer_id] => Ok(Subcommand::Reproduce(ReproduceArgs {
             vault: vault.clone(),
             answer_id: answer_id.clone(),
             record,
+            resident_addr,
         })),
         _ => Err(CliError::usage(
             "reproduce requires [--record] <vault> <answer_id>",
@@ -150,10 +165,16 @@ fn run_provenance(args: ProvenanceArgs) -> CliResult {
 fn run_reproduce(args: ReproduceArgs) -> CliResult {
     let resolved = resolve_cli_vault(&args.vault)?;
     let answer_id = parse_answer_id(&args.answer_id)?;
-    let report = if args.record {
+    let entries = ledger_entries(&resolved.path)?;
+    let report = if let Some(payload) = latest_kernel_answer_payload(&entries, &answer_id)? {
+        kernel_reproduce::record(&resolved, &answer_id, &payload, args.resident_addr)?
+    } else if args.resident_addr.is_some() {
+        return Err(CliError::usage(
+            "--resident-addr is valid only for a kernel answer",
+        ));
+    } else if args.record {
         reproduce_record::record(&resolved, &answer_id)?
     } else {
-        let entries = ledger_entries(&resolved.path)?;
         reproduce_report(&entries, &answer_id)?
     };
     print_json(&report)?;
@@ -166,6 +187,32 @@ fn run_reproduce(args: ReproduceArgs) -> CliResult {
         ))
         .into())
     }
+}
+
+fn latest_kernel_answer_payload(
+    entries: &[LedgerEntry],
+    answer_id: &[u8],
+) -> CliResult<Option<Value>> {
+    for entry in entries.iter().rev() {
+        if entry.kind != EntryKind::Answer
+            || !matches!(&entry.subject, SubjectId::Query(id) if id == answer_id)
+        {
+            continue;
+        }
+        let payload: Value = serde_json::from_slice(&entry.payload).map_err(|error| {
+            CalyxError::ledger_corrupt(format!(
+                "decode kernel Answer payload at seq {}: {error}",
+                entry.seq
+            ))
+        })?;
+        if matches!(
+            payload.get("type").and_then(Value::as_str),
+            Some("kernel_answer_v2" | "kernel_answer_v3" | "kernel_citation_answer_v1")
+        ) {
+            return Ok(Some(payload));
+        }
+    }
+    Ok(None)
 }
 
 fn run_anneal_status(args: AnnealStatusArgs) -> CliResult {

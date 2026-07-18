@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 
+use calyx_anneal::{
+    AnnealLedger, AnnealLedgerAction, AnnealLedgerEntry, AsterAnnealLedgerStore, ChangeId,
+    MetricComparison, MetricSnapshot, TripwireMetric,
+};
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::ledger_view::AsterLedgerCfStore;
 use calyx_aster::vault::{AsterVault, VaultOptions};
@@ -20,6 +24,8 @@ use super::quarantine::NoQuarantine;
 use super::{core, status};
 use crate::tools::test_support::ENV_LOCK;
 use crate::tools::vault::store::{ResolvedVault, vault_salt};
+
+mod indexed;
 
 #[test]
 fn lineage_reports_original_ingest_and_mcp_anchor_sequences() {
@@ -163,55 +169,6 @@ fn missing_aster_ledger_state_maps_to_aster_corrupt_for_mcp() {
 }
 
 #[test]
-fn answer_trace_scans_home_and_returns_retrieval_steps() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    let (root, _resolved, vault) = test_vault("answer-trace");
-    let old_home = std::env::var_os("CALYX_HOME");
-    unsafe {
-        std::env::set_var("CALYX_HOME", &root);
-    }
-    let cx_id = CxId::from_bytes([9; 16]);
-    let answer_id = b"answer-523".to_vec();
-    let payload = json!({
-        "complete": true,
-        "expected_hops": 1,
-        "path": [{
-            "hop": 0,
-            "cx_id": cx_id.to_string(),
-            "score": 0.75,
-            "ledger_ref": {"seq": 0}
-        }],
-        "fusion_weights": FusionWeights {
-            mode: FusionMode::Rrf,
-            k: 1,
-            candidates: vec![cx_id],
-            weights: Vec::new(),
-            single_slot: None,
-        },
-    });
-    vault
-        .append_ledger_entry(
-            EntryKind::Answer,
-            SubjectId::Query(answer_id.clone()),
-            serde_json::to_vec(&payload).unwrap(),
-            ActorId::Service("unit".to_string()),
-        )
-        .unwrap();
-    vault.flush().unwrap();
-
-    let out = serde_json::to_value(core::answer_trace("answer-523").unwrap()).unwrap();
-
-    assert_eq!(out["answer_id"], core::hex(&answer_id));
-    assert_eq!(out["complete"], true);
-    assert_eq!(out["trusted"], true);
-    assert_eq!(out["answer_seq"], 0);
-    assert_eq!(out["retrieval_steps"][0]["cx_id"], cx_id.to_string());
-    assert_eq!(out["kernel_cx_ids"][0], cx_id.to_string());
-    restore_home(old_home);
-    fs::remove_dir_all(root).ok();
-}
-
-#[test]
 fn reproduce_missing_and_mismatch_fail_closed() {
     let missing = core::reproduce_report(&[], b"missing").unwrap_err();
     assert_eq!(err_code(&missing), "CALYX_VAULT_ACCESS_DENIED");
@@ -283,6 +240,35 @@ fn anneal_status_contains_required_fields_from_proposal_row() {
     assert!(out.get("tripwires").is_some());
     assert!(out.get("p99_latency_ms").is_some());
     fs::remove_dir_all(root).ok();
+}
+
+fn anneal_event(change: u64, search_p99: Option<f64>) -> AnnealLedgerEntry {
+    AnnealLedgerEntry {
+        action: AnnealLedgerAction::Promote,
+        change_id: ChangeId(change),
+        artifact_id: format!("issue1532-{change}"),
+        prior_ptr_hash: [1; 32],
+        candidate_ptr_hash: [2; 32],
+        metrics: MetricSnapshot {
+            evaluated_at: 1_532_000 + change,
+            query_count: 1,
+            metrics: search_p99
+                .map(|candidate_value| {
+                    vec![MetricComparison {
+                        metric: TripwireMetric::SearchP99,
+                        candidate_value,
+                        incumbent_value: candidate_value + 1.0,
+                    }]
+                })
+                .unwrap_or_default(),
+        },
+        ts: 1_532_000 + change,
+        description: format!("issue1532 change {change}"),
+        fault: None,
+        proposal: None,
+        details: None,
+        prev_hash: None,
+    }
 }
 
 fn test_vault(name: &str) -> (std::path::PathBuf, ResolvedVault, AsterVault) {

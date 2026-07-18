@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::runtime::load_runtime_lens;
 use super::*;
 use crate::lens::process_runtime_requires_golden;
@@ -107,5 +109,17 @@ impl Lens for LazyPersistedLens {
 
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
         self.runtime()?.measure_batch(inputs)
+    }
+
+    fn measurement_group_key(&self) -> Result<Option<calyx_core::MeasurementGroupKey>> {
+        self.runtime()?.measurement_group_key()
+    }
+
+    fn measure_grouped_batch(
+        &self,
+        requests: &[calyx_core::GroupedLensRequest],
+        inputs: &[Input],
+    ) -> Result<Option<BTreeMap<LensId, Vec<SlotVector>>>> {
+        self.runtime()?.measure_grouped_batch(requests, inputs)
     }
 }

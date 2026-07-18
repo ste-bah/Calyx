@@ -18,6 +18,7 @@ use super::model::{
 };
 use crate::server::{ToolError, ToolResult};
 use crate::tools::guard_measure::required_dense_vectors;
+use crate::tools::search_generation::publish_search_generation;
 
 const GUARD_UUID: &str = "018f48a4-9a79-74d2-8a5c-9ad7f6b8c101";
 
@@ -87,6 +88,7 @@ pub(super) fn calibrate(
         default_guard_key(),
         &profile,
     )?;
+    publish_search_generation(&ctx.vault_dir, &ctx.vault, &ctx.state)?;
     Ok(json!(profile_out(&profile, corpus_size)?))
 }
 

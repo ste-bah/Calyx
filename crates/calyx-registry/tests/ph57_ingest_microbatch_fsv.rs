@@ -215,7 +215,7 @@ fn measured_lengths(readout: &IngestPanelReadout, good_id: LensId) -> Vec<f32> {
 }
 
 fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue590-ingest-microbatch", || {
         PathBuf::from("target/fsv-issue590-ingest-microbatch")
     })
 }

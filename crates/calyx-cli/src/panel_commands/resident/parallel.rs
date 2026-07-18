@@ -9,8 +9,10 @@
 //! serial loop — and fails loud as `CALYX_EMBED_SEQUENTIAL_EXECUTION`
 //! (#1154) unless explicitly downgraded.
 
-use calyx_core::Result;
-use calyx_registry::measure_registry_batch_with_runtime_limit;
+use calyx_core::{MeasurementGroupKey, Result};
+use calyx_registry::{
+    measure_registry_batch_with_runtime_limit, measure_registry_group_with_runtime_limit,
+};
 
 use super::server::ResidentService;
 use super::*;
@@ -148,55 +150,106 @@ pub(super) fn measure_chunk_lenses(
         runnable.push(slot);
     }
     let registry = &service.state.build.registry;
-    let outcomes = fan_out(runnable.len(), |index| {
-        measure_registry_batch_with_runtime_limit(
-            registry,
-            runnable[index].lens_id,
-            chunk,
-            runtime_batch_limit,
-        )
+    let mut jobs: Vec<MeasurementJob<'_>> = Vec::new();
+    let mut grouped_jobs: BTreeMap<MeasurementGroupKey, usize> = BTreeMap::new();
+    for slot in runnable {
+        match registry.measurement_group_key(slot.lens_id)? {
+            Some(key) => {
+                if let Some(&job_index) = grouped_jobs.get(&key) {
+                    jobs[job_index].slots.push(slot);
+                } else {
+                    let job_index = jobs.len();
+                    grouped_jobs.insert(key, job_index);
+                    jobs.push(MeasurementJob {
+                        slots: vec![slot],
+                        grouped: true,
+                    });
+                }
+            }
+            None => jobs.push(MeasurementJob {
+                slots: vec![slot],
+                grouped: false,
+            }),
+        }
+    }
+    let outcomes = fan_out(jobs.len(), |index| {
+        let job = &jobs[index];
+        if job.grouped {
+            let lens_ids: Vec<LensId> = job.slots.iter().map(|slot| slot.lens_id).collect();
+            measure_registry_group_with_runtime_limit(
+                registry,
+                &lens_ids,
+                chunk,
+                runtime_batch_limit,
+            )
+        } else {
+            let lens_id = job.slots[0].lens_id;
+            measure_registry_batch_with_runtime_limit(registry, lens_id, chunk, runtime_batch_limit)
+                .map(|vectors| BTreeMap::from([(lens_id, vectors)]))
+        }
     });
 
     let mut measured_by_lens = BTreeMap::new();
     let mut spans = Vec::new();
     let mut first_error: Option<CalyxError> = None;
-    for (slot, outcome) in runnable.iter().zip(outcomes) {
+    for (job, outcome) in jobs.iter().zip(outcomes) {
         let error = match outcome.result {
-            Ok(Ok(vectors)) if vectors.len() == chunk.len() => {
-                eprintln!(
-                    "CALYX_PANEL_RESIDENT_RUNTIME phase=measure_batch_lens_ok process_id={} lens_id={} slot={} inputs={} elapsed_ms={} span_start_us={} span_end_us={}",
-                    std::process::id(),
-                    slot.lens_id,
-                    slot.slot_id.get(),
-                    chunk.len(),
-                    (outcome.ended_us - outcome.started_us) / 1000,
-                    outcome.started_us,
-                    outcome.ended_us
-                );
+            Ok(Ok(measured)) => {
+                for slot in &job.slots {
+                    let vectors = measured.get(&slot.lens_id).ok_or_else(|| {
+                        CalyxError::lens_dim_mismatch(format!(
+                            "resident measurement job omitted lens {}",
+                            slot.lens_id
+                        ))
+                    })?;
+                    if vectors.len() != chunk.len() {
+                        return Err(CalyxError::lens_dim_mismatch(format!(
+                            "resident measure_batch lens {} returned {} vectors for {} inputs",
+                            slot.lens_id,
+                            vectors.len(),
+                            chunk.len()
+                        ))
+                        .into());
+                    }
+                    eprintln!(
+                        "CALYX_PANEL_RESIDENT_RUNTIME phase=measure_batch_lens_ok process_id={} lens_id={} slot={} inputs={} grouped={} group_lenses={} elapsed_ms={} span_start_us={} span_end_us={}",
+                        std::process::id(),
+                        slot.lens_id,
+                        slot.slot_id.get(),
+                        chunk.len(),
+                        job.grouped,
+                        job.slots.len(),
+                        (outcome.ended_us - outcome.started_us) / 1000,
+                        outcome.started_us,
+                        outcome.ended_us
+                    );
+                }
                 spans.push((outcome.started_us, outcome.ended_us));
-                measured_by_lens.insert(slot.lens_id, vectors);
+                measured_by_lens.extend(measured);
                 continue;
             }
-            Ok(Ok(vectors)) => CalyxError::lens_dim_mismatch(format!(
-                "resident measure_batch lens {} returned {} vectors for {} inputs",
-                slot.lens_id,
-                vectors.len(),
-                chunk.len()
-            )),
             Ok(Err(error)) => error,
             Err(_) => CalyxError::lens_unreachable(format!(
-                "resident measure_batch thread for lens {} panicked",
-                slot.lens_id
+                "resident measurement thread for lenses [{}] panicked",
+                job.slots
+                    .iter()
+                    .map(|slot| slot.lens_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             )),
         };
-        eprintln!(
-            "CALYX_PANEL_RESIDENT_RUNTIME phase=measure_batch_lens_err process_id={} lens_id={} slot={} code={} message={}",
-            std::process::id(),
-            slot.lens_id,
-            slot.slot_id.get(),
-            error.code,
-            error.message
-        );
+        for slot in &job.slots {
+            eprintln!(
+                "CALYX_PANEL_RESIDENT_RUNTIME phase=measure_batch_lens_err process_id={} lens_id={} slot={} grouped={} group_lenses={} code={} message={}",
+                std::process::id(),
+                slot.lens_id,
+                slot.slot_id.get(),
+                job.grouped,
+                job.slots.len(),
+                error.code,
+                error.message
+            );
+        }
         if first_error.is_none() {
             first_error = Some(error);
         }
@@ -206,6 +259,11 @@ pub(super) fn measure_chunk_lenses(
     }
     enforce_overlap(&spans, policy, floor_us)?;
     Ok(measured_by_lens)
+}
+
+struct MeasurementJob<'a> {
+    slots: Vec<&'a calyx_core::Slot>,
+    grouped: bool,
 }
 
 /// #1154: log chunk-level overlap stats and fail loud on serialized spans.

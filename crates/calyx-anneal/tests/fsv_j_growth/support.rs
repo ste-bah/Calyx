@@ -12,10 +12,8 @@ use calyx_core::{FixedClock, Result as CalyxResult};
 use calyx_ledger::{ActorId, LedgerAppender};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-
-#[allow(clippy::duplicate_mod)]
-#[path = "../fsv_support/mod.rs"]
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 pub(crate) use fsv_support::write_json;
 
 pub(crate) const FSV_TS: u64 = 1_785_800_428;

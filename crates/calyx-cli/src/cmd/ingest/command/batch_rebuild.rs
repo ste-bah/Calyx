@@ -14,6 +14,7 @@ use super::*;
 pub(super) fn run_post_commit_index_rebuild(
     resolved: &ResolvedVault,
     vault: &AsterVault,
+    state: &VaultPanelState,
     summary: &BatchIngestSummary,
     session: &mut Option<&mut BatchIngestSession>,
 ) -> CliResult<()> {
@@ -26,12 +27,32 @@ pub(super) fn run_post_commit_index_rebuild(
             "phase=batch_index_rebuild_start new_count={} already_count={}",
             summary.new_count, summary.already_count
         ));
-        if let Err(error) = rebuild_persistent_indexes_with_progress(
-            &resolved.path,
-            vault,
-            log_batch_index_rebuild_progress,
-        ) {
+        let rebuild = if let Some(session) = session.as_deref_mut() {
+            rebuild_persistent_indexes_with_fallible_progress(
+                &resolved.path,
+                vault,
+                state,
+                |event| {
+                    log_batch_index_rebuild_progress(event);
+                    session.check_interrupted()
+                },
+            )
+        } else {
+            rebuild_persistent_indexes_with_fallible_progress(
+                &resolved.path,
+                vault,
+                state,
+                |event| {
+                    log_batch_index_rebuild_progress(event);
+                    Ok(())
+                },
+            )
+        };
+        if let Err(error) = rebuild {
             log_batch_index_rebuild_error(summary, &error);
+            if error.code() == "CALYX_INGEST_SESSION_INTERRUPTED" {
+                return Err(error);
+            }
             return Err(batch_index_rebuild_error(resolved, summary, error));
         }
         ingest_runtime_log(format_args!(

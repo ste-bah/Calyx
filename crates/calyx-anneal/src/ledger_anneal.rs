@@ -145,6 +145,7 @@ where
     }
 
     pub fn write(&mut self, mut entry: AnnealLedgerEntry) -> Result<LedgerRef> {
+        self.appender.refresh_tip_from_store()?;
         let chain_prev = self.appender.prev_hash();
         if let Some(expected) = entry.prev_hash
             && expected != chain_prev
@@ -309,19 +310,7 @@ where
     }
 
     fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()> {
-        let key = ledger_key(seq);
-        if self
-            .vault
-            .read_cf_at(self.vault.latest_seq(), ColumnFamily::Ledger, &key)?
-            .is_some()
-        {
-            return Err(CalyxError::ledger_append_only_violation(format!(
-                "Aster ledger seq {seq} already exists"
-            )));
-        }
-        self.vault
-            .write_cf(ColumnFamily::Ledger, key, bytes.to_vec())?;
-        Ok(())
+        self.vault.append_external_ledger_row(seq, bytes)
     }
 }
 

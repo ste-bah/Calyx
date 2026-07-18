@@ -1,5 +1,6 @@
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+mod buffer;
+mod gpu;
+
 use std::path::Path;
 
 use calyx_core::Result;
@@ -12,6 +13,8 @@ use crate::index::SpannCentroidIndex;
 use crate::index::distance::l2_sq;
 
 use super::{ClosureAssignmentStats, VectorSource, ids_rel};
+use buffer::AssignmentBuffer;
+pub(super) use gpu::{stream_assign_to_ids_bounded_gpu, stream_assign_to_ids_gpu};
 
 #[derive(Debug, Clone)]
 pub(super) struct AssignmentRegion {
@@ -75,11 +78,11 @@ pub(super) fn stream_assign_to_ids_with_routing(
     let n = source.len();
     let chunk = chunk.max(1) as u64;
     let mut counts = vec![0usize; r];
-    clear_stale_ids(root, sink, r)?;
+    let mut output = AssignmentBuffer::new(root, sink, r)?;
     let mut start = 0u64;
     while start < n {
         let end = (start + chunk).min(n);
-        let mut assigned: Vec<(u64, u32)> = (start..end)
+        let assigned: Vec<(u64, u32)> = (start..end)
             .into_par_iter()
             .map(|idx| {
                 let row = source.row(idx);
@@ -102,10 +105,11 @@ pub(super) fn stream_assign_to_ids_with_routing(
                 ));
             }
             counts[region] += 1;
+            output.push(idx, region)?;
         }
-        append_assigned_chunk(root, sink, &mut assigned)?;
         start = end;
     }
+    output.finish()?;
     Ok(counts
         .into_iter()
         .enumerate()
@@ -154,7 +158,7 @@ pub(super) fn stream_assign_to_ids_bounded(
     let mut stored_counts = vec![0usize; r];
     let mut duplicate_budget = usize::try_from(total_capacity - n as u128).unwrap_or(usize::MAX);
     let mut stats = ClosureAssignmentStats::default();
-    clear_stale_ids(root, sink, r)?;
+    let mut output = AssignmentBuffer::new(root, sink, r)?;
     let mut start = 0u64;
     while start < n {
         let end = (start + chunk).min(n);
@@ -172,40 +176,44 @@ pub(super) fn stream_assign_to_ids_bounded(
                 (idx, score_candidates(centroids, &row, &candidates))
             })
             .collect();
-        let mut assigned = Vec::with_capacity(rayon_assigned.len());
+        let mut selected = Vec::with_capacity(config.max_replication);
         for (idx, candidates) in rayon_assigned {
-            let regions = choose_bounded_regions(
+            if !choose_bounded_regions(
                 &primary_counts,
                 &stored_counts,
                 config.cap,
+                config.cap,
                 &candidates,
+                None,
                 config.boundary_epsilon,
                 config.max_replication,
                 duplicate_budget,
-                config.apply_rng_rule.then_some((centroids, config.rng_factor)),
+                config
+                    .apply_rng_rule
+                    .then_some((centroids, config.rng_factor)),
                 &mut stats,
-            )
-            .ok_or_else(|| {
-                sextant_error(
+                &mut selected,
+            ) {
+                return Err(sextant_error(
                     CALYX_INDEX_INVALID_PARAMS,
                     format!(
                         "bounded assignment exhausted the top {probe} routed regions for row {idx}; increase regions or cap"
                     ),
-                )
-            })?;
-            for (pos, region) in regions.into_iter().enumerate() {
+                ));
+            }
+            for (pos, &region) in selected.iter().enumerate() {
                 if pos == 0 {
                     primary_counts[region] += 1;
                 } else {
                     duplicate_budget = duplicate_budget.saturating_sub(1);
                 }
                 stored_counts[region] += 1;
-                assigned.push((idx, region as u32));
+                output.push(idx, region)?;
             }
         }
-        append_assigned_chunk(root, sink, &mut assigned)?;
         start = end;
     }
+    output.finish()?;
     let regions = stored_counts
         .into_iter()
         .enumerate()
@@ -239,30 +247,39 @@ fn score_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn choose_bounded_regions(
+pub(super) fn choose_bounded_regions(
     primary_counts: &[usize],
     stored_counts: &[usize],
+    primary_cap: usize,
     cap: usize,
     candidates: &[(usize, f32)],
+    boundary_anchor_distance: Option<f32>,
     boundary_epsilon: f32,
     max_replication: usize,
     duplicate_budget: usize,
     rng_rule: Option<(&SpannCentroidIndex, f32)>,
     stats: &mut ClosureAssignmentStats,
-) -> Option<Vec<usize>> {
-    let &(primary, primary_distance) = candidates.iter().find(|(region, _)| {
+    selected: &mut Vec<usize>,
+) -> bool {
+    selected.clear();
+    let Some(&(primary, primary_distance)) = candidates.iter().find(|(region, _)| {
         primary_counts
             .get(*region)
-            .is_some_and(|count| *count < cap)
+            .is_some_and(|count| *count < primary_cap)
             && stored_counts.get(*region).is_some_and(|count| *count < cap)
-    })?;
+    }) else {
+        return false;
+    };
     // Candidates carry SQUARED distances; epsilon is defined on the distance
     // scale (SPANN's closure rule), so the squared threshold is (1 + eps)^2.
     let factor = (1.0 + boundary_epsilon) * (1.0 + boundary_epsilon);
-    let threshold = primary_distance * factor;
+    let anchor_distance = boundary_anchor_distance
+        .filter(|distance| distance.is_finite() && *distance >= 0.0)
+        .map_or(primary_distance, |distance| distance.min(primary_distance));
+    let threshold = anchor_distance * factor;
     let duplicate_cap = cap.saturating_mul(max_replication.saturating_sub(1));
-    let mut selected = vec![primary];
-    for &(region, distance) in candidates {
+    selected.push(primary);
+    for (position, &(region, distance)) in candidates.iter().enumerate() {
         if selected.len() >= max_replication {
             break;
         }
@@ -274,15 +291,15 @@ fn choose_bounded_regions(
             continue;
         }
         if distance > threshold {
-            stats.epsilon_filtered += 1;
-            continue;
+            stats.epsilon_filtered += (candidates.len() - position) as u64;
+            break;
         }
         let duplicates = stored_counts[region].saturating_sub(primary_counts[region]);
         if stored_counts[region] >= cap || duplicates >= duplicate_cap {
             stats.cap_skipped += 1;
             continue;
         }
-        if rng_rule_skips(rng_rule, &selected, region, distance) {
+        if rng_rule_skips(rng_rule, selected, region, distance) {
             stats.rng_skipped += 1;
             continue;
         }
@@ -295,7 +312,7 @@ fn choose_bounded_regions(
         stats.replica_histogram.resize(bucket + 1, 0);
     }
     stats.replica_histogram[bucket] += 1;
-    Some(selected)
+    true
 }
 
 /// SPANN RNG rule: replica candidate `region` (squared distance `distance_sq`
@@ -319,76 +336,6 @@ fn rng_rule_skips(
         all.get(chosen)
             .is_some_and(|centroid| rng_factor * l2_sq(centroid, candidate) < distance_sq)
     })
-}
-
-fn append_assigned_chunk(
-    root: &Path,
-    sink: AssignmentSink,
-    assigned: &mut [(u64, u32)],
-) -> Result<()> {
-    assigned.sort_by_key(|(_, region)| *region);
-    let mut offset = 0usize;
-    while offset < assigned.len() {
-        let region = assigned[offset].1;
-        let start = offset;
-        while offset < assigned.len() && assigned[offset].1 == region {
-            offset += 1;
-        }
-        append_region_ids(root, sink, region, &assigned[start..offset])?;
-    }
-    Ok(())
-}
-
-fn append_region_ids(
-    root: &Path,
-    sink: AssignmentSink,
-    region: u32,
-    assigned: &[(u64, u32)],
-) -> Result<()> {
-    let path = root.join(assignment_ids_rel(sink, region));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| sextant_error(CALYX_INDEX_IO, format!("create ids dir: {e}")))?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| {
-            sextant_error(
-                CALYX_INDEX_IO,
-                format!("open ids {} for append: {e}", path.display()),
-            )
-        })?;
-    let mut writer = BufWriter::new(file);
-    for &(idx, _) in assigned {
-        writer.write_all(&idx.to_le_bytes()).map_err(|e| {
-            sextant_error(
-                CALYX_INDEX_IO,
-                format!("write region {region} id {idx}: {e}"),
-            )
-        })?;
-    }
-    writer
-        .flush()
-        .map_err(|e| sextant_error(CALYX_INDEX_IO, format!("flush ids {}: {e}", path.display())))
-}
-
-fn clear_stale_ids(root: &Path, sink: AssignmentSink, regions: usize) -> Result<()> {
-    for region in 0..regions {
-        let path = root.join(assignment_ids_rel(sink, region as u32));
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(sextant_error(
-                    CALYX_INDEX_IO,
-                    format!("remove stale ids {}: {e}", path.display()),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn assignment_ids_rel(sink: AssignmentSink, region: u32) -> String {

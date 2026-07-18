@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "calyx-cli"
 version.workspace = true
 edition.workspace = true
@@ -19,7 +20,16 @@ default = []
 # compiled out. Platform limits belong in the owning crate (calyx-sextant
 # target-gates cuVS to Linux), and what actually got compiled is proven via
 # build-info `capabilities`, not feature names.
-cuda = ["calyx-forge/cuda", "calyx-registry/cuda", "calyx-sextant/cuda"]
+cuda = [
+    "calyx-assay/cuda",
+    "calyx-aster/cuda",
+    "calyx-forge/cuda",
+    "calyx-loom/cuda",
+    "calyx-oracle/cuda",
+    "calyx-registry/cuda",
+    "calyx-search/cuda",
+    "calyx-sextant/cuda",
+]
 
 [build-dependencies]
 calyx-buildinfo = { path = "../calyx-buildinfo" }
@@ -51,6 +61,7 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+signal-hook.workspace = true
 ulid.workspace = true
 ureq.workspace = true
 
@@ -59,8 +70,69 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
 [dev-dependencies]
+axum = "0.8"
+calyx-mcp = { path = "../calyx-mcp" }
 calyx-testkit = { path = "../calyx-testkit" }
+calyx-web-api = { path = "../calyx-web-api" }
+http-body-util = "0.1"
 proptest.workspace = true
+socket2 = "0.6.4"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+
+[[test]]
+name = "issue1513_mcp_cli_web_parity_fsv"
+path = "tests/issue1513_mcp_cli_web_parity_fsv.rs"
+
+# BEGIN generated integration harnesses (issue #1546)
+
+[[test]]
+name = "__calyx_integration_isolated_ingest_resident_discovery_fsv"
+path = "tests/__calyx_integration_isolated_ingest_resident_discovery_fsv.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_ingest_resident_service_fsv"
+path = "tests/__calyx_integration_isolated_ingest_resident_service_fsv.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_ingest_resident_worker_fsv"
+path = "tests/__calyx_integration_isolated_ingest_resident_worker_fsv.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_issue918_search_provenance"
+path = "tests/__calyx_integration_isolated_issue918_search_provenance.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_ph62_workflow_healthcheck"
+path = "tests/__calyx_integration_isolated_ph62_workflow_healthcheck.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_search_resident_service_fsv"
+path = "tests/__calyx_integration_isolated_search_resident_service_fsv.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_verify_chain"
+path = "tests/__calyx_integration_isolated_verify_chain.rs"
+
+[[test]]
+name = "__calyx_integration_process_0"
+path = "tests/__calyx_integration_process_0.rs"
+
+[[test]]
+name = "__calyx_integration_process_1"
+path = "tests/__calyx_integration_process_1.rs"
+
+[[test]]
+name = "__calyx_integration_process_2"
+path = "tests/__calyx_integration_process_2.rs"
+
+[[test]]
+name = "__calyx_integration_suite_0"
+path = "tests/__calyx_integration_suite_0.rs"
+
+# END generated integration harnesses (issue #1546)

@@ -29,8 +29,7 @@ pub(super) fn warm_preflight(
         record.declared_template_vram_mib = Some(declared_template_vram_mib);
         record.estimated_resident_vram_mib = Some(estimated_resident_vram_mib);
         record.max_resident_vram_mib = Some(max_resident_vram_mib);
-        record.resident_overhead_multiplier =
-            Some(multiplier_to_f32(resident_overhead_multiplier_milli));
+        record.resident_overhead_multiplier_milli = Some(resident_overhead_multiplier_milli);
         log.append(&record)?;
     }
     if estimated_resident_vram_mib > max_resident_vram_mib {
@@ -39,7 +38,7 @@ pub(super) fn warm_preflight(
              resident_overhead_multiplier={} estimated_resident_vram_mib={estimated_resident_vram_mib} \
              max_resident_vram_mib={max_resident_vram_mib} lens_count={} semantic_lens_count={semantic_lenses}; \
              this would exceed the Blackwell RTX 5090 22GiB resident target before inference",
-            multiplier_to_f32(resident_overhead_multiplier_milli),
+            format_multiplier_milli(resident_overhead_multiplier_milli),
             template.lenses.len(),
         );
         if let Some(log) = progress_log {
@@ -49,8 +48,7 @@ pub(super) fn warm_preflight(
             record.declared_template_vram_mib = Some(declared_template_vram_mib);
             record.estimated_resident_vram_mib = Some(estimated_resident_vram_mib);
             record.max_resident_vram_mib = Some(max_resident_vram_mib);
-            record.resident_overhead_multiplier =
-                Some(multiplier_to_f32(resident_overhead_multiplier_milli));
+            record.resident_overhead_multiplier_milli = Some(resident_overhead_multiplier_milli);
             record.error_code = Some(WARM_VRAM_BUDGET.to_string());
             record.error_message = Some(message.clone());
             record.remediation = Some(
@@ -140,10 +138,10 @@ pub(super) fn estimate_resident_vram_mib(declared_bytes: u64, multiplier_milli: 
     ((adjusted_bytes.saturating_add(mib - 1)) / mib) as u64
 }
 
-fn bytes_to_mib_ceil(bytes: u64) -> u64 {
+pub(super) fn bytes_to_mib_ceil(bytes: u64) -> u64 {
     bytes.saturating_add((1024 * 1024) - 1) / (1024 * 1024)
 }
 
-pub(super) fn multiplier_to_f32(multiplier_milli: u64) -> f32 {
-    multiplier_milli as f32 / 1000.0
+pub(super) fn format_multiplier_milli(multiplier_milli: u64) -> String {
+    format!("{}.{:03}", multiplier_milli / 1000, multiplier_milli % 1000)
 }

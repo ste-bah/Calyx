@@ -43,6 +43,41 @@ pub struct ClosureAssignmentStats {
     pub replica_histogram: Vec<u64>,
 }
 
+/// Persisted readback for the pre-region partition build phases (#1515).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PartitionBuildDiagnostics {
+    pub backend: String,
+    pub strict_gpu_required: bool,
+    pub row_count: u64,
+    pub dim: usize,
+    pub sample_rows: usize,
+    pub initial_centroids: usize,
+    pub final_centroids: usize,
+    pub chunk_rows: usize,
+    pub resident_corpus: bool,
+    pub resident_reused_across_scans: bool,
+    pub kmeans_calls: usize,
+    pub routing_calls: usize,
+    pub corpus_passes: usize,
+    pub corpus_uploads: usize,
+    pub rows_uploaded: u64,
+    pub h2d_transfers: usize,
+    pub d2h_transfers: usize,
+    pub h2d_bytes: u64,
+    pub d2h_bytes: u64,
+    pub peak_device_bytes: u64,
+    pub peak_pinned_host_bytes: u64,
+    pub requested_boundary_epsilon: f32,
+    pub effective_boundary_epsilon: f32,
+    pub centroid_sample_support: f32,
+    pub centroid_training_us: u128,
+    pub provisional_assignment_us: u128,
+    pub balance_us: u128,
+    pub final_assignment_us: u128,
+    pub pre_region_build_us: u128,
+    pub end_to_end_build_us: u128,
+}
+
 impl ClosureAssignmentStats {
     /// Stored copies per row (1.0 = no replication happened).
     pub fn replication_factor(&self) -> f64 {
@@ -93,6 +128,9 @@ pub struct PartitionedManifest {
     pub region_balance_cap: usize,
     #[serde(default)]
     pub stored_region_members: usize,
+    /// `None` for CPU builds and vaults written before #1515.
+    #[serde(default)]
+    pub partition_build_diagnostics: Option<PartitionBuildDiagnostics>,
     pub centroids_rel: String,
     pub root_graph_rel: String,
     pub regions: Vec<RegionMeta>,

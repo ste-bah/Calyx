@@ -126,6 +126,7 @@ fn parse_provenance_ops_commands() {
             vault: "mydb".to_string(),
             answer_id: "answer-1".to_string(),
             record: true,
+            resident_addr: None,
         })
     );
     assert_eq!(
@@ -134,19 +135,20 @@ fn parse_provenance_ops_commands() {
             vault: "mydb".to_string(),
             answer_id: "answer-1".to_string(),
             record: false,
+            resident_addr: None,
         })
     );
 }
 
 #[test]
 fn known_subcommand_help_bypasses_required_arg_validation() {
-    let result = try_run(&tokens(["probe-matrix", "--help"]))
-        .expect("known command should be handled by cmd dispatcher");
-    assert!(result.is_ok(), "{result:?}");
-
-    let result =
-        try_run(&tokens(["probe-matrix", "-h"])).expect("short help flag should be handled");
-    assert!(result.is_ok(), "{result:?}");
+    for command in ["probe-matrix", "readback", "spectral-communities"] {
+        for flag in ["--help", "-h"] {
+            let result = try_run(&tokens([command, flag]))
+                .expect("known command should be handled by cmd dispatcher");
+            assert!(result.is_ok(), "{command} {flag}: {result:?}");
+        }
+    }
 }
 
 #[test]
@@ -249,6 +251,7 @@ fn arb_subcommand() -> impl Strategy<Value = Subcommand> {
             resident_addr: None,
             allow_cold_gpu_workers: false,
             session_id: None,
+            precondition: IngestPrecondition::default(),
         })),
         safe_name().prop_map(|vault| Subcommand::Measure(MeasureArgs {
             vault,
@@ -269,6 +272,7 @@ fn arb_subcommand() -> impl Strategy<Value = Subcommand> {
             fusion: search::SearchFusionArg::Rrf,
             guard: search::SearchGuardArg::Off,
             explain: false,
+            rerank: false,
             provenance: true,
             freshness: search::SearchFreshnessArg::Fresh,
             filter: None,
@@ -279,6 +283,10 @@ fn arb_subcommand() -> impl Strategy<Value = Subcommand> {
             query: "roundtrip".to_string(),
             anchor: None,
             explain: false,
+            resident_addr: None,
+            max_hops: search::DEFAULT_KERNEL_MAX_HOPS,
+            citation_target: None,
+            citation_collection: "legal-citations-v2".to_string(),
         })),
         safe_name().prop_map(|vault| Subcommand::Bits(intelligence::BitsArgs {
             vault,
@@ -315,6 +323,7 @@ fn arb_subcommand() -> impl Strategy<Value = Subcommand> {
             vault,
             answer_id: "answer-1".to_string(),
             record: false,
+            resident_addr: None,
         })),
         safe_name()
             .prop_map(|vault| Subcommand::AnnealStatus(provenance::AnnealStatusArgs { vault })),
@@ -347,6 +356,7 @@ fn arb_subcommand() -> impl Strategy<Value = Subcommand> {
                 held_out_fraction: 0.5,
                 top_k,
                 min_recall: 0.95,
+                ..kernel_build::KernelBuildArgs::default()
             })
         }),
         (safe_name(), 1usize..16).prop_map(|(vault, top_k)| {

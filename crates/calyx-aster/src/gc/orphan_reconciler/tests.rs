@@ -151,12 +151,18 @@ fn vault_target_repairs_real_cf_rows_and_queues_base_rebuild_once() {
         .unwrap()
         .len();
     let report = reconciler.scan(&target).unwrap();
+    let before_repair_seq = vault.latest_seq();
     let repair = reconciler.repair(&target, &report).unwrap();
 
     assert_eq!(before_slot_rows, 6);
     assert_eq!(report.orphan_index, vec![cx(6), cx(7), cx(8)]);
     assert_eq!(report.orphan_base, vec![cx(4), cx(5)]);
     assert_eq!(repair.repairs_total, 5);
+    assert_eq!(
+        vault.latest_seq() - before_repair_seq,
+        2,
+        "one index batch plus one Base batch, not one commit per orphan"
+    );
     let after_slot_rows = vault
         .scan_cf_at(vault.latest_seq(), ColumnFamily::slot(slot))
         .unwrap();
@@ -209,6 +215,180 @@ fn vault_target_repairs_real_cf_rows_and_queues_base_rebuild_once() {
     );
 }
 
+#[test]
+fn vault_target_batches_one_thousand_real_orphans_into_eight_commits() {
+    let vault = AsterVault::with_clock(vault_id(), b"issue1548-scale", FixedClock::new(1_548));
+    let slots = (0..10).map(SlotId::new).collect::<Vec<_>>();
+    let ids = (0..1_000).map(scaled_cx).collect::<Vec<_>>();
+    let rows = ids
+        .iter()
+        .flat_map(|cx_id| {
+            slots.iter().map(move |slot| {
+                (
+                    ColumnFamily::slot(*slot),
+                    slot_key(*cx_id),
+                    vec![slot.get() as u8],
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    vault.write_cf_batch(rows).unwrap();
+    let target = VaultOrphanGcTarget::new(&vault, slots.clone());
+    let reconciler = OrphanReconciler::new(Duration::ZERO, 1_000);
+    let report = reconciler.scan(&target).unwrap();
+    assert_eq!(report.orphan_index.len(), 1_000);
+    assert_eq!(report.orphan_index_entries.len(), 10_000);
+    let before = vault.latest_seq();
+    eprintln!(
+        "ISSUE1548_SCALE before_seq={before} orphan_ids={} orphan_rows={}",
+        report.orphan_index.len(),
+        report.orphan_index_entries.len()
+    );
+
+    reset_orphan_io_counts();
+    let repaired = reconciler.repair(&target, &report).unwrap();
+
+    let after = vault.latest_seq();
+    assert_eq!(repaired.orphan_index_repaired, 1_000);
+    assert_eq!(after - before, 8, "ceil(1000 / 128) repair commits");
+    for slot in &slots {
+        assert!(
+            vault
+                .scan_cf_at(after, ColumnFamily::slot(*slot))
+                .unwrap()
+                .is_empty(),
+            "slot CF {} must be physically absent at the read snapshot",
+            slot.get()
+        );
+    }
+    let ledger = vault
+        .scan_cf_at(after, ColumnFamily::Ledger)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, bytes)| decode_ledger(&bytes).ok())
+        .filter(|entry| {
+            serde_json::from_slice::<serde_json::Value>(&entry.payload)
+                .ok()
+                .and_then(|payload| payload["event"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("orphan_index_purged")
+        })
+        .count();
+    assert_eq!(ledger, 1_000);
+    let counts = orphan_io_counts();
+    assert_eq!(counts.report_entry_visits, 10_000);
+    assert_eq!(counts.point_reads, 11_000);
+    assert_eq!(counts.group_commits, 8);
+    assert_eq!(counts.ledger_entries, 1_000);
+    assert_eq!(counts.ledger_commits, 8);
+    assert_eq!(counts.flushes, 8);
+    assert_eq!(counts.committed_rows, 10_000);
+    assert_eq!(counts.max_chunk_rows, 1_280);
+    assert_eq!(counts.compaction_calls.len(), 10);
+    assert!(counts.compaction_calls.values().all(|calls| *calls == 1));
+    eprintln!(
+        "ISSUE1548_SCALE after_seq={after} commit_delta={} remaining_slot_rows=0 ledger_events={ledger} report_entry_visits={} point_reads={} flushes={} compaction_cfs={} compactions_per_cf=1 max_chunk_rows={} max_chunk_bytes={}",
+        after - before,
+        counts.report_entry_visits,
+        counts.point_reads,
+        counts.flushes,
+        counts.compaction_calls.len(),
+        counts.max_chunk_rows,
+        counts.max_chunk_bytes,
+    );
+}
+
+#[test]
+fn vault_target_compacts_one_slot_cf_once_after_all_chunks() {
+    let vault = AsterVault::with_clock(
+        vault_id(),
+        b"issue1548-one-final-compaction",
+        FixedClock::new(1_548),
+    );
+    let slot = SlotId::new(0);
+    let rows = (0..1_000).map(|index| {
+        (
+            ColumnFamily::slot(slot),
+            slot_key(scaled_cx(index)),
+            vec![(index % 251) as u8],
+        )
+    });
+    vault.write_cf_batch(rows).unwrap();
+    let target = VaultOrphanGcTarget::new(&vault, [slot]);
+    let reconciler = OrphanReconciler::new(Duration::ZERO, 1_000);
+    let report = reconciler.scan(&target).unwrap();
+
+    reset_orphan_io_counts();
+    let repaired = reconciler.repair(&target, &report).unwrap();
+
+    let counts = orphan_io_counts();
+    assert_eq!(repaired.orphan_index_repaired, 1_000);
+    assert_eq!(counts.report_entry_visits, 1_000);
+    assert_eq!(counts.group_commits, 8);
+    assert_eq!(counts.compaction_calls.len(), 1);
+    assert_eq!(counts.compaction_calls.values().copied().next(), Some(1));
+    assert!(
+        vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::slot(slot))
+            .unwrap()
+            .is_empty()
+    );
+    eprintln!("ISSUE1548_ONE_CF orphan_ids=1000 commits=8 compaction_calls=1 remaining_rows=0");
+}
+
+#[test]
+fn vault_target_revalidates_disappeared_orphan_without_consuming_budget() {
+    let vault = AsterVault::with_clock(vault_id(), b"issue1548-race", FixedClock::new(1_548));
+    let slot = SlotId::new(0);
+    vault
+        .write_cf_batch([
+            (ColumnFamily::slot(slot), slot_key(cx(1)), vec![1]),
+            (ColumnFamily::slot(slot), slot_key(cx(2)), vec![2]),
+        ])
+        .unwrap();
+    let target = VaultOrphanGcTarget::new(&vault, [slot]).without_auto_compaction();
+    let reconciler = OrphanReconciler::new(Duration::ZERO, 1);
+    let report = reconciler.scan(&target).unwrap();
+    assert_eq!(report.orphan_index, vec![cx(1), cx(2)]);
+    vault
+        .write_cf(
+            ColumnFamily::Base,
+            base_key(cx(1)),
+            encode_constellation_base(&constellation(1, &[slot])).unwrap(),
+        )
+        .unwrap();
+    eprintln!(
+        "ISSUE1548_RACE before cx1_base=true cx1_slot=true cx2_base=false cx2_slot=true budget=1"
+    );
+
+    let repaired = reconciler.repair(&target, &report).unwrap();
+
+    assert_eq!(repaired.orphan_index_repaired, 1);
+    assert!(
+        vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::slot(slot),
+                &slot_key(cx(1))
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::slot(slot),
+                &slot_key(cx(2))
+            )
+            .unwrap()
+            .is_none()
+    );
+    eprintln!(
+        "ISSUE1548_RACE after cx1_base=true cx1_slot=true cx2_base=false cx2_slot=false repaired=1"
+    );
+}
+
 fn base(seed: u8, slots: &[u16]) -> OrphanBaseEntry {
     OrphanBaseEntry {
         cx_id: cx(seed),
@@ -226,6 +406,14 @@ fn slot_entry(seed: u8, slot: u16) -> OrphanIndexEntry {
 
 fn cx(seed: u8) -> CxId {
     CxId::from_bytes([seed; 16])
+}
+
+fn scaled_cx(seed: u16) -> CxId {
+    let [high, low] = seed.to_be_bytes();
+    let mut bytes = [0_u8; 16];
+    bytes[0] = high;
+    bytes[1] = low;
+    CxId::from_bytes(bytes)
 }
 
 fn vault_id() -> VaultId {

@@ -1,0 +1,1251 @@
+{
+  "counts": {
+    "citations": 12,
+    "found": 10,
+    "low_support": 1,
+    "not_in_corpus": 2,
+    "reviewed_agreement": 12
+  },
+  "rows": [
+    {
+      "case_name": "Cleveland v. McCruel",
+      "citation_id": "C01",
+      "citation_text": "Cleveland v. McCruel, 8th Dist. Cuyahoga No. 103971, 2017-Ohio-182.",
+      "citation_walk": {
+        "citation_id": "C01",
+        "frontier_exit_count": 6,
+        "internal_edges_examined": 0,
+        "maximum_graph_hop": 0,
+        "nodes_by_hop": {
+          "0": 1
+        },
+        "reachable_canonical_opinion_count": 1,
+        "start_canonical_opinion_id": 4117067,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "103971",
+      "exact_ingest_match_count": 1,
+      "expected_cx_id": "8f9b8ff1e2ed614e732c0e0f4e1ac62b",
+      "identity_latency_ms": 24631,
+      "known_item_latency_ms": 25158,
+      "known_item_rank": 1,
+      "known_item_score": 0.100690246,
+      "nearest_returned_cx_id": "8f9b8ff1e2ed614e732c0e0f4e1ac62b",
+      "proposition": "An order placing a defendant in a statutory pretrial-diversion program is immediately appealable when it affects the state's substantial right to complete the prosecution.",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24864,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.86892235,
+          "proposition_raw": 0.7764182,
+          "raw_gain": -0.09250415000000001,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.7083954,
+          "proposition_raw": 0.488393,
+          "raw_gain": -0.2200024,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.9952043,
+          "proposition_raw": 0.8512233,
+          "raw_gain": -0.14398100000000003,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 10.515279,
+          "proposition_raw": 18.971296,
+          "raw_gain": 8.456017,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.24289677,
+          "proposition_raw": 0.6416443,
+          "raw_gain": 0.39874752999999996,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.81896675,
+          "proposition_raw": 0.70918447,
+          "raw_gain": -0.10978228000000001,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.79914325,
+          "proposition_raw": 0.60186374,
+          "raw_gain": -0.19727951,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.52624595,
+          "proposition_raw": 0.4848077,
+          "raw_gain": -0.041438249999999954,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.64915603,
+          "proposition_raw": 0.47024357,
+          "raw_gain": -0.17891246,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.5497562,
+          "proposition_raw": 0.2927248,
+          "raw_gain": -0.2570314,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 0.8063247531578946,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 4117067
+    },
+    {
+      "case_name": "State v. Slater",
+      "citation_id": "C02",
+      "citation_text": "State v. Slater, 8th Dist. Cuyahoga No. 101358, 2014-Ohio-5552.",
+      "citation_walk": {
+        "citation_id": "C02",
+        "frontier_exit_count": 73,
+        "internal_edges_examined": 8,
+        "maximum_graph_hop": 3,
+        "nodes_by_hop": {
+          "0": 1,
+          "1": 3,
+          "2": 3,
+          "3": 1
+        },
+        "reachable_canonical_opinion_count": 8,
+        "start_canonical_opinion_id": 2762313,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "101358",
+      "exact_ingest_match_count": 1,
+      "expected_cx_id": "715fa4629a3a21cb7a2264dacec7f45f",
+      "identity_latency_ms": 24622,
+      "known_item_latency_ms": 24588,
+      "known_item_rank": 1,
+      "known_item_score": 0.10552451,
+      "nearest_returned_cx_id": "715fa4629a3a21cb7a2264dacec7f45f",
+      "proposition": "A presentence plea-withdrawal request may be denied when a knowing and voluntary plea is followed only by a change of heart.",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24741,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.8587737,
+          "proposition_raw": 0.75347483,
+          "raw_gain": -0.10529886999999993,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.6559666,
+          "proposition_raw": 0.41544774,
+          "raw_gain": -0.24051885999999995,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 1.590663,
+          "proposition_raw": 0.20043781,
+          "raw_gain": -1.39022519,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 8.708558,
+          "proposition_raw": 13.846545,
+          "raw_gain": 5.137987000000001,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.12772654,
+          "proposition_raw": 0.68374896,
+          "raw_gain": 0.5560224199999999,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7914997,
+          "proposition_raw": 0.7019452,
+          "raw_gain": -0.08955449999999998,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.711357,
+          "proposition_raw": 0.51647615,
+          "raw_gain": -0.19488085,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.60381925,
+          "proposition_raw": 0.57567555,
+          "raw_gain": -0.028143699999999994,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.6279968,
+          "proposition_raw": 0.42019778,
+          "raw_gain": -0.20779902,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.42706093,
+          "proposition_raw": 0.14741276,
+          "raw_gain": -0.27964817,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 0.33795681000000005,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 2762313
+    },
+    {
+      "case_name": "State v. Torres",
+      "citation_id": "C03",
+      "citation_text": "State v. Torres, 8th Dist. Cuyahoga No. 111037, 2022-Ohio-3230.",
+      "citation_walk": {
+        "citation_id": "C03",
+        "frontier_exit_count": 8096,
+        "internal_edges_examined": 1371,
+        "maximum_graph_hop": 10,
+        "nodes_by_hop": {
+          "0": 1,
+          "1": 6,
+          "10": 3,
+          "2": 16,
+          "3": 52,
+          "4": 132,
+          "5": 156,
+          "6": 110,
+          "7": 53,
+          "8": 26,
+          "9": 8
+        },
+        "reachable_canonical_opinion_count": 563,
+        "start_canonical_opinion_id": 8206604,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "111037",
+      "exact_ingest_match_count": 1,
+      "expected_cx_id": "315c3940ea2c8c04eaf47023fd5deded",
+      "identity_latency_ms": 24777,
+      "known_item_latency_ms": 24616,
+      "known_item_rank": 5,
+      "known_item_score": 0.1001966,
+      "nearest_returned_cx_id": "cae1a17cd7f0a697e0c21c65d65d599e",
+      "proposition": "Newly discovered evidence warrants a new trial only when it creates a strong probability of changing the result and satisfies the remaining Petro factors.",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24613,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.8449995,
+          "proposition_raw": 0.7570882,
+          "raw_gain": -0.08791130000000003,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.6166712,
+          "proposition_raw": 0.4171955,
+          "raw_gain": -0.19947569999999998,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 1.2685645,
+          "proposition_raw": 0.07636393,
+          "raw_gain": -1.19220057,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 7.9040728,
+          "proposition_raw": 12.917959,
+          "raw_gain": 5.0138862,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.17097826,
+          "proposition_raw": 0.39663962,
+          "raw_gain": 0.22566136000000003,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.75476813,
+          "proposition_raw": 0.59214306,
+          "raw_gain": -0.16262506999999993,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7410389,
+          "proposition_raw": 0.45872155,
+          "raw_gain": -0.28231734999999997,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.5480865,
+          "proposition_raw": 0.4755693,
+          "raw_gain": -0.07251720000000006,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.6635215,
+          "proposition_raw": 0.393121,
+          "raw_gain": -0.2704005,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.47565866,
+          "proposition_raw": 0.21540989,
+          "raw_gain": -0.26024877,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 0.29008492105263156,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 8206604
+    },
+    {
+      "case_name": "State v. Harrowfield",
+      "citation_id": "C04",
+      "citation_text": "State v. Harrowfield, 8th Dist. Cuyahoga No. 113947, 2024-Ohio-4871.",
+      "citation_walk": null,
+      "corpus_verdict": "NOT_IN_CORPUS",
+      "docket_number": "113947",
+      "exact_ingest_match_count": 0,
+      "expected_cx_id": null,
+      "identity_latency_ms": null,
+      "known_item_latency_ms": 24624,
+      "known_item_rank": null,
+      "known_item_score": null,
+      "nearest_returned_cx_id": "a822ba90d267e7eab4ff194f460d7a8e",
+      "proposition": "Police must obtain a second warrant before viewing any cloud backup synchronized after a phone is seized.",
+      "reviewed_agreement": true,
+      "reviewed_class": "fabricated",
+      "support_latency_ms": null,
+      "support_per_lens": [],
+      "support_rank": null,
+      "support_score": null,
+      "support_verdict": "NOT_APPLICABLE",
+      "target_opinion_id": null
+    },
+    {
+      "case_name": "State v. Wachee",
+      "citation_id": "C05",
+      "citation_text": "State v. Wachee, 8th Dist. Cuyahoga No. 110117, 2021-Ohio-4427.",
+      "citation_walk": {
+        "citation_id": "C05",
+        "frontier_exit_count": 6157,
+        "internal_edges_examined": 957,
+        "maximum_graph_hop": 11,
+        "nodes_by_hop": {
+          "0": 1,
+          "1": 2,
+          "10": 8,
+          "11": 5,
+          "2": 6,
+          "3": 14,
+          "4": 20,
+          "5": 48,
+          "6": 91,
+          "7": 118,
+          "8": 77,
+          "9": 36
+        },
+        "reachable_canonical_opinion_count": 426,
+        "start_canonical_opinion_id": 5136011,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "110117",
+      "exact_ingest_match_count": 2,
+      "expected_cx_id": "2b52799bfc3571fe900eeb33e9705840",
+      "identity_latency_ms": 24473,
+      "known_item_latency_ms": 24756,
+      "known_item_rank": 1,
+      "known_item_score": 0.10602855,
+      "nearest_returned_cx_id": "2b52799bfc3571fe900eeb33e9705840",
+      "proposition": "An App.R. 26(B) applicant must support proposed errors with record-based facts showing a genuine, colorable claim of ineffective appellate assistance.",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24711,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.87052095,
+          "proposition_raw": 0.80730146,
+          "raw_gain": -0.06321948999999993,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.6455736,
+          "proposition_raw": 0.41542834,
+          "raw_gain": -0.23014525999999996,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 1.1418556,
+          "proposition_raw": 0.37158394,
+          "raw_gain": -0.7702716599999999,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 8.931445,
+          "proposition_raw": 16.193235,
+          "raw_gain": 7.261790000000001,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.24347006,
+          "proposition_raw": 0.5906654,
+          "raw_gain": 0.34719534,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.80720544,
+          "proposition_raw": 0.66018593,
+          "raw_gain": -0.14701951000000002,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7366534,
+          "proposition_raw": 0.6668873,
+          "raw_gain": -0.06976610000000005,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.59193254,
+          "proposition_raw": 0.5673517,
+          "raw_gain": -0.024580839999999937,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.6681034,
+          "proposition_raw": 0.39222962,
+          "raw_gain": -0.27587378,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.52748585,
+          "proposition_raw": 0.4142738,
+          "raw_gain": -0.11321205000000001,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 0.6259480415789476,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 5136011
+    },
+    {
+      "case_name": "State v. Burton",
+      "citation_id": "C06",
+      "citation_text": "State v. Burton, 8th Dist. Cuyahoga No. 107054, 2019-Ohio-2431.",
+      "citation_walk": {
+        "citation_id": "C06",
+        "frontier_exit_count": 162,
+        "internal_edges_examined": 5,
+        "maximum_graph_hop": 5,
+        "nodes_by_hop": {
+          "0": 1,
+          "1": 1,
+          "2": 1,
+          "3": 1,
+          "4": 1,
+          "5": 1
+        },
+        "reachable_canonical_opinion_count": 6,
+        "start_canonical_opinion_id": 4408729,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "107054",
+      "exact_ingest_match_count": 2,
+      "expected_cx_id": "663676562e08e5e43208cae9b0173cc2",
+      "identity_latency_ms": 24561,
+      "known_item_latency_ms": 24584,
+      "known_item_rank": 1,
+      "known_item_score": 0.10336955,
+      "nearest_returned_cx_id": "663676562e08e5e43208cae9b0173cc2",
+      "proposition": "Counsel's failure to file a suppression motion is not automatically deficient; the record must show that the motion had a reasonable probability of success.",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24756,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.8403636,
+          "proposition_raw": 0.75887746,
+          "raw_gain": -0.08148613999999998,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.5847082,
+          "proposition_raw": 0.42073286,
+          "raw_gain": -0.16397534000000002,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.8639464,
+          "proposition_raw": 0.0062578283,
+          "raw_gain": -0.8576885717,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 8.571691,
+          "proposition_raw": 12.3140955,
+          "raw_gain": 3.742404500000001,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.124370605,
+          "proposition_raw": 0.20206855,
+          "raw_gain": 0.07769794500000002,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7770025,
+          "proposition_raw": 0.5451896,
+          "raw_gain": -0.2318129,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.718331,
+          "proposition_raw": 0.53791124,
+          "raw_gain": -0.18041976000000004,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.5657206,
+          "proposition_raw": 0.521131,
+          "raw_gain": -0.04458960000000001,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.66015756,
+          "proposition_raw": 0.4211254,
+          "raw_gain": -0.23903216000000005,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.479173,
+          "proposition_raw": 0.13548268,
+          "raw_gain": -0.34369032,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 0.18085797087368435,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 4408729
+    },
+    {
+      "case_name": "State v. Mercer-Lane",
+      "citation_id": "C07",
+      "citation_text": "State v. Mercer-Lane, 8th Dist. Cuyahoga No. 112608, 2023-Ohio-4412.",
+      "citation_walk": null,
+      "corpus_verdict": "NOT_IN_CORPUS",
+      "docket_number": "112608",
+      "exact_ingest_match_count": 0,
+      "expected_cx_id": null,
+      "identity_latency_ms": null,
+      "known_item_latency_ms": 24530,
+      "known_item_rank": null,
+      "known_item_score": null,
+      "nearest_returned_cx_id": "74b35747ad3925f454536d7f005e8a41",
+      "proposition": "Kidnapping and a sexual offense merge categorically whenever they occur during the same encounter.",
+      "reviewed_agreement": true,
+      "reviewed_class": "fabricated",
+      "support_latency_ms": null,
+      "support_per_lens": [],
+      "support_rank": null,
+      "support_score": null,
+      "support_verdict": "NOT_APPLICABLE",
+      "target_opinion_id": null
+    },
+    {
+      "case_name": "State v. Radney",
+      "citation_id": "C08",
+      "citation_text": "State v. Radney, 8th Dist. Cuyahoga No. 103869, 2016-Ohio-5328.",
+      "citation_walk": {
+        "citation_id": "C08",
+        "frontier_exit_count": 4435,
+        "internal_edges_examined": 722,
+        "maximum_graph_hop": 10,
+        "nodes_by_hop": {
+          "0": 1,
+          "1": 3,
+          "10": 4,
+          "2": 6,
+          "3": 26,
+          "4": 54,
+          "5": 55,
+          "6": 79,
+          "7": 65,
+          "8": 25,
+          "9": 10
+        },
+        "reachable_canonical_opinion_count": 328,
+        "start_canonical_opinion_id": 4023653,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "103869",
+      "exact_ingest_match_count": 1,
+      "expected_cx_id": "910e6db8e6bd7c1dbaffb6cfa84d6187",
+      "identity_latency_ms": 24663,
+      "known_item_latency_ms": 24670,
+      "known_item_rank": 1,
+      "known_item_score": 0.10655737,
+      "nearest_returned_cx_id": "910e6db8e6bd7c1dbaffb6cfa84d6187",
+      "proposition": "Kidnapping under R.C. 2905.01(A)(4) is mitigated to a second-degree felony when the accused proves the victim was released in a safe place unharmed.",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24551,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.8411092,
+          "proposition_raw": 0.8096308,
+          "raw_gain": -0.03147840000000002,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.6337463,
+          "proposition_raw": 0.5227453,
+          "raw_gain": -0.11100100000000002,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 1.1436938,
+          "proposition_raw": 0.09766445,
+          "raw_gain": -1.0460293500000002,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 8.286546,
+          "proposition_raw": 23.527378,
+          "raw_gain": 15.240832,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.14311221,
+          "proposition_raw": 0.6366808,
+          "raw_gain": 0.4935685900000001,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.80271035,
+          "proposition_raw": 0.6681759,
+          "raw_gain": -0.13453444999999997,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.75168854,
+          "proposition_raw": 0.5962648,
+          "raw_gain": -0.15542373999999992,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.5668672,
+          "proposition_raw": 0.5739012,
+          "raw_gain": 0.007033999999999985,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.62932014,
+          "proposition_raw": 0.5013452,
+          "raw_gain": -0.12797493999999998,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.54730844,
+          "proposition_raw": 0.21506523,
+          "raw_gain": -0.33224321,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 1.4545777578947368,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 4023653
+    },
+    {
+      "case_name": "State v. Delvallie",
+      "citation_id": "C09",
+      "citation_text": "State v. Delvallie, 8th Dist. Cuyahoga No. 109315, 2022-Ohio-470.",
+      "citation_walk": {
+        "citation_id": "C09",
+        "frontier_exit_count": 10147,
+        "internal_edges_examined": 1640,
+        "maximum_graph_hop": 10,
+        "nodes_by_hop": {
+          "0": 1,
+          "1": 9,
+          "10": 5,
+          "2": 15,
+          "3": 50,
+          "4": 104,
+          "5": 155,
+          "6": 178,
+          "7": 119,
+          "8": 56,
+          "9": 20
+        },
+        "reachable_canonical_opinion_count": 712,
+        "start_canonical_opinion_id": 6227032,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "109315",
+      "exact_ingest_match_count": 2,
+      "expected_cx_id": "334b319e9fae2ca1931a3e39a227741c",
+      "identity_latency_ms": 24607,
+      "known_item_latency_ms": 24760,
+      "known_item_rank": 1,
+      "known_item_score": 0.10602854,
+      "nearest_returned_cx_id": "334b319e9fae2ca1931a3e39a227741c",
+      "proposition": "A defendant must prove beyond a reasonable doubt that the Reagan Tokes statutory framework violates due process or the separation-of-powers doctrine.",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24647,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.8592695,
+          "proposition_raw": 0.815352,
+          "raw_gain": -0.043917500000000054,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.6452079,
+          "proposition_raw": 0.58201754,
+          "raw_gain": -0.06319035999999989,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 1.0483284,
+          "proposition_raw": 0.553096,
+          "raw_gain": -0.4952323999999999,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 9.754894,
+          "proposition_raw": 19.072382,
+          "raw_gain": 9.317488,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.109031156,
+          "proposition_raw": 0.37257493,
+          "raw_gain": 0.263543774,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7786694,
+          "proposition_raw": 0.7497273,
+          "raw_gain": -0.02894209999999997,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7333356,
+          "proposition_raw": 0.59886146,
+          "raw_gain": -0.13447414000000002,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.5961738,
+          "proposition_raw": 0.5308019,
+          "raw_gain": -0.06537189999999993,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.6414076,
+          "proposition_raw": 0.50242555,
+          "raw_gain": -0.13898204999999997,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.4552211,
+          "proposition_raw": 0.29346472,
+          "raw_gain": -0.16175637999999998,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 0.8916972309473685,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 6227032
+    },
+    {
+      "case_name": "State v. Anderson",
+      "citation_id": "C10",
+      "citation_text": "State v. Anderson, 8th Dist. Cuyahoga No. 112514, 2024-Ohio-843.",
+      "citation_walk": {
+        "citation_id": "C10",
+        "frontier_exit_count": 16393,
+        "internal_edges_examined": 3469,
+        "maximum_graph_hop": 12,
+        "nodes_by_hop": {
+          "0": 1,
+          "1": 7,
+          "10": 32,
+          "11": 8,
+          "12": 2,
+          "2": 34,
+          "3": 112,
+          "4": 234,
+          "5": 223,
+          "6": 203,
+          "7": 143,
+          "8": 119,
+          "9": 81
+        },
+        "reachable_canonical_opinion_count": 1199,
+        "start_canonical_opinion_id": 9948768,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "112514",
+      "exact_ingest_match_count": 1,
+      "expected_cx_id": "05a08b1c775df61524c5439d9a81c006",
+      "identity_latency_ms": 24592,
+      "known_item_latency_ms": 24691,
+      "known_item_rank": 1,
+      "known_item_score": 0.10192017,
+      "nearest_returned_cx_id": "05a08b1c775df61524c5439d9a81c006",
+      "proposition": "Consecutive sentences are contrary to law when the trial court fails to make the proportionality finding required by R.C. 2929.14(C)(4).",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24688,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.85086393,
+          "proposition_raw": 0.76170766,
+          "raw_gain": -0.08915627000000004,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.6411649,
+          "proposition_raw": 0.4370637,
+          "raw_gain": -0.20410120000000004,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7298707,
+          "proposition_raw": 0.11995915,
+          "raw_gain": -0.60991155,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 8.241724,
+          "proposition_raw": 16.650969,
+          "raw_gain": 8.409245,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.2087776,
+          "proposition_raw": 0.20018114,
+          "raw_gain": -0.00859646,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.83419305,
+          "proposition_raw": 0.5930678,
+          "raw_gain": -0.24112524999999996,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7400678,
+          "proposition_raw": 0.5636945,
+          "raw_gain": -0.17637330000000007,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.5504825,
+          "proposition_raw": 0.53600097,
+          "raw_gain": -0.014481529999999965,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.6152655,
+          "proposition_raw": 0.3822454,
+          "raw_gain": -0.2330201,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.507318,
+          "proposition_raw": 0.39923808,
+          "raw_gain": -0.10807992000000005,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 0.7125239531578949,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 9948768
+    },
+    {
+      "case_name": "State v. Burton",
+      "citation_id": "C11",
+      "citation_text": "State v. Burton, 8th Dist. Cuyahoga No. 114052, 2025-Ohio-650.",
+      "citation_walk": {
+        "citation_id": "C11",
+        "frontier_exit_count": 20350,
+        "internal_edges_examined": 4165,
+        "maximum_graph_hop": 13,
+        "nodes_by_hop": {
+          "0": 1,
+          "1": 4,
+          "10": 36,
+          "11": 32,
+          "12": 13,
+          "13": 3,
+          "2": 19,
+          "3": 81,
+          "4": 235,
+          "5": 360,
+          "6": 330,
+          "7": 221,
+          "8": 92,
+          "9": 53
+        },
+        "reachable_canonical_opinion_count": 1480,
+        "start_canonical_opinion_id": 10813355,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "114052",
+      "exact_ingest_match_count": 1,
+      "expected_cx_id": "8fcb2df6dadf537ea545eb16dc867929",
+      "identity_latency_ms": 24696,
+      "known_item_latency_ms": 24560,
+      "known_item_rank": 1,
+      "known_item_score": 0.10477972,
+      "nearest_returned_cx_id": "8fcb2df6dadf537ea545eb16dc867929",
+      "proposition": "When postrelease-control notice was correctly given at the hearing but misstated in the journal entry, a nunc pro tunc entry may correct the clerical error.",
+      "reviewed_agreement": true,
+      "reviewed_class": "supported",
+      "support_latency_ms": 24612,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.83874404,
+          "proposition_raw": 0.77824295,
+          "raw_gain": -0.060501090000000035,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.57948273,
+          "proposition_raw": 0.4030762,
+          "raw_gain": -0.17640652999999995,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.88162386,
+          "proposition_raw": 1.2217932,
+          "raw_gain": 0.34016934,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 8.465182,
+          "proposition_raw": 14.330919,
+          "raw_gain": 5.865736999999999,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.1016647,
+          "proposition_raw": 0.345992,
+          "raw_gain": 0.24432730000000003,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.77725923,
+          "proposition_raw": 0.61685604,
+          "raw_gain": -0.16040318999999992,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7303539,
+          "proposition_raw": 0.5382818,
+          "raw_gain": -0.19207209999999997,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.5685036,
+          "proposition_raw": 0.54998237,
+          "raw_gain": -0.018521229999999944,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7026374,
+          "proposition_raw": 0.41616186,
+          "raw_gain": -0.28647554,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.4947441,
+          "proposition_raw": 0.29969126,
+          "raw_gain": -0.19505284,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": 0.567479122631579,
+      "support_verdict": "SUPPORTED",
+      "target_opinion_id": 10813355
+    },
+    {
+      "case_name": "State v. Bonnell",
+      "citation_id": "C12",
+      "citation_text": "State v. Bonnell, 8th Dist. Cuyahoga No. 96368, 2011-Ohio-5837.",
+      "citation_walk": {
+        "citation_id": "C12",
+        "frontier_exit_count": 16,
+        "internal_edges_examined": 0,
+        "maximum_graph_hop": 0,
+        "nodes_by_hop": {
+          "0": 1
+        },
+        "reachable_canonical_opinion_count": 1,
+        "start_canonical_opinion_id": 2704114,
+        "walk_complete": true
+      },
+      "corpus_verdict": "FOUND",
+      "docket_number": "96368",
+      "exact_ingest_match_count": 1,
+      "expected_cx_id": "0dac1b2f00404b57cfebaf298257f361",
+      "identity_latency_ms": 24601,
+      "known_item_latency_ms": 24675,
+      "known_item_rank": 1,
+      "known_item_score": 0.10589634,
+      "nearest_returned_cx_id": "0dac1b2f00404b57cfebaf298257f361",
+      "proposition": "Ohio recognizes entrapment whenever a confidential informant initiates contact with the accused.",
+      "reviewed_agreement": true,
+      "reviewed_class": "low_support",
+      "support_latency_ms": 24623,
+      "support_per_lens": [
+        {
+          "identity_raw": 0.83625984,
+          "proposition_raw": 0.7770884,
+          "raw_gain": -0.059171439999999964,
+          "slot": 8,
+          "weight": 0.5
+        },
+        {
+          "identity_raw": 0.6338362,
+          "proposition_raw": 0.47598198,
+          "raw_gain": -0.15785421999999993,
+          "slot": 9,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 1.4471898,
+          "proposition_raw": 0.05442296,
+          "raw_gain": -1.3927668400000002,
+          "slot": 10,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 8.274463,
+          "proposition_raw": 9.15169,
+          "raw_gain": 0.8772269999999995,
+          "slot": 11,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.18539204,
+          "proposition_raw": 0.21362044,
+          "raw_gain": 0.028228399999999987,
+          "slot": 12,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.8173209,
+          "proposition_raw": 0.6122339,
+          "raw_gain": -0.20508700000000002,
+          "slot": 13,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.7298523,
+          "proposition_raw": 0.55228996,
+          "raw_gain": -0.17756234000000004,
+          "slot": 14,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.55860084,
+          "proposition_raw": 0.47379875,
+          "raw_gain": -0.08480209,
+          "slot": 15,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.66543466,
+          "proposition_raw": 0.48666465,
+          "raw_gain": -0.17877000999999998,
+          "slot": 16,
+          "weight": 1.0
+        },
+        {
+          "identity_raw": 0.50765103,
+          "proposition_raw": 0.28834924,
+          "raw_gain": -0.21930179,
+          "slot": 17,
+          "weight": 1.0
+        }
+      ],
+      "support_rank": 1,
+      "support_score": -0.1621341694736843,
+      "support_verdict": "LOW_SUPPORT",
+      "target_opinion_id": 2704114
+    }
+  ],
+  "scope": "Cuyahoga County Eighth District opinions only",
+  "semantic_caveat": "LOW_SUPPORT is a live panel outlier signal, not a legal-treatment judgment.",
+  "source_of_truth": {
+    "citation_overlay": "accepted physical Aster Graph CF lifecycle plus exhaustive verified sidecar traversal",
+    "existence": "physical Aster Base CF cx-list joined to canonical ingest metadata",
+    "report": "immutable generation members re-read by SHA-256",
+    "retrieval": "live fresh Calyx search through the frozen resident panel"
+  },
+  "status": "verified",
+  "support_calibration": {
+    "flagged_citation_id": "C12",
+    "low_support_threshold": 0.0,
+    "method": "target-filtered paired panel-weighted mean raw gain over ten active GPU lenses",
+    "scores": [
+      {
+        "citation_id": "C01",
+        "paired_raw_gain": 0.8063247531578946
+      },
+      {
+        "citation_id": "C02",
+        "paired_raw_gain": 0.33795681000000005
+      },
+      {
+        "citation_id": "C03",
+        "paired_raw_gain": 0.29008492105263156
+      },
+      {
+        "citation_id": "C05",
+        "paired_raw_gain": 0.6259480415789476
+      },
+      {
+        "citation_id": "C06",
+        "paired_raw_gain": 0.18085797087368435
+      },
+      {
+        "citation_id": "C08",
+        "paired_raw_gain": 1.4545777578947368
+      },
+      {
+        "citation_id": "C09",
+        "paired_raw_gain": 0.8916972309473685
+      },
+      {
+        "citation_id": "C10",
+        "paired_raw_gain": 0.7125239531578949
+      },
+      {
+        "citation_id": "C11",
+        "paired_raw_gain": 0.567479122631579
+      },
+      {
+        "citation_id": "C12",
+        "paired_raw_gain": -0.1621341694736843
+      }
+    ]
+  },
+  "vault": "/zfs/hot/calyx/vaults/01KXJQ6Y8SSREK6D8NPKYMJB9G",
+  "vault_id": "01KXJQ6Y8SSREK6D8NPKYMJB9G"
+}

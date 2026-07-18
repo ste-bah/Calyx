@@ -1,4 +1,5 @@
-mod support;
+// calyx-shared-module: path=support/mod.rs alias=__calyx_shared_support_mod_rs local=support visibility=private
+use crate::__calyx_shared_support_mod_rs as support;
 
 use calyx_ledger::{VerifyResult, assert_within_tolerance, verify_chain};
 use serde_json::json;

@@ -1,30 +1,10 @@
 use super::level::SstLevel;
-use super::{SstEntry, SstReader, read_record};
+use super::{SstEntry, SstStreamingReader};
 use crate::mvcc::is_tombstone_value;
 use calyx_core::Result;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-
-impl SstReader {
-    pub(crate) fn lower_bound(&self, key: &[u8], exclusive: bool) -> usize {
-        if exclusive {
-            self.index
-                .partition_point(|entry| entry.key.as_slice() <= key)
-        } else {
-            self.index
-                .partition_point(|entry| entry.key.as_slice() < key)
-        }
-    }
-
-    pub(crate) fn key_at(&self, position: usize) -> Option<&[u8]> {
-        self.index.get(position).map(|entry| entry.key.as_slice())
-    }
-
-    pub(crate) fn entry_at(&self, position: usize) -> Result<SstEntry> {
-        read_record(self.column.as_bytes(), self.index[position].offset)
-    }
-}
 
 pub(super) fn range_page(
     level: &SstLevel,
@@ -75,8 +55,14 @@ struct PageCursor {
 }
 
 enum PageSource {
-    Overlay { rows: Vec<SstEntry>, pos: usize },
-    Sst { reader: SstReader, pos: usize },
+    Overlay {
+        rows: Vec<SstEntry>,
+        pos: usize,
+    },
+    Sst {
+        reader: SstStreamingReader,
+        pos: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +146,7 @@ fn open_page_cursor(
         .files
         .par_iter()
         .map(|file| {
-            let reader = SstReader::open(&file.path)?;
+            let reader = SstStreamingReader::open(&file.path)?;
             let mut pos = reader.lower_bound(lower, exclusive);
             while reader.key_at(pos).is_some_and(|key| key < start) {
                 pos += 1;

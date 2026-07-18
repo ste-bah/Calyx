@@ -32,6 +32,10 @@ impl BuildLens {
         self.spec.max_batch
     }
 
+    pub(crate) fn runtime_name(&self) -> &str {
+        &self.runtime_name
+    }
+
     pub(crate) fn lens_id(&self) -> String {
         self.spec.lens_id().to_string()
     }

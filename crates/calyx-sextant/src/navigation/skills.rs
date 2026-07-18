@@ -18,7 +18,8 @@ use crate::error::{
 };
 use crate::hit::Hit;
 use crate::navigation::consensus::{dense_cosine, dense_vectors};
-use crate::navigation::hdbscan::{DistanceMatrix, condensed_tree};
+use crate::navigation::hdbscan::{DistanceMatrix, condensed_tree, condensed_tree_from_mst};
+use crate::navigation::skill_gpu;
 use crate::query::Query;
 use crate::search::SearchEngine;
 
@@ -49,6 +50,63 @@ impl Default for SkillParams {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillExecutionBackend {
+    #[default]
+    Cpu,
+    Cuda,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillExecutionStats {
+    pub backend: SkillExecutionBackend,
+    pub points: u64,
+    pub slots: u64,
+    pub feature_values: u64,
+    pub pairwise_values: u64,
+    pub kernel_launches: u64,
+    pub host_to_device_bytes: u64,
+    pub device_to_host_bytes: u64,
+    pub peak_device_bytes: u64,
+}
+
+impl SkillExecutionStats {
+    fn cpu(vectors: &[BTreeMap<SlotId, Vec<f32>>]) -> Self {
+        Self {
+            backend: SkillExecutionBackend::Cpu,
+            points: vectors.len() as u64,
+            slots: vectors
+                .iter()
+                .flat_map(BTreeMap::keys)
+                .collect::<BTreeSet<_>>()
+                .len() as u64,
+            feature_values: vectors
+                .iter()
+                .flat_map(BTreeMap::values)
+                .map(Vec::len)
+                .sum::<usize>() as u64,
+            pairwise_values: (vectors.len() * vectors.len().saturating_sub(1) / 2) as u64,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn cuda(stats: calyx_forge::CudaSkillStats) -> Self {
+        Self {
+            backend: SkillExecutionBackend::Cuda,
+            points: stats.points,
+            slots: stats.slots,
+            feature_values: stats.feature_values,
+            pairwise_values: stats.pairwise_values,
+            kernel_launches: stats.kernel_launches,
+            host_to_device_bytes: stats.host_to_device_bytes,
+            device_to_host_bytes: stats.device_to_host_bytes,
+            peak_device_bytes: stats.peak_device_bytes,
+        }
+    }
+}
+
 /// One node of the skill hierarchy.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillNode {
@@ -74,6 +132,8 @@ pub struct SkillTree {
     /// Constellations not inside any selected skill.
     pub noise: Vec<CxId>,
     pub params: Option<SkillParams>,
+    #[serde(default)]
+    pub execution: SkillExecutionStats,
 }
 
 /// Discovers the hierarchical skill tree over the engine's constellations.
@@ -110,13 +170,26 @@ pub fn skills(engine: &SearchEngine, params: &SkillParams) -> Result<SkillTree> 
         }
         vectors.push(dense);
     }
-    let dist = pairwise_distances(&ids, &vectors)?;
-    let clusters = condensed_tree(
-        &dist,
-        params.min_samples,
-        params.min_cluster_size,
-        params.allow_single_cluster,
-    )?;
+    let (clusters, execution) = if ids.len() >= skill_gpu::SKILL_CUDA_MIN_POINTS {
+        let (mst, execution) = skill_gpu::minimum_spanning_tree(&vectors, params.min_samples)?;
+        let clusters = condensed_tree_from_mst(
+            ids.len(),
+            &mst,
+            params.min_samples,
+            params.min_cluster_size,
+            params.allow_single_cluster,
+        )?;
+        (clusters, execution)
+    } else {
+        let dist = pairwise_distances(&ids, &vectors)?;
+        let clusters = condensed_tree(
+            &dist,
+            params.min_samples,
+            params.min_cluster_size,
+            params.allow_single_cluster,
+        )?;
+        (clusters, SkillExecutionStats::cpu(&vectors))
+    };
 
     let names: Vec<String> = clusters
         .iter()
@@ -172,6 +245,7 @@ pub fn skills(engine: &SearchEngine, params: &SkillParams) -> Result<SkillTree> 
         selected,
         noise,
         params: Some(params.clone()),
+        execution,
     })
 }
 

@@ -11,8 +11,7 @@ use calyx_core::{
     CalyxError, Input, Modality, Panel, Placement, Slot, SlotId, SlotShape, SlotState, SlotVector,
 };
 use calyx_registry::{
-    LensRuntime, Registry, lens_spec_from_manifest_path, load_vault_panel_state,
-    shutdown_multimodal_gpu_workers,
+    LensRuntime, Registry, load_vault_panel_state, shutdown_multimodal_gpu_workers,
 };
 use serde::Serialize;
 
@@ -65,7 +64,7 @@ struct WarmReport {
     progress_log: Option<PathBuf>,
     max_resident_vram_mib: u64,
     declared_template_vram_mib: u64,
-    resident_overhead_multiplier: f32,
+    resident_overhead_multiplier_milli: u64,
     estimated_resident_vram_mib: u64,
     max_load_secs: u64,
     load_parallelism: usize,
@@ -131,7 +130,7 @@ struct WarmProgressRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_resident_vram_mib: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    resident_overhead_multiplier: Option<f32>,
+    resident_overhead_multiplier_milli: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     load_parallelism: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,7 +299,7 @@ pub(super) fn run(args: &[String]) -> CliResult {
         progress_log: progress_log.as_ref().map(|log| log.path.clone()),
         max_resident_vram_mib,
         declared_template_vram_mib: preflight.declared_template_vram_mib,
-        resident_overhead_multiplier: multiplier_to_f32(resident_overhead_multiplier_milli),
+        resident_overhead_multiplier_milli,
         estimated_resident_vram_mib: preflight.estimated_resident_vram_mib,
         max_load_secs,
         load_parallelism,
@@ -344,11 +343,12 @@ impl Drop for MultimodalGpuWorkerShutdownGuard {
 }
 
 mod preflight;
-#[cfg(test)]
-use preflight::estimate_resident_vram_mib;
 use preflight::{
-    build_warm_template_panel, default_load_parallelism, multiplier_to_f32, warm_preflight,
+    build_warm_template_panel, bytes_to_mib_ceil, default_load_parallelism,
+    estimate_resident_vram_mib, format_multiplier_milli, warm_preflight,
 };
+
+mod resident_vram;
 
 mod load;
 
@@ -357,6 +357,7 @@ mod load_progress;
 mod flags;
 
 mod probe;
+pub(in crate::panel_commands) use probe::probe_bytes as warm_probe_bytes;
 use probe::{content_slots, probe_panel, run_progress_record};
 
 pub(super) mod resident_support;

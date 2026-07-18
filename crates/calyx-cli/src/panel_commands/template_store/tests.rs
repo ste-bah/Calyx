@@ -4,15 +4,19 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use calyx_core::{LensCost, LensId, Modality, Placement, SlotShape};
-use calyx_registry::lens_spec_from_manifest_path;
+use calyx_registry::{
+    LensForgeManifest, derive_runtime_contract_from_spec, lens_spec_from_manifest_path,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::lens_commands::support::runtime_name;
+use crate::panel_commands::template_model::{LENS_SNAPSHOT_VERSION, TemplateLensSnapshot};
 
 #[test]
 fn template_registration_canonicalizes_runtime_contracts() {
@@ -52,25 +56,236 @@ fn template_registration_canonicalizes_runtime_contracts() {
 }
 
 #[test]
+fn resident_registration_canonicalizes_verified_specs_to_frozen_contracts() {
+    let root = temp_root("resident-canonical-runtime");
+    fs::create_dir_all(&root).unwrap();
+    let template = saved_template(
+        "resident-tei-template",
+        (0..MIN_CONTENT_LENSES)
+            .map(|idx| tei_lens_ref(&root, idx, None, None))
+            .collect(),
+    );
+    let template_id = id_for_loaded(&template).unwrap();
+
+    let expected = resident_registration::expected_slots(&template, &template_id).unwrap();
+
+    assert_eq!(expected.len(), MIN_CONTENT_LENSES);
+    for (lens, slot) in template.lenses.iter().zip(expected) {
+        let raw_spec = lens.verified_materialization_spec(&template_id).unwrap();
+        assert_ne!(raw_spec.declared_contract(), slot.contract);
+        assert_eq!(slot.spec.declared_contract(), slot.contract);
+        assert_ne!(slot.spec.lens_id(), raw_spec.lens_id());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn stale_runtime_lens_id_fails_before_registry_mutation() {
     let root = temp_root("stale-runtime");
     fs::create_dir_all(&root).unwrap();
     let stale = LensId::from_bytes([0x55; 16]);
+    let (endpoint, server) = tei_registration_server((MIN_CONTENT_LENSES - 1) * 2);
     let mut template = saved_template(
         "tei-template-stale",
         (0..MIN_CONTENT_LENSES)
-            .map(|idx| tei_lens_ref(&root, idx, (idx == 0).then_some(stale), None))
+            .map(|idx| {
+                tei_lens_ref(
+                    &root,
+                    idx,
+                    (idx + 1 == MIN_CONTENT_LENSES).then_some(stale),
+                    Some(&endpoint),
+                )
+            })
             .collect(),
     );
     let mut registry = Registry::new();
 
     let error = register_template_lenses(&mut registry, &mut template).unwrap_err();
+    server.join().unwrap();
 
     assert_eq!(error.code(), TEMPLATE_INVALID);
     assert!(error.message().contains("expected"));
     assert_eq!(registry.lens_snapshots().len(), 0);
     assert!(!registry.contains(stale));
+    assert!(
+        template
+            .lenses
+            .iter()
+            .take(MIN_CONTENT_LENSES - 1)
+            .all(|lens| lens.runtime_lens_id.is_none())
+    );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_object_is_rejected_normally_but_readable_only_for_explicit_refresh() {
+    let home = temp_root("legacy-refresh");
+    let manifests = home.join("commissioned");
+    fs::create_dir_all(&manifests).unwrap();
+    let mut legacy = saved_template(
+        "legacy-template",
+        (0..MIN_CONTENT_LENSES)
+            .map(|idx| tei_lens_ref(&manifests, idx, None, None))
+            .collect(),
+    );
+    let mut current = legacy.clone();
+    current.name = "current-template".to_string();
+    current.version = 2;
+    legacy.schema_version = 1;
+    for lens in &mut legacy.lenses {
+        lens.immutable_snapshot = None;
+    }
+    let bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+    let template_id = blake3::hash(&bytes).to_hex().to_string();
+    let store_root = home.join("panels").join("templates");
+    let object_rel = format!("objects/{template_id}.json");
+    let object_path = store_root.join(&object_rel);
+    fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+    fs::write(&object_path, &bytes).unwrap();
+    let current_bytes = serde_json::to_vec_pretty(&current).unwrap();
+    let current_id = blake3::hash(&current_bytes).to_hex().to_string();
+    let current_rel = format!("objects/{current_id}.json");
+    fs::write(store_root.join(&current_rel), &current_bytes).unwrap();
+    let catalog = PanelTemplateCatalog {
+        schema_version: CATALOG_VERSION,
+        templates: vec![
+            PanelTemplateIndexEntry {
+                name: current.name.clone(),
+                active_template_id: current_id.clone(),
+                versions: vec![PanelTemplateVersionRef {
+                    version: current.version,
+                    template_id: current_id.clone(),
+                    object_path: current_rel,
+                    blake3_hex: current_id.clone(),
+                    size_bytes: current_bytes.len() as u64,
+                    saved_at_ms: 2,
+                }],
+            },
+            PanelTemplateIndexEntry {
+                name: legacy.name.clone(),
+                active_template_id: template_id.clone(),
+                versions: vec![PanelTemplateVersionRef {
+                    version: 1,
+                    template_id: template_id.clone(),
+                    object_path: object_rel,
+                    blake3_hex: template_id.clone(),
+                    size_bytes: bytes.len() as u64,
+                    saved_at_ms: 1,
+                }],
+            },
+        ],
+    };
+    fs::write(
+        store_root.join("index.json"),
+        serde_json::to_vec_pretty(&catalog).unwrap(),
+    )
+    .unwrap();
+    let store = TemplateStore::open(&home);
+
+    let ordinary_error = store.load("legacy-template").unwrap_err();
+    let refresh_source = store.load_for_refresh("legacy-template").unwrap();
+    let current_readback = store.load("current-template").unwrap();
+    let summaries = store.list().unwrap();
+
+    assert_eq!(ordinary_error.code(), TEMPLATE_INVALID);
+    assert!(ordinary_error.message().contains(&template_id));
+    assert!(ordinary_error.remediation().contains("template refresh"));
+    assert_eq!(refresh_source.schema_version, 1);
+    assert_eq!(refresh_source.name, "legacy-template");
+    assert_eq!(current_readback.schema_version, OBJECT_VERSION);
+    assert_eq!(summaries.len(), 2);
+    let legacy_summary = summaries
+        .iter()
+        .find(|summary| summary.name == "legacy-template")
+        .unwrap();
+    assert_eq!(legacy_summary.object_schema_version, 1);
+    assert!(legacy_summary.migration_required);
+    assert!(
+        legacy_summary
+            .refresh_command
+            .as_deref()
+            .unwrap()
+            .contains(&template_id)
+    );
+    let current_summary = summaries
+        .iter()
+        .find(|summary| summary.name == "current-template")
+        .unwrap();
+    assert_eq!(current_summary.object_schema_version, OBJECT_VERSION);
+    assert!(!current_summary.migration_required);
+    assert!(current_summary.refresh_command.is_none());
+    assert!(
+        refresh_source
+            .lenses
+            .iter()
+            .all(|lens| lens.immutable_snapshot.is_none())
+    );
+    let current_path = store_root.join(format!("objects/{current_id}.json"));
+    let mut corrupt = current_bytes;
+    corrupt.push(b'\n');
+    fs::write(current_path, corrupt).unwrap();
+    let corrupt_error = store.list().unwrap_err();
+    assert_eq!(corrupt_error.code(), TEMPLATE_INVALID);
+    assert!(corrupt_error.message().contains("hash mismatch"));
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn concurrent_template_saves_preserve_both_catalog_updates() {
+    let home = temp_root("concurrent-saves");
+    let manifests = home.join("commissioned");
+    fs::create_dir_all(&manifests).unwrap();
+    let lenses = (0..MIN_CONTENT_LENSES)
+        .map(|idx| {
+            let mut lens = tei_lens_ref(&manifests, idx, None, None);
+            lens.placement = Placement::Gpu;
+            lens
+        })
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(3));
+    let writers = ["concurrent-a", "concurrent-b"]
+        .into_iter()
+        .map(|name| {
+            let store = TemplateStore::open(&home);
+            let barrier = barrier.clone();
+            let lenses = lenses.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                store.save(
+                    TemplateDraft {
+                        name: name.to_string(),
+                        notes: "concurrent durable publication test".to_string(),
+                        lenses,
+                        ensemble_card: None,
+                    },
+                    42,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for writer in writers {
+        writer.join().unwrap().unwrap();
+    }
+
+    let catalog = TemplateStore::open(&home).read_catalog().unwrap();
+    let names = catalog
+        .templates
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["concurrent-a", "concurrent-b"]);
+    for entry in &catalog.templates {
+        let version = &entry.versions[0];
+        let bytes = fs::read(home.join("panels/templates").join(&version.object_path)).unwrap();
+        assert_eq!(blake3::hash(&bytes).to_hex().as_str(), version.blake3_hex);
+    }
+    let leaked = fs::read_dir(home.join("panels/templates"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+    assert!(!leaked);
+    fs::remove_dir_all(home).unwrap();
 }
 
 fn saved_template(name: &str, lenses: Vec<TemplateLensRef>) -> SavedPanelTemplate {
@@ -128,6 +343,19 @@ fn tei_lens_ref(
     )
     .unwrap();
     let spec = lens_spec_from_manifest_path(&manifest_path).unwrap();
+    let manifest: LensForgeManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let runtime_contract = derive_runtime_contract_from_spec(&spec).unwrap();
+    let immutable_snapshot = TemplateLensSnapshot {
+        schema_version: LENS_SNAPSHOT_VERSION,
+        manifest_blake3: fixture_blake3(&manifest),
+        spec_blake3: fixture_blake3(&spec),
+        runtime_contract_blake3: fixture_blake3(&runtime_contract),
+        manifest,
+        manifest_base_dir: root.to_path_buf(),
+        spec: spec.clone(),
+        runtime_contract,
+    };
     TemplateLensRef {
         slot_key: format!("fixture_tei_{idx}"),
         lens_name: spec.name.clone(),
@@ -140,6 +368,7 @@ fn tei_lens_ref(
         placement: Placement::Cpu,
         cost: LensCost::default(),
         manifest: manifest_path.display().to_string(),
+        immutable_snapshot: Some(immutable_snapshot),
         counts_toward_a35: true,
     }
 }
@@ -207,4 +436,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn fixture_blake3<T: serde::Serialize>(value: &T) -> String {
+    blake3::hash(&serde_json::to_vec(value).unwrap())
+        .to_hex()
+        .to_string()
 }

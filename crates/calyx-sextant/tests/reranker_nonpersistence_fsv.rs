@@ -11,9 +11,11 @@ use calyx_core::{
 use calyx_sextant::{RerankCandidateText, RerankRequest, RerankerClient};
 use serde_json::json;
 
-mod reranker_support;
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=reranker_support/mod.rs alias=__calyx_shared_reranker_support_mod_rs local=reranker_support visibility=private
+
+use crate::__calyx_shared_reranker_support_mod_rs as reranker_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use reranker_support::spawn_reranker;
 use sextant_support::{cx_u8_fill as cx, hex, raw_blake3_hex as blake3_hex};
 

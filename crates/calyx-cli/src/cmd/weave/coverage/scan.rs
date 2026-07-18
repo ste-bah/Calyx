@@ -104,67 +104,15 @@ fn scan_bounded_covered_coverage(
     live_entries: usize,
     deadline: &Deadline,
 ) -> CliResult<DenseSlotCoverageScan> {
-    if requested_slot.is_none() && limit > 0 {
-        return scan_auto_bounded_covered_coverage(
-            vault_dir,
-            read_context,
-            content_slots,
-            limit,
-            live_entries,
-            deadline,
-        );
-    }
-    let measured_slots = requested_slot.map_or_else(|| content_slots.to_vec(), |slot| vec![slot]);
+    let _ = requested_slot;
     scan_covered_slots(
         vault_dir,
         read_context,
-        &measured_slots,
+        content_slots,
         limit,
         live_entries,
         deadline,
     )
-}
-
-fn scan_auto_bounded_covered_coverage(
-    vault_dir: &Path,
-    read_context: &mut VaultReadContext,
-    content_slots: &[SlotId],
-    limit: usize,
-    live_entries: usize,
-    deadline: &Deadline,
-) -> CliResult<DenseSlotCoverageScan> {
-    let target_rows = limit.max(2);
-    let mut measured_coverage = Vec::new();
-    let mut last_scan = None;
-    for &slot in content_slots {
-        let mut scan = scan_covered_slots(
-            vault_dir,
-            read_context,
-            &[slot],
-            limit,
-            live_entries,
-            deadline,
-        )?;
-        let row = scan.coverage.remove(0);
-        let reached_target = row.dense_rows >= target_rows;
-        measured_coverage.push(row);
-        if reached_target {
-            scan.coverage = measured_coverage;
-            return Ok(scan);
-        }
-        last_scan = Some(scan);
-    }
-    let mut scan = last_scan.unwrap_or(DenseSlotCoverageScan {
-        constellations_in_vault: live_entries,
-        scanned_candidates: Vec::new(),
-        slot_maps: BTreeMap::new(),
-        coverage: Vec::new(),
-        base_page_index_live_entries: live_entries,
-        candidate_scan_rows: 0,
-        candidate_scan_complete: true,
-    });
-    scan.coverage = measured_coverage;
-    Ok(scan)
 }
 
 fn scan_covered_slots(
@@ -210,11 +158,7 @@ fn scan_covered_slots(
                 )?;
             }
             candidates.extend(chunk);
-            if target_rows != usize::MAX
-                && accumulators
-                    .values()
-                    .any(|accumulator| accumulator.map.len() >= target_rows)
-            {
+            if target_rows != usize::MAX && common_dense_count(&accumulators) >= target_rows {
                 stopped_after_target = true;
                 return Ok(false);
             }
@@ -239,6 +183,21 @@ fn scan_covered_slots(
         coverage,
         base_page_index_live_entries: live_entries,
     })
+}
+
+fn common_dense_count(accumulators: &BTreeMap<SlotId, SlotAccumulator>) -> usize {
+    let Some(first) = accumulators.values().next() else {
+        return 0;
+    };
+    first
+        .map
+        .keys()
+        .filter(|id| {
+            accumulators
+                .values()
+                .all(|accumulator| accumulator.map.contains_key(id))
+        })
+        .count()
 }
 
 fn scan_slots_for_candidates(

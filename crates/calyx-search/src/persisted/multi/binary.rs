@@ -15,6 +15,7 @@ pub(super) fn is_binary_sidecar(index_rel: &str) -> bool {
     index_rel.ends_with(".multi.bin")
 }
 
+#[cfg(test)]
 pub(super) fn write_binary_atomic_hashed(
     path: &Path,
     slot: SlotId,
@@ -56,6 +57,58 @@ pub(super) fn write_binary_atomic_hashed(
                     }
                     writer.write_all(&value.to_le_bytes())?;
                 }
+            }
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn write_encoded_binary_atomic_hashed(
+    path: &Path,
+    slot: SlotId,
+    token_dim: u32,
+    rows: &[super::segments::EncodedMultiRow],
+    base_seq: u64,
+) -> CliResult<String> {
+    let token_count = rows.iter().try_fold(0usize, |total, row| {
+        total
+            .checked_add(row.token_count as usize)
+            .ok_or_else(|| stale("streaming multi sidecar token_count overflow"))
+    })?;
+    write_atomic_hashed(path, |writer| {
+        writer.write_all(MULTI_BINARY_MAGIC)?;
+        write_u16(writer, slot.get())?;
+        write_u32(writer, token_dim)?;
+        write_u64(writer, base_seq)?;
+        write_u64(writer, rows.len() as u64)?;
+        write_u64(writer, token_count as u64)?;
+        for row in rows {
+            let encoded = EncodedMultiSlotVector::new(&row.bytes).map_err(|error| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "slot {slot} cx {} has malformed encoded multi payload during sidecar write: {}",
+                    row.cx_id, error.message
+                ))
+            })?;
+            if encoded.token_dim() != token_dim || encoded.token_count() != row.token_count {
+                return Err(stale(format!(
+                    "slot {slot} cx {} encoded multi shape changed while buffered: token_dim={} expected={token_dim}, token_count={} expected={}",
+                    row.cx_id,
+                    encoded.token_dim(),
+                    encoded.token_count(),
+                    row.token_count
+                )));
+            }
+            writer.write_all(row.cx_id.as_bytes())?;
+            write_u32(writer, row.token_count)?;
+            for value in encoded.components() {
+                if !value.is_finite() {
+                    return Err(CalyxError::lens_numerical_invariant(format!(
+                        "slot {slot} cx {} has non-finite multi token component",
+                        row.cx_id
+                    ))
+                    .into());
+                }
+                writer.write_all(&value.to_le_bytes())?;
             }
         }
         Ok(())
@@ -131,7 +184,9 @@ pub(super) fn search_binary(
 #[path = "binary/segments.rs"]
 mod segments;
 
-pub(super) use segments::{summarize_binary_entry, summarize_binary_path};
+#[cfg(test)]
+pub(super) use segments::summarize_binary_entry;
+pub(super) use segments::summarize_binary_path;
 
 pub(super) fn read_binary_header_unhashed(path: &Path) -> CliResult<BinaryHeader> {
     let file = File::open(path)?;

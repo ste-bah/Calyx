@@ -1,12 +1,19 @@
 mod plan;
 mod sketch;
 
+mod cuda;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_core::{CalyxError, Result, SlotId};
 
+#[cfg(not(feature = "cuda"))]
+use crate::cuda_strict::cuda_unavailable;
+use crate::cuda_strict::strict_cuda_requested;
 use crate::ksg::MIN_ASSAY_SAMPLES;
 use crate::nmi::partitioned_histogram_nmi;
+
+use self::cuda::ensemble_redundancy_from_lenses_cuda_strict_impl;
 
 use super::model::{
     ENSEMBLE_CARD_SCHEMA_VERSION, EnsembleCard, EnsembleLensInput, EnsemblePairRedundancyEvidence,
@@ -54,6 +61,9 @@ pub fn ensemble_redundancy_from_lenses(
     lenses: &[EnsembleLensInput],
     nmi_bins: usize,
 ) -> Result<EnsembleRedundancyEvidence> {
+    if strict_cuda_requested() {
+        return ensemble_redundancy_from_lenses_cuda_strict(lenses, nmi_bins);
+    }
     let row_count = lenses.first().map(|lens| lens.vectors.len()).unwrap_or(0);
     let plan = linear_cka_tuple_plan(row_count)?;
     let mut sketches = Vec::with_capacity(lenses.len());
@@ -67,6 +77,13 @@ pub fn ensemble_redundancy_from_lenses(
         ));
     }
     ensemble_redundancy_from_sketches(&plan, &sketches, nmi_bins)
+}
+
+pub fn ensemble_redundancy_from_lenses_cuda_strict(
+    lenses: &[EnsembleLensInput],
+    nmi_bins: usize,
+) -> Result<EnsembleRedundancyEvidence> {
+    ensemble_redundancy_from_lenses_cuda_strict_impl(lenses, nmi_bins)
 }
 
 pub fn ensemble_redundancy_from_sketches(

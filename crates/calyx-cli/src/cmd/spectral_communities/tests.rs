@@ -32,6 +32,10 @@ fn parses_tuning_flags() {
         "4",
         "--eigen-max-iter",
         "48",
+        "--communities",
+        "3",
+        "--cluster-max-iter",
+        "72",
         "--centrality-max-iter",
         "96",
         "--centrality-tol",
@@ -46,6 +50,8 @@ fn parses_tuning_flags() {
     assert_eq!(args.vault, "corpus");
     assert_eq!(args.eigen_k, 4);
     assert_eq!(args.eigen_max_iter, 48);
+    assert_eq!(args.community_count, 3);
+    assert_eq!(args.cluster_max_iter, 72);
     assert_eq!(args.centrality_max_iter, 96);
     assert_eq!(args.centrality_tol, 0.0001);
     assert_eq!(args.max_bridge_candidates, 7);
@@ -68,6 +74,8 @@ fn run_persists_report_then_reads_back_source_of_truth() {
         &home,
         SpectralCommunitiesArgs {
             vault: "happy".to_string(),
+            eigen_k: 3,
+            community_count: 2,
             max_bridge_candidates: 4,
             max_centrality_candidates: 6,
             ..SpectralCommunitiesArgs::default()
@@ -79,14 +87,44 @@ fn run_persists_report_then_reads_back_source_of_truth() {
     let readback_bytes = fs::read(&report_path).unwrap();
     let report: SpectralCommunityReport = serde_json::from_slice(&readback_bytes).unwrap();
 
-    assert_eq!(report.schema_version, 1);
+    assert_eq!(report.schema_version, 2);
     assert_eq!(report.node_count, 6);
     assert_eq!(report.edge_count, 13);
     assert_eq!(report.communities.len(), 2);
+    assert_eq!(report.requested_communities, 2);
+    assert_eq!(report.embedding_dimensions, 2);
+    assert_eq!(
+        report.assignment_method,
+        "normalized-laplacian-row-l2-farthest-first-lloyd-v2"
+    );
     assert_eq!(report.bridge_candidates.len(), 1);
     assert_eq!(report.centrality_candidates.len(), 6);
     assert_eq!(report.bridge_candidates[0].src, cx(2));
     assert_eq!(report.bridge_candidates[0].dst, cx(5));
+}
+
+#[test]
+fn explicit_existing_report_fails_before_mutation_and_preserves_bytes() {
+    let (home, _) = seed_home("existing-report", SeedShape::TwoCommunitiesWithBridge);
+    let report_path = home.join("immutable-report.json");
+    fs::write(&report_path, b"physically-existing-evidence\n").unwrap();
+    let before = fs::read(&report_path).unwrap();
+
+    let error = run_spectral_communities_with_home(
+        &home,
+        SpectralCommunitiesArgs {
+            vault: "existing-report".to_string(),
+            eigen_k: 3,
+            community_count: 2,
+            out: Some(report_path.clone()),
+            ..SpectralCommunitiesArgs::default()
+        },
+    )
+    .expect_err("existing explicit evidence must fail closed");
+
+    assert_eq!(error.code(), "CALYX_CLI_USAGE_ERROR");
+    assert!(error.message().contains("evidence is immutable"));
+    assert_eq!(fs::read(&report_path).unwrap(), before);
 }
 
 #[test]
@@ -97,6 +135,8 @@ fn too_small_graph_fails_before_artifact_write() {
         &home,
         SpectralCommunitiesArgs {
             vault: "too-small".to_string(),
+            eigen_k: 3,
+            community_count: 2,
             ..SpectralCommunitiesArgs::default()
         },
     )
@@ -114,13 +154,18 @@ fn disconnected_graph_fails_before_artifact_write() {
         &home,
         SpectralCommunitiesArgs {
             vault: "no-bridge".to_string(),
+            eigen_k: 3,
+            community_count: 2,
             ..SpectralCommunitiesArgs::default()
         },
     )
     .unwrap_err();
 
     assert_eq!(err.code(), "CALYX_KERNEL_INVALID_PARAMS");
-    assert!(err.message().contains("fewer than two communities"));
+    assert!(
+        err.message()
+            .contains("no inter-community bridge candidates")
+    );
     assert!(!vault_dir.join("idx").join("spectral_communities").exists());
 }
 

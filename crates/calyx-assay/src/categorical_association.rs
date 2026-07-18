@@ -32,9 +32,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::partial_correlation::{PearsonReport, pearson};
 use crate::special_fn::gammq;
+use crate::{DependenceCudaStats, cuda_strict::strict_cuda_requested};
+
+#[path = "categorical_association/cuda.rs"]
+mod cuda;
+
+use self::cuda::categorical_association_cuda_strict_with_stats_impl;
+use crate::dependence_dispatch::auto_cuda_at;
 
 /// Minimum paired observations for a defined categorical association test.
 pub const MIN_CATEGORICAL_SAMPLES: usize = 4;
+/// CUDA cutoff for dense contingency construction. Strict calls bypass it.
+pub const CATEGORICAL_CUDA_MIN_SAMPLES: usize = 262_144;
 
 /// Full categorical-association report from a single contingency table.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -64,6 +73,36 @@ pub struct CategoricalReport {
 
 /// Categorical association between two discrete label series `x` and `y`.
 pub fn categorical_association(x: &[u32], y: &[u32]) -> Result<CategoricalReport> {
+    if strict_cuda_requested() || auto_cuda_at(x.len(), CATEGORICAL_CUDA_MIN_SAMPLES) {
+        return categorical_association_cuda_strict(x, y);
+    }
+    categorical_association_cpu(x, y)
+}
+
+/// Strict CUDA contingency construction with existing f64 report numerics.
+pub fn categorical_association_cuda_strict(x: &[u32], y: &[u32]) -> Result<CategoricalReport> {
+    categorical_association_cuda_strict_with_stats(x, y).map(|(report, _)| report)
+}
+
+pub fn categorical_association_cuda_strict_with_stats(
+    x: &[u32],
+    y: &[u32],
+) -> Result<(CategoricalReport, DependenceCudaStats)> {
+    let (x_dense, y_dense, rows, cols) = categorical_dense_inputs(x, y)?;
+    categorical_association_cuda_strict_with_stats_impl(&x_dense, &y_dense, rows, cols, x.len())
+}
+
+fn categorical_association_cpu(x: &[u32], y: &[u32]) -> Result<CategoricalReport> {
+    let (x_dense, y_dense, r, c) = categorical_dense_inputs(x, y)?;
+    let n = x.len();
+    let mut table = vec![0u64; r * c];
+    for (&row, &col) in x_dense.iter().zip(&y_dense) {
+        table[row as usize * c + col as usize] += 1;
+    }
+    categorical_report_from_table(&table, r, c, n)
+}
+
+fn categorical_dense_inputs(x: &[u32], y: &[u32]) -> Result<(Vec<u32>, Vec<u32>, usize, usize)> {
     if x.len() != y.len() {
         return Err(CalyxError::assay_insufficient_samples(format!(
             "categorical association requires paired labels: x={} y={}",
@@ -78,7 +117,6 @@ pub fn categorical_association(x: &[u32], y: &[u32]) -> Result<CategoricalReport
         )));
     }
 
-    // Dense contingency table over the observed category codes.
     let x_levels = index_levels(x);
     let y_levels = index_levels(y);
     let r = x_levels.len();
@@ -88,13 +126,17 @@ pub fn categorical_association(x: &[u32], y: &[u32]) -> Result<CategoricalReport
             "categorical association undefined: a variable has a single category (r={r}, c={c})"
         )));
     }
-    let mut table = vec![0u64; r * c];
-    for (&xi, &yi) in x.iter().zip(y) {
-        let ri = x_levels[&xi];
-        let ci = y_levels[&yi];
-        table[ri * c + ci] += 1;
-    }
+    let x_dense = x.iter().map(|value| x_levels[value] as u32).collect();
+    let y_dense = y.iter().map(|value| y_levels[value] as u32).collect();
+    Ok((x_dense, y_dense, r, c))
+}
 
+fn categorical_report_from_table(
+    table: &[u64],
+    r: usize,
+    c: usize,
+    n: usize,
+) -> Result<CategoricalReport> {
     let nf = n as f64;
     let row_sums: Vec<f64> = (0..r)
         .map(|i| (0..c).map(|j| table[i * c + j] as f64).sum())
@@ -131,7 +173,7 @@ pub fn categorical_association(x: &[u32], y: &[u32]) -> Result<CategoricalReport
     let h_x = entropy_bits(&row_sums, nf);
     let h_y = entropy_bits(&col_sums, nf);
     let mut h_joint = 0.0f64;
-    for &cell in &table {
+    for &cell in table {
         if cell > 0 {
             let p = cell as f64 / nf;
             h_joint -= p * p.log2();

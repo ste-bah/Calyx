@@ -21,8 +21,17 @@ pub struct CudaContext {
     free_mem_mib_at_init: u64,
     blas: Arc<OnceLock<Arc<CudaBlas>>>,
     distance_module: Arc<OnceLock<Arc<CudaModule>>>,
+    algorithmic_module: Arc<OnceLock<Arc<CudaModule>>>,
+    energy_module: Arc<OnceLock<Arc<CudaModule>>>,
+    skill_module: Arc<OnceLock<Arc<CudaModule>>>,
+    assay_module: Arc<OnceLock<Arc<CudaModule>>>,
+    loom_module: Arc<OnceLock<Arc<CudaModule>>>,
     mxfp4_module: Arc<OnceLock<Arc<CudaModule>>>,
     topk_module: Arc<OnceLock<Arc<CudaModule>>>,
+    quant_module: Arc<OnceLock<Arc<CudaModule>>>,
+    packed_quant_module: Arc<OnceLock<Arc<CudaModule>>>,
+    mxfp_quant_module: Arc<OnceLock<Arc<CudaModule>>>,
+    olap_module: Arc<OnceLock<Arc<CudaModule>>>,
     kernel_functions: Arc<Mutex<HashMap<&'static str, Arc<CudaFunction>>>>,
 }
 
@@ -85,12 +94,48 @@ impl CudaContext {
         &self.distance_module
     }
 
+    pub(crate) fn algorithmic_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.algorithmic_module
+    }
+
+    pub(crate) fn energy_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.energy_module
+    }
+
+    pub(crate) fn skill_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.skill_module
+    }
+
+    pub(crate) fn assay_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.assay_module
+    }
+
+    pub(crate) fn loom_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.loom_module
+    }
+
     pub(crate) fn mxfp4_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
         &self.mxfp4_module
     }
 
     pub(crate) fn topk_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
         &self.topk_module
+    }
+
+    pub(crate) fn quant_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.quant_module
+    }
+
+    pub(crate) fn packed_quant_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.packed_quant_module
+    }
+
+    pub(crate) fn mxfp_quant_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.mxfp_quant_module
+    }
+
+    pub(crate) fn olap_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.olap_module
     }
 
     pub(crate) fn cached_function(
@@ -143,8 +188,17 @@ pub fn init_cuda(device_idx: u32, determinism: bool) -> Result<CudaContext> {
         free_mem_mib_at_init: free_mem_mib,
         blas: Arc::new(OnceLock::new()),
         distance_module: Arc::new(OnceLock::new()),
+        algorithmic_module: Arc::new(OnceLock::new()),
+        energy_module: Arc::new(OnceLock::new()),
+        skill_module: Arc::new(OnceLock::new()),
+        assay_module: Arc::new(OnceLock::new()),
+        loom_module: Arc::new(OnceLock::new()),
         mxfp4_module: Arc::new(OnceLock::new()),
         topk_module: Arc::new(OnceLock::new()),
+        quant_module: Arc::new(OnceLock::new()),
+        packed_quant_module: Arc::new(OnceLock::new()),
+        mxfp_quant_module: Arc::new(OnceLock::new()),
+        olap_module: Arc::new(OnceLock::new()),
         kernel_functions: Arc::new(Mutex::new(HashMap::new())),
     })
 }

@@ -238,8 +238,11 @@ fn manifest_load_failure_aborts_gc_without_relocating_referenced_assets() {
 
     let construction =
         VaultPanelVersionGcTarget::new(&vault, &vault_dir, &cold_dir).into_target_result();
-    let constructor_error_code = match construction {
-        Err(error) => Some(error.code.to_string()),
+    let (constructor_error_code, constructor_remediation) = match construction {
+        Err(error) => (
+            Some(error.code.to_string()),
+            Some(error.remediation.to_string()),
+        ),
         Ok(target) => {
             let policy = RetentionPolicy {
                 hot_versions_to_keep: 0,
@@ -252,7 +255,7 @@ fn manifest_load_failure_aborts_gc_without_relocating_referenced_assets() {
             let codebook_gc = CodebookVersionGc::new(policy);
             let codebook_ids = codebook_gc.find_unreferenced(&target).unwrap();
             codebook_gc.prune(&target, &codebook_ids).unwrap();
-            None
+            (None, None)
         }
     };
     fs::rename(&unavailable_current_path, &current_path).unwrap();
@@ -261,8 +264,9 @@ fn manifest_load_failure_aborts_gc_without_relocating_referenced_assets() {
     let codebook_after = fs::read(&codebook_path).ok();
     let manifest_reloads = manifest_store.load_current().is_ok();
     let readback = format!(
-        "constructor_error_code={}\npanel_hot_exists={}\npanel_cold_exists={}\npanel_expected_blake3={}\npanel_actual_blake3={}\ncodebook_hot_exists={}\ncodebook_cold_exists={}\ncodebook_expected_blake3={}\ncodebook_actual_blake3={}\nmanifest_reloads={}\n",
+        "constructor_error_code={}\nconstructor_remediation={}\npanel_hot_exists={}\npanel_cold_exists={}\npanel_expected_blake3={}\npanel_actual_blake3={}\ncodebook_hot_exists={}\ncodebook_cold_exists={}\ncodebook_expected_blake3={}\ncodebook_actual_blake3={}\nmanifest_reloads={}\n",
         constructor_error_code.as_deref().unwrap_or("NONE"),
+        constructor_remediation.as_deref().unwrap_or("NONE"),
         panel_path.exists(),
         cold_panel_path.exists(),
         blake3::hash(&panel_bytes).to_hex(),
@@ -290,8 +294,13 @@ fn manifest_load_failure_aborts_gc_without_relocating_referenced_assets() {
 
     assert_eq!(
         constructor_error_code.as_deref(),
-        Some("CALYX_DISK_PRESSURE"),
+        Some("CALYX_ASTER_MANIFEST_MISSING"),
         "manifest read failure was swallowed before GC:\n{readback}"
+    );
+    assert!(
+        constructor_remediation
+            .as_deref()
+            .is_some_and(|value| value.contains("restore the named manifest member"))
     );
     assert_eq!(panel_after.as_deref(), Some(panel_bytes.as_slice()));
     assert_eq!(codebook_after.as_deref(), Some(codebook_bytes.as_slice()));

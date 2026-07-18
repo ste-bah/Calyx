@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-#[path = "fsv_io.rs"]
-mod fsv_io;
+// calyx-shared-module: path=support/fsv_io.rs alias=__calyx_shared_support_fsv_io_rs local=fsv_io visibility=private
+use crate::__calyx_shared_support_fsv_io_rs as fsv_io;
 
 #[allow(unused_imports)]
 pub(crate) use fsv_io::{

@@ -11,8 +11,8 @@ use calyx_poly::{
 };
 use serde_json::{Value, json};
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 use support::{collect_files, hex, named_fsv_root, reset_dir, write_blake3sums, write_json};
 
 const HEALTHY_CODE: &str = "CALYX_POLY_SELF_EVOLUTION_APPROVED";
@@ -120,7 +120,7 @@ fn run_case(root: &Path, name: &str, kind: CaseKind, expected_code: &str) -> Val
     if !matches!(kind, CaseKind::MissingReproduction) {
         fs::write(
             &reproduction_path,
-            "cargo test -p calyx-poly --test issue114_self_evolution_guardrails_fsv\n",
+            "cargo test -p calyx-poly --test __calyx_integration_suite_0 issue114_self_evolution_guardrails_fsv\n",
         )
         .expect("write reproduction plan");
     }

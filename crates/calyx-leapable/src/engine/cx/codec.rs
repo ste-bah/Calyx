@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 
-use calyx_aster::cf::{ColumnFamily, base_key, full_content_hash};
+use calyx_aster::cf::{ColumnFamily, full_content_hash};
 use calyx_aster::dedup::EpochSecs;
 use calyx_aster::recurrence::{OccurrenceContext, RetentionPolicy, append_occurrence};
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
     CalyxError, Constellation, CxFlags, CxId, InputRef, LedgerRef, SlotId, SlotVector, Ts,
-    VaultStore,
 };
 use serde_json::{Value, json};
 
@@ -36,7 +35,6 @@ pub(super) struct PreparedPut {
     pub(super) input_bytes: Vec<u8>,
     pub(super) input_hash: [u8; 32],
     pub(super) input_len: usize,
-    pub(super) deduped: bool,
     pub(super) recurrence_context: OccurrenceContext,
 }
 
@@ -49,24 +47,23 @@ pub(super) fn prepare_put(
     handle: &VaultHandle,
     item: CxPutItem,
     batch_ts: Ts,
-    within_batch_duplicate: bool,
 ) -> EngineResult<PreparedPut> {
     let decoded = decode_input(&item.input)?;
     let id = handle
         .vault
         .cx_id_for_input(&decoded.bytes, item.panel_version);
-    prepare_put_decoded(handle, item, batch_ts, within_batch_duplicate, decoded, id)
+    prepare_put_decoded(handle, item, batch_ts, decoded, id)
 }
 
 pub(super) fn prepare_put_decoded(
     handle: &VaultHandle,
     item: CxPutItem,
     batch_ts: Ts,
-    within_batch_duplicate: bool,
     decoded: DecodedInput,
     id: CxId,
 ) -> EngineResult<PreparedPut> {
     reject_reserved_metadata(&item.metadata)?;
+    reject_reserved_scalars(&item.scalars)?;
     let input_len = decoded.bytes.len();
     let input_hash = full_content_hash([decoded.bytes.as_slice()]);
     let mut metadata = item.metadata;
@@ -78,7 +75,6 @@ pub(super) fn prepare_put_decoded(
     let slots = slots_from_params(item.slots)?;
     let created_at = item.ts.unwrap_or(batch_ts);
     let recurrence_context = recurrence_context(item.panel_version, &input_hash, &metadata)?;
-    let deduped = within_batch_duplicate || base_exists(handle, id)?;
     let constellation = Constellation {
         cx_id: id,
         vault_id: handle.vault.vault_id(),
@@ -112,7 +108,6 @@ pub(super) fn prepare_put_decoded(
         input_bytes: decoded.bytes,
         input_hash,
         input_len,
-        deduped,
         recurrence_context,
     })
 }
@@ -365,6 +360,21 @@ fn reject_reserved_metadata(metadata: &BTreeMap<String, String>) -> EngineResult
     Ok(())
 }
 
+fn reject_reserved_scalars(scalars: &BTreeMap<String, f64>) -> EngineResult<()> {
+    if scalars.contains_key(calyx_aster::recurrence::FREQUENCY_SCALAR) {
+        return Err(cx_error(
+            CALYX_LEAPABLE_CX_INPUT_INVALID,
+            format!(
+                "scalar {:?} is maintained by Aster recurrence state",
+                calyx_aster::recurrence::FREQUENCY_SCALAR
+            ),
+            "remove recurrence.frequency and let duplicate cx.put update recurrence",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn slots_from_params(params: Vec<CxSlotParam>) -> EngineResult<BTreeMap<SlotId, SlotVector>> {
     if let Some(first) = params.first() {
         return Err(cx_error(
@@ -400,13 +410,6 @@ fn slot_vector_kind(vector: &SlotVector) -> &'static str {
         SlotVector::Multi { .. } => "multi",
         SlotVector::Absent { .. } => "absent",
     }
-}
-
-fn base_exists(handle: &VaultHandle, id: CxId) -> EngineResult<bool> {
-    Ok(handle
-        .vault
-        .read_cf_at(handle.vault.snapshot(), ColumnFamily::Base, &base_key(id))?
-        .is_some())
 }
 
 fn recurrence_context(

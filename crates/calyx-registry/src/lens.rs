@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use calyx_core::{Asymmetry, CalyxError, Input, Lens, LensId, Result, SlotVector};
+use calyx_core::{
+    Asymmetry, CalyxError, GroupedLensRequest, Input, Lens, LensId, MeasurementGroupKey, Result,
+    SlotVector,
+};
 use serde::{Deserialize, Serialize};
 
 mod contract;
+mod registration;
 mod reproduce;
 mod validation;
 
@@ -204,6 +208,103 @@ impl Registry {
         Ok(vectors)
     }
 
+    /// Returns the exact shared-runtime identity advertised by a lens.
+    pub fn measurement_group_key(&self, lens_id: LensId) -> Result<Option<MeasurementGroupKey>> {
+        self.lookup(lens_id)?.lens.measurement_group_key()
+    }
+
+    /// Measures compatible frozen lens projections in one runtime forward pass.
+    ///
+    /// This API fails closed: every lens must advertise the same non-empty
+    /// group key, every requested id must be unique, and the runtime must return
+    /// one shape-valid vector per input for every requested lens. Callers must
+    /// not retry individual lenses after an error because that would restore
+    /// the redundant-forward path this boundary exists to prevent.
+    pub fn measure_grouped_batch(
+        &self,
+        lens_ids: &[LensId],
+        inputs: &[Input],
+    ) -> Result<BTreeMap<LensId, Vec<SlotVector>>> {
+        let Some((&driver_id, remaining_ids)) = lens_ids.split_first() else {
+            return Ok(BTreeMap::new());
+        };
+        let driver = self.lookup(driver_id)?;
+        let group_key = driver.lens.measurement_group_key()?.ok_or_else(|| {
+            CalyxError::lens_unreachable(format!(
+                "lens {driver_id} does not support grouped measurement"
+            ))
+        })?;
+        let mut requests = Vec::with_capacity(lens_ids.len());
+        requests.push(GroupedLensRequest {
+            lens_id: driver_id,
+            shape: driver.lens.shape(),
+        });
+        for &lens_id in remaining_ids {
+            if requests.iter().any(|request| request.lens_id == lens_id) {
+                return Err(CalyxError::lens_dim_mismatch(format!(
+                    "grouped measurement repeats lens {lens_id}"
+                )));
+            }
+            let entry = self.lookup(lens_id)?;
+            let candidate_key = entry.lens.measurement_group_key()?.ok_or_else(|| {
+                CalyxError::lens_unreachable(format!(
+                    "lens {lens_id} does not support grouped measurement"
+                ))
+            })?;
+            if candidate_key != group_key {
+                return Err(CalyxError::lens_unreachable(format!(
+                    "lens {lens_id} has a different grouped-runtime identity from lens {driver_id}"
+                )));
+            }
+            requests.push(GroupedLensRequest {
+                lens_id,
+                shape: entry.lens.shape(),
+            });
+        }
+        for &lens_id in lens_ids {
+            let entry = self.lookup(lens_id)?;
+            for input in inputs {
+                ensure_input_modality(entry.lens.as_ref(), input)?;
+            }
+        }
+        let measured = driver
+            .lens
+            .measure_grouped_batch(&requests, inputs)?
+            .ok_or_else(|| {
+                CalyxError::lens_unreachable(format!(
+                    "lens {driver_id} advertised grouped measurement but did not implement it"
+                ))
+            })?;
+        if measured.len() != requests.len() {
+            return Err(CalyxError::lens_dim_mismatch(format!(
+                "grouped runtime returned {} lens result sets for {} requests",
+                measured.len(),
+                requests.len()
+            )));
+        }
+        for request in &requests {
+            let vectors = measured.get(&request.lens_id).ok_or_else(|| {
+                CalyxError::lens_dim_mismatch(format!(
+                    "grouped runtime omitted lens {}",
+                    request.lens_id
+                ))
+            })?;
+            if vectors.len() != inputs.len() {
+                return Err(CalyxError::lens_dim_mismatch(format!(
+                    "grouped runtime lens {} returned {} vectors for {} inputs",
+                    request.lens_id,
+                    vectors.len(),
+                    inputs.len()
+                )));
+            }
+            let entry = self.lookup(request.lens_id)?;
+            for vector in vectors {
+                self.validate_entry(request.lens_id, entry, vector)?;
+            }
+        }
+        Ok(measured)
+    }
+
     /// Measures an ingest microbatch across lenses with bounded admission and degradation.
     pub fn measure_ingest_microbatch(
         &self,
@@ -270,6 +371,12 @@ impl Registry {
             .and_then(|entry| entry.spec.as_ref())
     }
 
+    /// Returns the input modality accepted by a registered lens.
+    pub fn lens_modality(&self, lens_id: LensId) -> Result<calyx_core::Modality> {
+        let entry = self.lookup(lens_id)?;
+        Ok(entry.lens.modality())
+    }
+
     pub fn lens_snapshots(&self) -> Vec<RegistryLensSnapshot> {
         self.lenses
             .iter()
@@ -283,152 +390,6 @@ impl Registry {
                 })
             })
             .collect()
-    }
-
-    pub(crate) fn register_persisted_arc(
-        &mut self,
-        lens: Arc<dyn Lens>,
-        contract: FrozenLensContract,
-        spec: Option<LensSpec>,
-        determinism: DeterminismProof,
-        runtime_golden: Option<RuntimeGolden>,
-    ) -> Result<LensId> {
-        contract.verify_registration(lens.as_ref())?;
-        if let Some(spec) = &spec {
-            ensure_spec_declares_contract(&contract, spec)?;
-        }
-        if let Some(golden) = &runtime_golden {
-            verify_runtime_golden_identity(&contract, golden)?;
-        }
-        let id = lens.id();
-        if self.lenses.contains_key(&id) {
-            return Err(CalyxError::registry_duplicate(format!(
-                "lens {id} is already registered"
-            )));
-        }
-        self.lenses.insert(
-            id,
-            RegistryEntry {
-                lens,
-                frozen: Some(contract),
-                spec,
-                determinism,
-                runtime_golden,
-            },
-        );
-        Ok(id)
-    }
-
-    /// Returns whether registration verified a deterministic probe or used an explicit exemption.
-    pub fn determinism_proof(&self, lens_id: LensId) -> Option<DeterminismProof> {
-        self.lenses.get(&lens_id).map(|entry| entry.determinism)
-    }
-
-    /// Probes runtime health for a registered lens.
-    pub fn health(&self, lens_id: LensId) -> Result<LensHealth> {
-        let entry = self.lookup(lens_id)?;
-        Ok(entry
-            .spec
-            .as_ref()
-            .map(LensSpec::health)
-            .unwrap_or(LensHealth::Loaded))
-    }
-
-    fn register_frozen_inner<L>(
-        &mut self,
-        lens: L,
-        contract: FrozenLensContract,
-        probe: Option<&Input>,
-        spec: Option<LensSpec>,
-    ) -> Result<LensId>
-    where
-        L: Lens + 'static,
-    {
-        self.register_frozen_arc_inner(Arc::new(lens), contract, probe, spec)
-    }
-
-    fn register_frozen_arc_inner(
-        &mut self,
-        lens: Arc<dyn Lens>,
-        contract: FrozenLensContract,
-        probe: Option<&Input>,
-        spec: Option<LensSpec>,
-    ) -> Result<LensId> {
-        contract.verify_registration(lens.as_ref())?;
-        if let Some(spec) = &spec {
-            ensure_spec_declares_contract(&contract, spec)?;
-        }
-
-        let runtime_version = spec.as_ref().and_then(process_runtime_golden_version);
-        let default_probe = runtime_version.map(|_| {
-            Input::new(
-                contract.modality(),
-                PROCESS_RUNTIME_GOLDEN_PROBE_BYTES.to_vec(),
-            )
-        });
-        let effective_probe = probe.or(default_probe.as_ref());
-        let verified_output = effective_probe
-            .map(|probe| contract.measure_determinism_probe(lens.as_ref(), probe))
-            .transpose()?;
-        let runtime_golden = match (runtime_version, effective_probe, verified_output.as_ref()) {
-            (Some(runtime_version), Some(probe), Some(output)) => {
-                let golden_output = output.as_dense().ok_or_else(|| {
-                    CalyxError::lens_frozen_violation(
-                        "process runtime identity probes require dense output",
-                    )
-                })?;
-                Some(RuntimeGolden {
-                    lens_id: contract.lens_id(),
-                    runtime_version: runtime_version.to_string(),
-                    probe: probe.clone(),
-                    golden_output: golden_output.to_vec(),
-                    tolerance: PROCESS_RUNTIME_GOLDEN_TOLERANCE,
-                })
-            }
-            _ => None,
-        };
-        let determinism = if effective_probe.is_some() {
-            DeterminismProof::ProbeVerified
-        } else {
-            DeterminismProof::ContractOnlyExemption
-        };
-        let id = lens.id();
-        if self.lenses.contains_key(&id) {
-            return Err(CalyxError::registry_duplicate(format!(
-                "lens {id} is already registered"
-            )));
-        }
-        self.lenses.insert(
-            id,
-            RegistryEntry {
-                lens,
-                frozen: Some(contract),
-                spec,
-                determinism,
-                runtime_golden,
-            },
-        );
-        Ok(id)
-    }
-
-    fn validate_entry(
-        &self,
-        lens_id: LensId,
-        entry: &RegistryEntry,
-        vector: &SlotVector,
-    ) -> Result<()> {
-        if let Some(contract) = &entry.frozen {
-            contract.verify_registration(entry.lens.as_ref())?;
-            contract.verify_vector(lens_id, vector)
-        } else {
-            ensure_vector_shape(lens_id, entry.lens.shape(), vector)
-        }
-    }
-
-    fn lookup(&self, lens_id: LensId) -> Result<&RegistryEntry> {
-        self.lenses.get(&lens_id).ok_or_else(|| {
-            CalyxError::lens_unreachable(format!("lens {lens_id} is not registered"))
-        })
     }
 }
 

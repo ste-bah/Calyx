@@ -15,14 +15,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use batch::GroupCommitBatcher;
-pub(crate) use point_read::read_record_at;
+pub(crate) use point_read::WalWriteRowPointReader;
 pub use replay::replay_dir;
 pub use replay::replay_dir_after;
 use replay::{replay_dir_locked, replay_dir_locked_after};
-pub(crate) use stream_replay::stream_records;
+pub(crate) use stream_replay::{stream_records, stream_records_after};
+
+pub(crate) const RECORD_HEADER_BYTES: u64 = record::HEADER_LEN as u64;
 
 /// Default group-commit window for PH05.
 pub const DEFAULT_GROUP_COMMIT_WINDOW: Duration = Duration::from_millis(2);
+/// Maximum encoded payload accepted by one WAL record.
+pub(crate) const MAX_RECORD_BYTES: usize = record::MAX_RECORD_BYTES as usize;
 
 /// WAL writer configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

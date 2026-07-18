@@ -4,8 +4,8 @@ use super::super::*;
 
 mod flows;
 use flows::{
-    chain_walks_tokens, discovery_chain_tokens, graph_collection_generations_tokens,
-    graph_collection_state_tokens, probe_matrix_tokens,
+    chain_walks_tokens, citation_overlay_tokens, discovery_chain_tokens,
+    graph_collection_generations_tokens, graph_collection_state_tokens, probe_matrix_tokens,
 };
 mod falsification_tokens;
 use falsification_tokens::hypothesis_falsification_tokens;
@@ -107,6 +107,8 @@ pub(super) fn subcommand_tokens(command: &Subcommand) -> Vec<String> {
         Subcommand::VerifyChain(args) => verify_chain_tokens(args),
         Subcommand::Reproduce(args) => std::iter::once("reproduce".to_string())
             .chain(args.record.then_some("--record".to_string()))
+            .chain(args.resident_addr.map(|_| "--resident-addr".to_string()))
+            .chain(args.resident_addr.map(|addr| addr.to_string()))
             .chain([args.vault.clone(), args.answer_id.clone()])
             .collect(),
         Subcommand::AnnealStatus(args) => vec!["anneal-status".to_string(), args.vault.clone()],
@@ -126,6 +128,7 @@ pub(super) fn subcommand_tokens(command: &Subcommand) -> Vec<String> {
         Subcommand::WeaveLoom(args) => weave_loom_tokens(args),
         Subcommand::DomainBridges(args) => domain_bridges_tokens(args),
         Subcommand::MaterializeBridgeCorpus(args) => bridge_corpus_tokens(args),
+        Subcommand::MaterializeCitationOverlay(args) => citation_overlay_tokens(args),
         Subcommand::MaterializeMolecularVault(args) => molecular_vault_tokens(args),
         Subcommand::MaterializeEvidenceSubstrate(args) => evidence_substrate_tokens(args),
         Subcommand::MaterializeLincsReversal(args) => lincs_reversal_tokens(args),
@@ -422,6 +425,15 @@ fn ingest_tokens(args: &IngestArgs) -> Vec<String> {
         out.push("--allow-cold-gpu-workers".to_string());
     }
     push_opt(&mut out, "--session-id", args.session_id.as_deref());
+    if let Some(value) = args.precondition.expected_durable_seq {
+        out.extend(["--expect-durable-seq".to_string(), value.to_string()]);
+    }
+    if let Some(value) = args.precondition.expected_manifest_seq {
+        out.extend(["--expect-manifest-seq".to_string(), value.to_string()]);
+    }
+    if let Some(value) = args.precondition.expected_base_count {
+        out.extend(["--expect-base-count".to_string(), value.to_string()]);
+    }
     out
 }
 
@@ -482,13 +494,11 @@ fn profile_lens_tokens(args: &ProfileLensArgs) -> Vec<String> {
     );
     out
 }
-
 fn push_opt(out: &mut Vec<String>, flag: &str, value: Option<&str>) {
     if let Some(value) = value {
         out.extend([flag.to_string(), value.to_string()]);
     }
 }
-
 fn slot_tokens(command: &str, args: &SlotCommandArgs) -> Vec<String> {
     vec![
         command.to_string(),

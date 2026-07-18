@@ -1,5 +1,8 @@
 //! Append-only ledger writer and row-store adapters.
 
+mod memory;
+
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use calyx_core::{CalyxError, Clock, LedgerRef, Result};
@@ -11,12 +14,57 @@ use crate::kind::EntryKind;
 use crate::redaction::RedactionPolicy;
 
 pub use crate::directory_store::DirectoryLedgerStore;
+pub use memory::MemoryLedgerStore;
 
 /// Physical ledger row keyed by big-endian sequence number.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerRow {
     pub seq: u64,
     pub bytes: Vec<u8>,
+}
+
+/// One coherent read view of ledger rows and their external head witness.
+///
+/// Stores that already own an immutable in-memory view can return a borrowed
+/// snapshot. Other implementations receive an owned snapshot from the trait
+/// default. Consumers can then count, verify, and audit the same rows without
+/// re-entering [`LedgerCfStore::scan`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerSnapshot<'a> {
+    rows: Cow<'a, [LedgerRow]>,
+    head_anchor: Option<Cow<'a, LedgerHeadAnchor>>,
+}
+
+impl<'a> LedgerSnapshot<'a> {
+    pub fn borrowed(rows: &'a [LedgerRow], head_anchor: Option<&'a LedgerHeadAnchor>) -> Self {
+        Self {
+            rows: Cow::Borrowed(rows),
+            head_anchor: head_anchor.map(Cow::Borrowed),
+        }
+    }
+
+    pub fn owned(rows: Vec<LedgerRow>, head_anchor: Option<LedgerHeadAnchor>) -> Self {
+        Self {
+            rows: Cow::Owned(rows),
+            head_anchor: head_anchor.map(Cow::Owned),
+        }
+    }
+
+    pub fn rows(&self) -> &[LedgerRow] {
+        &self.rows
+    }
+
+    pub fn head_anchor(&self) -> Option<&LedgerHeadAnchor> {
+        self.head_anchor.as_deref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +113,17 @@ impl PreparedLedgerEntry {
 pub trait LedgerCfStore {
     /// Returns all rows sorted by sequence number.
     fn scan(&self) -> Result<Vec<LedgerRow>>;
+
+    /// Acquires rows and the external head witness for one logical read.
+    ///
+    /// Implementations backed by a shared lock or immutable resident view
+    /// should override this method so both values come from the same guarded
+    /// generation and so the rows can be borrowed rather than copied.
+    fn snapshot(&self) -> Result<LedgerSnapshot<'_>> {
+        let head_anchor = self.head_anchor()?;
+        let rows = self.scan()?;
+        Ok(LedgerSnapshot::owned(rows, head_anchor))
+    }
 
     /// Returns at most the newest `n` rows sorted by sequence number.
     ///
@@ -283,6 +342,20 @@ where
         self.last_ts
     }
 
+    pub fn refresh_tip_from_store(&mut self) -> Result<()> {
+        let (next_seq, prev_hash, last_ts) = recover_tip(&self.store)?;
+        if next_seq < self.next_seq || (next_seq == self.next_seq && prev_hash != self.prev_hash) {
+            return Err(CalyxError::ledger_chain_broken(format!(
+                "ledger tip diverged: appender expected next_seq {}, store has {}",
+                self.next_seq, next_seq
+            )));
+        }
+        self.next_seq = next_seq;
+        self.prev_hash = prev_hash;
+        self.last_ts = last_ts;
+        Ok(())
+    }
+
     pub fn scan_entries(&self) -> Result<Vec<LedgerEntry>> {
         self.store
             .scan()?
@@ -331,70 +404,6 @@ where
         } else {
             clock_ts
         })
-    }
-}
-
-/// In-memory row store for deterministic tests.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MemoryLedgerStore {
-    rows: BTreeMap<u64, Vec<u8>>,
-    anchor: Option<LedgerHeadAnchor>,
-}
-
-impl MemoryLedgerStore {
-    pub fn insert_raw(&mut self, seq: u64, bytes: Vec<u8>) {
-        self.rows.insert(seq, bytes);
-    }
-
-    pub fn remove_raw(&mut self, seq: u64) {
-        self.rows.remove(&seq);
-    }
-}
-
-impl LedgerCfStore for MemoryLedgerStore {
-    fn scan(&self) -> Result<Vec<LedgerRow>> {
-        Ok(self
-            .rows
-            .iter()
-            .map(|(seq, bytes)| LedgerRow {
-                seq: *seq,
-                bytes: bytes.clone(),
-            })
-            .collect())
-    }
-
-    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
-        Ok(self.rows.get(&seq).map(|bytes| LedgerRow {
-            seq,
-            bytes: bytes.clone(),
-        }))
-    }
-
-    fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()> {
-        if self.rows.contains_key(&seq) {
-            return Err(append_only_violation(format!(
-                "ledger seq {seq} already exists"
-            )));
-        }
-        self.rows.insert(seq, bytes.to_vec());
-        Ok(())
-    }
-
-    fn head_anchor(&self) -> Result<Option<LedgerHeadAnchor>> {
-        Ok(self.anchor.clone())
-    }
-
-    fn put_head_anchor(&mut self, anchor: &LedgerHeadAnchor) -> Result<()> {
-        if let Some(current) = &self.anchor
-            && anchor.height < current.height
-        {
-            return Err(append_only_violation(format!(
-                "ledger head anchor regressed from {} to {}",
-                current.height, anchor.height
-            )));
-        }
-        self.anchor = Some(anchor.clone());
-        Ok(())
     }
 }
 

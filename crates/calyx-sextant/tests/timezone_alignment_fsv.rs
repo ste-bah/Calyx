@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::dedup::EpochSecs;
 use calyx_aster::vault::{AsterVault, VaultOptions};
@@ -17,9 +20,6 @@ use calyx_oracle::{
 };
 use calyx_sextant::{PeriodicOptions, score_e3_periodic, temporal_time_bucket};
 use serde_json::json;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
 use sextant_support::hex;
 
 const TUESDAY_2024_01_02_14H_UTC: i64 = 1_704_204_000;

@@ -219,6 +219,7 @@ fn i8bin_build_and_search_uses_real_vector_files() {
     let root = temp_root("i8bin-happy");
     let corpus = root.join("corpus.i8bin");
     let queries = root.join("queries.i8bin");
+    let truth = root.join("truth.i32bin");
     let vault = root.join("vault");
     write_i8bin(
         &corpus,
@@ -233,6 +234,7 @@ fn i8bin_build_and_search_uses_real_vector_files() {
         ],
     );
     write_i8bin(&queries, 3, &[&[10, 0, 0], &[0, 10, 0], &[0, 0, 10]]);
+    write_i32bin(&truth, 1, &[&[0], &[2], &[4]]);
 
     run_build(&[
         "--vault".into(),
@@ -284,6 +286,8 @@ fn i8bin_build_and_search_uses_real_vector_files() {
         path_arg(&queries),
         "--corpus".into(),
         path_arg(&corpus),
+        "--ground-truth-file".into(),
+        path_arg(&truth),
         "--n".into(),
         "3".into(),
         "--k".into(),
@@ -297,7 +301,7 @@ fn i8bin_build_and_search_uses_real_vector_files() {
         "--recall-floor".into(),
         "1.0".into(),
     ])
-    .expect("search i8bin vault with exact recall");
+    .expect("search i8bin vault with precomputed exact recall");
     let _ = std::fs::remove_dir_all(root);
 }
 

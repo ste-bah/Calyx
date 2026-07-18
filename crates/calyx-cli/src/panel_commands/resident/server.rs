@@ -10,6 +10,11 @@ pub(crate) struct ResidentService {
     pub(crate) state: ResidentWarmState,
     pub(crate) bind: SocketAddr,
     pub(crate) started: Instant,
+    pub(crate) max_runtime_batch: usize,
+    pub(crate) capacity_probe_input_count: usize,
+    pub(crate) capacity_probe_ms: u128,
+    pub(crate) capacity_probe_modalities: Vec<Modality>,
+    pub(crate) onnx_shape_budget: Option<calyx_registry::OnnxShapeBucketBudget>,
 }
 
 pub(crate) fn serve(args: &[String]) -> CliResult {
@@ -36,12 +41,24 @@ pub(crate) fn serve(args: &[String]) -> CliResult {
         None => None,
     };
     let discovery_template = flags.template.clone();
+    let max_runtime_batch = flags.max_runtime_batch.unwrap_or(DEFAULT_MAX_RUNTIME_BATCH);
     let state = load_resident_warm_state(warm_options(home.clone(), flags))?;
-    let service = Arc::new(ResidentService {
+    let mut service = ResidentService {
         state,
         bind: local_addr,
         started: Instant::now(),
-    });
+        max_runtime_batch,
+        capacity_probe_input_count: 0,
+        capacity_probe_ms: 0,
+        capacity_probe_modalities: Vec::new(),
+        onnx_shape_budget: None,
+    };
+    let capacity = super::capacity::run(&service)?;
+    service.capacity_probe_input_count = capacity.input_count;
+    service.capacity_probe_ms = capacity.elapsed_ms;
+    service.capacity_probe_modalities = capacity.modalities;
+    service.onnx_shape_budget = capacity.onnx_shape_budget;
+    let service = Arc::new(service);
     let ready = readiness(&service);
     if let Some(path) = service.state.ready_out.clone() {
         write_json_file(path, &ready)?;
@@ -107,13 +124,68 @@ fn warm_options(home: PathBuf, flags: ServeFlags) -> ResidentWarmOptions {
 
 fn serve_loop(listener: TcpListener, service: Arc<ResidentService>) -> CliResult {
     let running = Arc::new(AtomicBool::new(true));
+    serve_loop_with(listener, Arc::clone(&running), |stream, running| {
+        handle_client(stream, Arc::clone(&service), running)
+    })
+}
+
+pub(super) fn serve_loop_with(
+    listener: TcpListener,
+    running: Arc<AtomicBool>,
+    mut handle: impl FnMut(TcpStream, Arc<AtomicBool>) -> CliResult,
+) -> CliResult {
     while running.load(Ordering::SeqCst) {
-        let (stream, peer) = listener.accept()?;
+        let (stream, peer) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                eprintln!(
+                    "CALYX_PANEL_RESIDENT_RUNTIME {}",
+                    json!({
+                        "event_code": "CALYX_PANEL_RESIDENT_ACCEPT_INTERRUPTED",
+                        "phase": "accept_retry",
+                        "error_message": error.to_string(),
+                        "remediation": "no operator action required; the listener is retrying",
+                    })
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(CliError::io(format!(
+                    "accept resident client on {}: {error}",
+                    listener.local_addr().map_or_else(
+                        |addr_error| format!("unknown ({addr_error})"),
+                        |addr| addr.to_string()
+                    )
+                )));
+            }
+        };
         if !peer.ip().is_loopback() {
+            eprintln!(
+                "CALYX_PANEL_RESIDENT_RUNTIME {}",
+                json!({
+                    "event_code": "CALYX_PANEL_RESIDENT_NON_LOOPBACK_CLIENT",
+                    "phase": "client_rejected",
+                    "peer": peer.to_string(),
+                    "remediation": "connect only through the configured loopback address",
+                })
+            );
             let _ = stream.shutdown(Shutdown::Both);
             continue;
         }
-        handle_client(stream, Arc::clone(&service), Arc::clone(&running))?;
+        if let Err(error) = handle(stream, Arc::clone(&running)) {
+            eprintln!(
+                "CALYX_PANEL_RESIDENT_RUNTIME {}",
+                json!({
+                    "event_code": "CALYX_PANEL_RESIDENT_CLIENT_ERROR",
+                    "phase": "client_error",
+                    "peer": peer.to_string(),
+                    "error_code": error.code(),
+                    "error_message": error.message(),
+                    "cause_remediation": error.remediation(),
+                    "remediation": "inspect and repair only the named client; use the resident JSON-line or binary protocol and read the complete response; the resident remains active",
+                })
+            );
+        }
     }
     Ok(())
 }
@@ -123,12 +195,26 @@ fn handle_client(
     service: Arc<ResidentService>,
     running: Arc<AtomicBool>,
 ) -> CliResult {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let timeout = Some(Duration::from_secs(CLIENT_TIMEOUT_SECS));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|error| CliError::io(format!("set resident client read timeout: {error}")))?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|error| CliError::io(format!("set resident client write timeout: {error}")))?;
+    let reader_stream = stream
+        .try_clone()
+        .map_err(|error| CliError::io(format!("clone resident client stream: {error}")))?;
+    let mut reader = BufReader::new(reader_stream);
     let mut first_line = Vec::new();
-    reader.read_until(b'\n', &mut first_line)?;
+    reader
+        .read_until(b'\n', &mut first_line)
+        .map_err(|error| CliError::io(format!("read resident client request line: {error}")))?;
     if first_line == RESIDENT_BINARY_MAGIC {
         serve_binary_measure_batch(&mut reader, &mut stream, &service)?;
-        stream.flush()?;
+        stream
+            .flush()
+            .map_err(|error| CliError::io(format!("flush resident binary response: {error}")))?;
         let _ = stream.shutdown(Shutdown::Both);
         return Ok(());
     }
@@ -150,8 +236,12 @@ fn handle_client(
     };
     serde_json::to_writer(&mut stream, &response)
         .map_err(|error| CliError::runtime(format!("write resident response JSON: {error}")))?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    stream
+        .write_all(b"\n")
+        .map_err(|error| CliError::io(format!("write resident response terminator: {error}")))?;
+    stream
+        .flush()
+        .map_err(|error| CliError::io(format!("flush resident JSON response: {error}")))?;
     let _ = stream.shutdown(Shutdown::Both);
     Ok(())
 }

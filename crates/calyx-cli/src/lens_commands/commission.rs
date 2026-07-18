@@ -22,7 +22,7 @@ use artifact::{
     manifest_files, read_hidden_size, require_named, require_named_fallback,
 };
 use log::{ConversionLog, run_command, write_json_file};
-use options::{CommissionFlags, CommissionRuntime};
+use options::{CommissionFlags, CommissionRuntime, qwen3_max_tokens_for_manifest};
 
 use super::catalog::{AddReport, add_manifest_to_catalog};
 use super::support::validate_vector_contract;
@@ -397,6 +397,7 @@ fn write_manifest(
         truncate_dim: None,
         recall_delta: calyx_registry::spec::default_recall_delta(),
         max_batch: flags.max_batch,
+        max_tokens: qwen3_max_tokens_for_manifest(flags),
         // Resolved by the #1157 batch preflight after this initial write.
         batch_policy: None,
     };

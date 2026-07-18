@@ -84,11 +84,30 @@ fn batch_jsonl_empty_and_invalid_edges() {
     let invalid = root.join("bad.jsonl");
     fs::write(&invalid, format!("{}\nnot-json\n", batch_line("ok"))).unwrap();
     let preflight_err = validate_batch_file(&invalid).unwrap_err();
-    assert_eq!(preflight_err.code(), "CALYX_CLI_IO_ERROR");
+    assert_eq!(preflight_err.code(), "CALYX_INGEST_BATCH_INVALID");
     assert!(preflight_err.message().contains("line 2"));
+    assert!(preflight_err.remediation().contains("parser column"));
     let err = read_batch_texts(&invalid).unwrap_err();
-    assert_eq!(err.code(), "CALYX_CLI_IO_ERROR");
+    assert_eq!(err.code(), "CALYX_INGEST_BATCH_INVALID");
     assert!(err.message().contains("line 2"));
+    assert!(
+        err.remediation()
+            .contains("one complete UTF-8 JSON object per line")
+    );
+
+    let truncated = root.join("truncated.jsonl");
+    fs::write(&truncated, r#"{"text":"unfinished""#).unwrap();
+    let err = validate_batch_file(&truncated).unwrap_err();
+    assert_eq!(err.code(), "CALYX_INGEST_BATCH_INVALID");
+    assert!(err.message().contains("EOF while parsing an object"));
+    assert!(err.message().contains("line 1 column"));
+    assert!(err.remediation().contains("parser column"));
+
+    let invalid_utf8 = root.join("invalid-utf8.jsonl");
+    fs::write(&invalid_utf8, [b'{', 0xff, b'}', b'\n']).unwrap();
+    let err = validate_batch_file(&invalid_utf8).unwrap_err();
+    assert_eq!(err.code(), "CALYX_INGEST_BATCH_INVALID");
+    assert!(err.message().contains("not valid UTF-8"));
     fs::remove_dir_all(root).ok();
 }
 
@@ -197,8 +216,9 @@ fn invalid_batch_jsonl_fails_before_vault_open() {
 
     let err = ingest_batch_streaming(&resolved, &invalid).unwrap_err();
 
-    assert_eq!(err.code(), "CALYX_CLI_IO_ERROR");
+    assert_eq!(err.code(), "CALYX_INGEST_BATCH_INVALID");
     assert!(err.message().contains("batch JSONL line 1 is invalid"));
+    assert!(err.remediation().contains("parser column"));
     assert!(
         !missing_vault.exists(),
         "invalid JSONL must fail before opening or creating vault state"
@@ -405,6 +425,51 @@ fn batch_ingest_rebuilds_stale_base_page_index_for_physical_readback() {
         "rebuilt index must be sealed to the post-ingest ledger head"
     );
     assert_eq!(rebuilt.live_entries, 2);
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn batch_ingest_builds_missing_base_page_index_and_reads_back_the_new_row() {
+    let (root, resolved) = test_vault_with_registered_dense_lens("ingest-missing-base-page-index");
+    let manifest_path = resolved
+        .path
+        .join(calyx_aster::base_page_index::BASE_PAGE_INDEX_DIR)
+        .join(calyx_aster::base_page_index::BASE_PAGE_INDEX_MANIFEST);
+    assert!(
+        !manifest_path.exists(),
+        "fixture must prove the missing-index transition"
+    );
+
+    let text = "first row must create the required Base page index";
+    let batch = resolved.path.join("missing-index.jsonl");
+    fs::write(&batch, format!("{}\n", batch_line(text))).unwrap();
+    let summary = ingest_batch_streaming(&resolved, &batch).unwrap();
+    assert_eq!(summary.new_count, 1);
+    assert_eq!(summary.verified_base_rows, 1);
+
+    let vault = open_vault(&resolved).unwrap();
+    let snapshot = vault.snapshot();
+    let state = load_vault_panel_state(&resolved.path).unwrap();
+    let cx_id = vault.cx_id_for_input(text.as_bytes(), state.panel.version);
+    let key = base_key(cx_id);
+    let manifest =
+        calyx_aster::base_page_index::read_base_page_index_manifest(&resolved.path).unwrap();
+    assert_eq!(manifest.ledger_head_height, snapshot);
+    assert_eq!(manifest.live_entries, 1);
+    assert_eq!(manifest.total_entries, 1);
+
+    let rows = calyx_aster::base_page_index::read_indexed_base_rows_for_keys(
+        &resolved.path,
+        std::slice::from_ref(&key),
+    )
+    .unwrap();
+    let stored = rows
+        .get(&key)
+        .and_then(|value| value.as_ref())
+        .expect("new Base row must be physically readable through the persisted index");
+    let decoded = calyx_aster::vault::encode::decode_constellation_base(stored).unwrap();
+    assert_eq!(decoded.cx_id, cx_id);
 
     fs::remove_dir_all(root).ok();
 }

@@ -6,7 +6,8 @@ use calyx_forge::{
     cuda::{bench_gemm_cublas, bench_gemm_reference_cublas},
     init_cuda,
 };
-mod cuda_parity_support;
+// calyx-shared-module: path=cuda_parity_support.rs alias=__calyx_shared_cuda_parity_support_rs local=cuda_parity_support visibility=private
+use crate::__calyx_shared_cuda_parity_support_rs as cuda_parity_support;
 #[cfg(feature = "cuda")]
 use cuda_parity_support::{
     PARITY_ABS_TOL, l2_norm, load_golden_f32, load_manifest, parity_report, write_cuda_fsv_readback,

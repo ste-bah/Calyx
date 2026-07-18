@@ -27,7 +27,6 @@ fn issue1977_kill_recover_wal_tail_and_torn_tail_fsv() {
     fs::create_dir_all(&vault_dir).expect("create vault dir");
 
     let mut child = Command::new(std::env::current_exe().expect("current test exe"))
-        .arg("--exact")
         .arg("issue1977_kill_recover_wal_tail_and_torn_tail_fsv")
         .arg("--nocapture")
         .env(CHILD_ENV, "1")
@@ -39,7 +38,7 @@ fn issue1977_kill_recover_wal_tail_and_torn_tail_fsv() {
         .expect("spawn child writer");
 
     let ready_path = fixture.root.join("ready-to-kill.json");
-    wait_for_path(&ready_path, Duration::from_secs(15));
+    wait_for_child_path(&ready_path, Duration::from_secs(15), &mut child);
     let expected = read_committed(&fixture.root);
     assert_eq!(expected.len(), EXPECTED_TOTAL);
     assert_eq!(

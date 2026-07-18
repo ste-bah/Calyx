@@ -1,8 +1,9 @@
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use calyx_core::Modality;
+use calyx_core::{CalyxError, Modality};
 use serde::Serialize;
 
 use super::LensCatalogEntry;
@@ -15,7 +16,7 @@ use crate::error::{CliError, CliResult};
 use crate::lens_commands::catalog::{catalog_path, read_catalog};
 use crate::output::print_json;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Flags {
     home: Option<PathBuf>,
     name: Option<String>,
@@ -31,6 +32,7 @@ struct Flags {
     assay_card: Option<PathBuf>,
     a37_admission_card: Option<PathBuf>,
     require_a37_gate: bool,
+    resident_addr: Option<SocketAddr>,
 }
 
 #[derive(Serialize)]
@@ -60,6 +62,8 @@ struct SeedReport {
     index_path: PathBuf,
     templates: Vec<SaveReport>,
 }
+
+const RESIDENT_REQUIRED_CODE: &str = "CALYX_PANEL_RESIDENT_REQUIRED";
 
 pub(super) fn run(rest: &[String]) -> CliResult {
     let (command, args) = rest
@@ -172,7 +176,7 @@ fn refresh(args: &[String]) -> CliResult {
     })?;
     let catalog = read_catalog(&catalog_path(Some(&home))?)?;
     let store = TemplateStore::open(&home);
-    let source = store.load(&selector)?;
+    let source = store.load_for_refresh(&selector)?;
     let mut lenses = Vec::with_capacity(source.lenses.len());
     for old in &source.lenses {
         let entry = catalog
@@ -214,7 +218,10 @@ fn refresh(args: &[String]) -> CliResult {
             name: source.name,
             notes: flags.notes.unwrap_or(source.notes),
             lenses,
-            ensemble_card: source.ensemble_card,
+            // Refresh explicitly re-resolves deployment identities. Existing
+            // measurement/admission evidence names the previous identities and
+            // must never be silently carried onto the new template version.
+            ensemble_card: None,
         },
         vault::now_ms(),
     )?;
@@ -244,13 +251,14 @@ fn profile(args: &[String]) -> CliResult {
 
 fn swap(args: &[String]) -> CliResult {
     let flags = Flags::parse(args)?;
-    let home = home(flags.home)?;
     let selector = flags
         .template
         .ok_or_else(|| CliError::usage("panel template swap requires --template <name-or-id>"))?;
     let vault_name = flags
         .vault
         .ok_or_else(|| CliError::usage("panel template swap requires --vault <vault>"))?;
+    let resident_addr = required_swap_resident(flags.resident_addr)?;
+    let home = home(flags.home)?;
     let vault_dir = vault::resolve_vault(&home, &vault_name)?;
     let store = TemplateStore::open(&home);
     let report = store.swap_into_vault(
@@ -258,8 +266,20 @@ fn swap(args: &[String]) -> CliResult {
         &vault_dir,
         vault::now_ms(),
         flags.require_a37_gate,
+        resident_addr,
     )?;
     print_json(&report)
+}
+
+fn required_swap_resident(resident_addr: Option<SocketAddr>) -> CliResult<SocketAddr> {
+    resident_addr.ok_or_else(|| {
+        CliError::Calyx(CalyxError {
+            code: RESIDENT_REQUIRED_CODE,
+            message: "panel template swap requires an exact loopback --resident-addr; local template materialization would create a second GPU model set"
+                .to_string(),
+            remediation: "start `calyx panel resident serve --template <same-template>`, verify readiness, and retry the swap with its loopback address",
+        })
+    })
 }
 
 fn save_seed(

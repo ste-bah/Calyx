@@ -1,5 +1,7 @@
 use super::*;
 
+mod latest;
+
 impl VersionedCfStore {
     /// Reads one CF/key at the pinned sequence.
     pub fn read_at(
@@ -14,7 +16,8 @@ impl VersionedCfStore {
         {
             let table = self.rows.read().expect("mvcc row table poisoned");
             if let Some(value) = table
-                .get(&(cf, key.to_vec()))
+                .get(&cf)
+                .and_then(|rows| rows.get(key))
                 .and_then(|versions| visible_value_state(versions, snapshot.seq()))
             {
                 return Ok(value.into_option());
@@ -35,7 +38,8 @@ impl VersionedCfStore {
         self.ensure_unbarriered(cf, key)?;
         let table = self.rows.read().expect("mvcc row table poisoned");
         let seq = table
-            .get(&(cf, key.to_vec()))
+            .get(&cf)
+            .and_then(|rows| rows.get(key))
             .and_then(|versions| visible_version(versions, snapshot.seq()))
             .map(|version| version.seq);
         if seq.is_some() || !self.router_latest_readback.load(Ordering::Acquire) {
@@ -57,13 +61,61 @@ impl VersionedCfStore {
         clock: &dyn Clock,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         self.ensure_snapshot_live(snapshot, clock)?;
-        for read in reads {
-            self.ensure_unbarriered(read.cf, &read.key)?;
+        if reads.is_empty() {
+            return Ok(Vec::new());
         }
-        reads
-            .iter()
-            .map(|read| self.read_at(snapshot, read.cf, &read.key, clock))
-            .collect()
+
+        // Hold one shared barrier generation across table and router
+        // resolution. An installer needs the write guard, so no requested key
+        // can become blocked halfway through this logical batch.
+        let barriers = self
+            .read_barriers
+            .read()
+            .expect("mvcc read barriers poisoned");
+        #[cfg(test)]
+        self.batch_barrier_phases.fetch_add(1, Ordering::Relaxed);
+        for read in reads {
+            if let Some(error) = first_blocking(&barriers, read.cf, &read.key) {
+                return Err(error);
+            }
+        }
+
+        let mut values = vec![None; reads.len()];
+        let mut router_misses = Vec::new();
+        {
+            let table = self.rows.read().expect("mvcc row table poisoned");
+            #[cfg(test)]
+            self.batch_row_phases.fetch_add(1, Ordering::Relaxed);
+            for (index, read) in reads.iter().enumerate() {
+                let visible = table
+                    .get(&read.cf)
+                    .and_then(|rows| rows.get(read.key.as_slice()))
+                    .and_then(|versions| visible_value_state(versions, snapshot.seq()));
+                match visible {
+                    Some(VisibleValue::Live(value)) => values[index] = Some(value),
+                    Some(VisibleValue::Tombstone) => {}
+                    None => router_misses.push(index),
+                }
+            }
+        }
+
+        if router_misses.is_empty() || !self.router_latest_readback.load(Ordering::Acquire) {
+            return Ok(values);
+        }
+
+        self.ensure_router_latest_snapshot(snapshot)?;
+        let router = self.router.read().expect("mvcc router poisoned");
+        #[cfg(test)]
+        self.batch_router_phases.fetch_add(1, Ordering::Relaxed);
+        if let Some(router) = router.as_ref() {
+            for index in router_misses {
+                let read = &reads[index];
+                values[index] = router
+                    .get(read.cf, &read.key)?
+                    .filter(|value| !is_tombstone_value(value));
+            }
+        }
+        Ok(values)
     }
 
     /// Scans visible rows for one CF at the pinned sequence, ordered by key.
@@ -131,33 +183,45 @@ impl VersionedCfStore {
             return Ok(Vec::new());
         }
         if self.router_latest_readback.load(Ordering::Acquire) {
-            let mut rows = self.router_latest_rows_page(snapshot, cf, range, after_key, limit)?;
-            self.overlay_table_rows(snapshot, cf, Some(range), &mut rows);
-            for key in rows.keys() {
-                self.ensure_unbarriered(cf, key)?;
-            }
-            return Ok(rows
+            // Select visible keys first so table tombstones and inserts are
+            // merged correctly without cloning the complete value range.
+            let keys = self.scan_cf_range_keys_at(snapshot, cf, range, clock)?;
+            let keys = keys
                 .into_iter()
-                .filter(|(key, _)| range.contains(key))
-                .filter(|(key, _)| after_key.is_none_or(|after| key.as_slice() > after))
+                .filter(|key| after_key.is_none_or(|after| key.as_slice() > after))
                 .take(limit)
-                .collect());
+                .collect::<Vec<_>>();
+            let reads = keys
+                .iter()
+                .cloned()
+                .map(|key| CfRead::new(cf, key))
+                .collect::<Vec<_>>();
+            let values = self.read_batch(snapshot, &reads, clock)?;
+            return keys
+                .into_iter()
+                .zip(values)
+                .map(|(key, value)| {
+                    value.map(|value| (key.clone(), value)).ok_or_else(|| {
+                        calyx_core::CalyxError::aster_corrupt_shard(format!(
+                            "visible {} key {} disappeared during pinned page read",
+                            cf.name(),
+                            hex_prefix(&key)
+                        ))
+                    })
+                })
+                .collect();
         }
-        let start = after_key.unwrap_or(&range.start).to_vec();
-        let lower = if after_key.is_some() {
-            Bound::Excluded((cf, start))
+        let lower = if let Some(after_key) = after_key {
+            Bound::Excluded(after_key)
         } else {
-            Bound::Included((cf, start))
+            Bound::Included(range.start.as_slice())
         };
         let table = self.rows.read().expect("mvcc row table poisoned");
         let mut rows = Vec::with_capacity(limit);
-        for ((row_cf, key), versions) in table.range((lower, Bound::Unbounded)) {
-            if *row_cf != cf {
-                if *row_cf > cf {
-                    break;
-                }
-                continue;
-            }
+        let Some(cf_rows) = table.get(&cf) else {
+            return Ok(rows);
+        };
+        for (key, versions) in cf_rows.range::<[u8], _>((lower, Bound::Unbounded)) {
             if !range.contains(key) {
                 if range.end.as_ref().is_some_and(|end| key >= end) {
                     break;
@@ -175,6 +239,94 @@ impl VersionedCfStore {
         Ok(rows)
     }
 
+    /// Returns the greatest visible row in `[start, upper]` at one pinned snapshot.
+    pub fn predecessor_cf_at(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        start: &[u8],
+        upper: &[u8],
+        clock: &dyn Clock,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_snapshot_live(snapshot, clock)?;
+        let router = if self.router_latest_readback.load(Ordering::Acquire) {
+            self.ensure_router_latest_snapshot(snapshot)?;
+            self.router.read().expect("mvcc router poisoned")
+        } else {
+            self.router.read().expect("mvcc router poisoned")
+        };
+        let mut upper = upper.to_vec();
+        let mut inclusive = true;
+        loop {
+            let table_candidate =
+                self.table_predecessor_state(snapshot, cf, start, &upper, inclusive);
+            let router_candidate = if self.router_latest_readback.load(Ordering::Acquire) {
+                router
+                    .as_ref()
+                    .map(|router| router.predecessor(cf, start, &upper, inclusive))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            match (table_candidate, router_candidate) {
+                (None, None) => return Ok(None),
+                (None, Some(row)) => {
+                    self.ensure_unbarriered(cf, &row.key)?;
+                    return Ok(Some((row.key, row.value)));
+                }
+                (Some((key, VisibleValue::Live(value))), None) => {
+                    self.ensure_unbarriered(cf, &key)?;
+                    return Ok(Some((key, value)));
+                }
+                (Some((key, VisibleValue::Tombstone)), None) => {
+                    upper = key;
+                    inclusive = false;
+                }
+                (Some((key, state)), Some(router_row)) => {
+                    if router_row.key > key {
+                        self.ensure_unbarriered(cf, &router_row.key)?;
+                        return Ok(Some((router_row.key, router_row.value)));
+                    }
+                    match state {
+                        VisibleValue::Live(value) => {
+                            self.ensure_unbarriered(cf, &key)?;
+                            return Ok(Some((key, value)));
+                        }
+                        VisibleValue::Tombstone => {
+                            upper = key;
+                            inclusive = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn table_predecessor_state(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        start: &[u8],
+        upper: &[u8],
+        inclusive: bool,
+    ) -> Option<(Vec<u8>, VisibleValue)> {
+        let lower = Bound::Included(start);
+        let upper = if inclusive {
+            Bound::Included(upper)
+        } else {
+            Bound::Excluded(upper)
+        };
+        let table = self.rows.read().expect("mvcc row table poisoned");
+        table
+            .get(&cf)?
+            .range::<[u8], _>((lower, upper))
+            .rev()
+            .find_map(|(key, versions)| {
+                visible_value_state(versions, snapshot.seq()).map(|state| (key.clone(), state))
+            })
+    }
+
     pub(super) fn ensure_unbarriered(&self, cf: ColumnFamily, key: &[u8]) -> Result<()> {
         let barriers = self
             .read_barriers
@@ -184,169 +336,6 @@ impl VersionedCfStore {
             return Err(error);
         }
         Ok(())
-    }
-
-    fn router_latest_value(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
-        if !self.router_latest_readback.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        self.ensure_router_latest_snapshot(snapshot)?;
-        let router = self.router.read().expect("mvcc router poisoned");
-        let Some(router) = router.as_ref() else {
-            return Ok(None);
-        };
-        Ok(router
-            .get(cf, key)?
-            .filter(|value| !is_tombstone_value(value)))
-    }
-
-    fn router_latest_rows_page(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        range: &KeyRange,
-        after_key: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        if !self.router_latest_readback.load(Ordering::Acquire) {
-            return Ok(BTreeMap::new());
-        }
-        self.ensure_router_latest_snapshot(snapshot)?;
-        let router = self.router.read().expect("mvcc router poisoned");
-        let Some(router) = router.as_ref() else {
-            return Ok(BTreeMap::new());
-        };
-        Ok(router
-            .range_page_until(cf, &range.start, range.end.as_deref(), after_key, limit)?
-            .into_iter()
-            .filter_map(|row| (!is_tombstone_value(&row.value)).then_some((row.key, row.value)))
-            .collect())
-    }
-
-    fn router_latest_rows(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        range: Option<&KeyRange>,
-    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        if !self.router_latest_readback.load(Ordering::Acquire) {
-            return Ok(BTreeMap::new());
-        }
-        self.ensure_router_latest_snapshot(snapshot)?;
-        let router = self.router.read().expect("mvcc router poisoned");
-        let Some(router) = router.as_ref() else {
-            return Ok(BTreeMap::new());
-        };
-        let rows = match range {
-            Some(range) => match range.end.as_deref() {
-                Some(end) => router.range(cf, &range.start, end)?,
-                None => router
-                    .iter_cf(cf)?
-                    .into_iter()
-                    .filter(|row| row.key.as_slice() >= range.start.as_slice())
-                    .collect(),
-            },
-            None => router.iter_cf(cf)?,
-        };
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| (!is_tombstone_value(&row.value)).then_some((row.key, row.value)))
-            .collect())
-    }
-
-    fn router_latest_keys(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        range: &KeyRange,
-    ) -> Result<BTreeMap<Vec<u8>, ()>> {
-        if !self.router_latest_readback.load(Ordering::Acquire) {
-            return Ok(BTreeMap::new());
-        }
-        self.ensure_router_latest_snapshot(snapshot)?;
-        let router = self.router.read().expect("mvcc router poisoned");
-        let Some(router) = router.as_ref() else {
-            return Ok(BTreeMap::new());
-        };
-        Ok(router
-            .range_keys_until(cf, &range.start, range.end.as_deref())?
-            .into_iter()
-            .map(|key| (key, ()))
-            .collect())
-    }
-
-    fn overlay_table_rows(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        range: Option<&KeyRange>,
-        rows: &mut BTreeMap<Vec<u8>, Vec<u8>>,
-    ) {
-        let table = self.rows.read().expect("mvcc row table poisoned");
-        for ((row_cf, key), versions) in table.iter() {
-            if *row_cf != cf || range.is_some_and(|range| !range.contains(key)) {
-                continue;
-            }
-            match visible_value_state(versions, snapshot.seq()) {
-                Some(VisibleValue::Live(value)) => {
-                    rows.insert(key.clone(), value);
-                }
-                Some(VisibleValue::Tombstone) => {
-                    rows.remove(key);
-                }
-                None => {}
-            }
-        }
-    }
-
-    fn overlay_table_keys(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        range: &KeyRange,
-        keys: &mut BTreeMap<Vec<u8>, ()>,
-    ) {
-        let table = self.rows.read().expect("mvcc row table poisoned");
-        for ((row_cf, key), versions) in table.iter() {
-            if *row_cf != cf || !range.contains(key) {
-                continue;
-            }
-            match visible_value_state(versions, snapshot.seq()) {
-                Some(VisibleValue::Live(_)) => {
-                    keys.insert(key.clone(), ());
-                }
-                Some(VisibleValue::Tombstone) => {
-                    keys.remove(key);
-                }
-                None => {}
-            }
-        }
-    }
-
-    pub(super) fn ensure_router_latest_snapshot(&self, snapshot: Snapshot) -> Result<()> {
-        let latest = self.current_seq();
-        if snapshot.seq() == latest {
-            return Ok(());
-        }
-        Err(latest_only_error(format!(
-            "historical snapshot {} requested from latest-only recovered vault at seq {}",
-            snapshot.seq(),
-            latest
-        )))
-    }
-
-    pub(super) fn ensure_snapshot_live(&self, snapshot: Snapshot, clock: &dyn Clock) -> Result<()> {
-        let now = clock.now();
-        let lease = snapshot.lease();
-        if lease.is_expired_at(now) {
-            self.leases.abort_if_expired(lease, now);
-        }
-        lease.ensure_live_at(now)
     }
 }
 
@@ -390,7 +379,7 @@ fn latest_only_error(message: impl Into<String>) -> calyx_core::CalyxError {
     }
 }
 
-fn hex_prefix(bytes: &[u8]) -> String {
+pub(super) fn hex_prefix(bytes: &[u8]) -> String {
     let mut value = String::new();
     for byte in bytes.iter().take(12) {
         value.push_str(&format!("{byte:02x}"));

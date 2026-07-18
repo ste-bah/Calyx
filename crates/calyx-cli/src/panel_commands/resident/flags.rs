@@ -22,6 +22,7 @@ pub(super) struct ServeFlags {
     pub(super) resident_overhead_multiplier_milli: Option<u64>,
     pub(super) max_load_secs: Option<u64>,
     pub(super) load_parallelism: Option<usize>,
+    pub(super) max_runtime_batch: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -79,6 +80,12 @@ pub(super) fn parse_serve_flags(args: &[String]) -> CliResult<ServeFlags> {
                 flags.load_parallelism = Some(parse_usize(
                     value(args, idx + 1, "--load-parallelism")?,
                     "--load-parallelism",
+                )?)
+            }
+            "--max-runtime-batch" => {
+                flags.max_runtime_batch = Some(parse_usize(
+                    value(args, idx + 1, "--max-runtime-batch")?,
+                    "--max-runtime-batch",
                 )?)
             }
             other => {
@@ -344,6 +351,8 @@ mod tests {
             "22",
             "--bind",
             "127.0.0.1:8788",
+            "--max-runtime-batch",
+            "8",
         ]))
         .unwrap();
         assert_eq!(
@@ -353,6 +362,7 @@ mod tests {
         assert_eq!(flags.modality, Some(Modality::Text));
         assert_eq!(flags.slots, vec![SlotId::new(22)]);
         assert_eq!(flags.bind, Some("127.0.0.1:8788".parse().unwrap()));
+        assert_eq!(flags.max_runtime_batch, Some(8));
     }
 
     #[test]

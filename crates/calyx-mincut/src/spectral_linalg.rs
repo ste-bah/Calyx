@@ -1,5 +1,8 @@
 use crate::spectral::{SpectralError, SpectralResult};
 
+#[cfg(test)]
+mod tests;
+
 const EIGEN_EPS: f32 = 1.0e-6;
 const JACOBI_TOL: f32 = 1.0e-6;
 const JACOBI_MIN_MAX_ITER: usize = 256;
@@ -22,8 +25,8 @@ where
             iterations: max_iter,
         });
     }
-    let basis = lanczos_basis_operator(n, target_dim, max_iter, &mut mat_vec)?;
-    let projected = project_to_basis_operator(&basis, &mut mat_vec);
+    let decomposition = lanczos_decomposition_operator(n, target_dim, max_iter, &mut mat_vec)?;
+    let LanczosDecomposition { basis, projected } = decomposition;
     let jacobi_max_iter = jacobi_max_iter(projected.len());
     let (values, ritz_vectors) = jacobi_eigen(projected, jacobi_max_iter)?;
     Ok((values, expand_ritz_vectors(&basis, &ritz_vectors)))
@@ -35,16 +38,23 @@ fn jacobi_max_iter(n: usize) -> usize {
         .max(JACOBI_MIN_MAX_ITER)
 }
 
-fn lanczos_basis_operator<F>(
+#[derive(Debug)]
+struct LanczosDecomposition {
+    basis: Vec<Vec<f32>>,
+    projected: Vec<Vec<f32>>,
+}
+
+fn lanczos_decomposition_operator<F>(
     n: usize,
     target_dim: usize,
     max_iter: usize,
     mat_vec: &mut F,
-) -> SpectralResult<Vec<Vec<f32>>>
+) -> SpectralResult<LanczosDecomposition>
 where
     F: FnMut(&[f32]) -> Vec<f32>,
 {
     let mut basis = Vec::with_capacity(target_dim);
+    let mut projected = vec![vec![0.0; target_dim]; target_dim];
     let mut seed_index = 0;
     let mut iterations = 0;
     while basis.len() < target_dim && iterations < max_iter {
@@ -56,16 +66,23 @@ where
         loop {
             iterations += 1;
             basis.push(current.clone());
-            if basis.len() == target_dim || iterations == max_iter {
-                break;
-            }
-            let mut residual = mat_vec(&current);
+            let column = basis.len() - 1;
+            let product = mat_vec(&current);
+            validate_operator_product(n, &product)?;
+            let mut residual = product;
+            let mut coefficients = vec![0.0; basis.len()];
             if previous_beta > EIGEN_EPS {
                 axpy(&mut residual, -previous_beta, &previous);
+                coefficients[column - 1] += previous_beta;
             }
             let alpha = dot(&current, &residual);
             axpy(&mut residual, -alpha, &current);
-            orthogonalize_against(&mut residual, &basis);
+            coefficients[column] += alpha;
+            orthogonalize_against_recording(&mut residual, &basis, &mut coefficients);
+            record_symmetric_projection(&mut projected, column, &coefficients)?;
+            if basis.len() == target_dim || iterations == max_iter {
+                break;
+            }
             let beta = vector_norm(&residual);
             if beta <= EIGEN_EPS {
                 break;
@@ -77,7 +94,11 @@ where
         }
     }
     if basis.len() == target_dim {
-        Ok(basis)
+        projected.truncate(target_dim);
+        for row in &mut projected {
+            row.truncate(target_dim);
+        }
+        Ok(LanczosDecomposition { basis, projected })
     } else {
         Err(SpectralError::NotConverged {
             iterations: max_iter,
@@ -98,18 +119,34 @@ fn next_lanczos_seed(n: usize, basis: &[Vec<f32>], seed_index: &mut usize) -> Op
     None
 }
 
-fn project_to_basis_operator<F>(basis: &[Vec<f32>], mat_vec: &mut F) -> Vec<Vec<f32>>
-where
-    F: FnMut(&[f32]) -> Vec<f32>,
-{
-    let mut projected = vec![vec![0.0; basis.len()]; basis.len()];
-    for (col, vector) in basis.iter().enumerate() {
-        let product = mat_vec(vector);
-        for (row, basis_vector) in basis.iter().enumerate() {
-            projected[row][col] = dot(basis_vector, &product);
-        }
+fn validate_operator_product(expected: usize, product: &[f32]) -> SpectralResult<()> {
+    if product.len() != expected || product.iter().any(|value| !value.is_finite()) {
+        return Err(SpectralError::InvalidOperator {
+            expected,
+            actual: product.len(),
+            non_finite: product.iter().filter(|value| !value.is_finite()).count(),
+        });
     }
-    projected
+    Ok(())
+}
+
+fn record_symmetric_projection(
+    projected: &mut [Vec<f32>],
+    column: usize,
+    coefficients: &[f32],
+) -> SpectralResult<()> {
+    for (row, coefficient) in coefficients.iter().copied().enumerate() {
+        if !coefficient.is_finite() {
+            return Err(SpectralError::InvalidOperator {
+                expected: projected.len(),
+                actual: projected.len(),
+                non_finite: 1,
+            });
+        }
+        projected[row][column] = coefficient;
+        projected[column][row] = coefficient;
+    }
+    Ok(())
 }
 
 fn expand_ritz_vectors(basis: &[Vec<f32>], ritz_vectors: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -240,6 +277,18 @@ fn vector_norm(vector: &[f32]) -> f32 {
 fn orthogonalize_against(vector: &mut [f32], basis: &[Vec<f32>]) {
     for basis_vector in basis {
         let projection = dot(vector, basis_vector);
+        axpy(vector, -projection, basis_vector);
+    }
+}
+
+fn orthogonalize_against_recording(
+    vector: &mut [f32],
+    basis: &[Vec<f32>],
+    coefficients: &mut [f32],
+) {
+    for (index, basis_vector) in basis.iter().enumerate() {
+        let projection = dot(vector, basis_vector);
+        coefficients[index] += projection;
         axpy(vector, -projection, basis_vector);
     }
 }

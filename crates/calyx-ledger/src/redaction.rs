@@ -6,7 +6,14 @@ use serde_json::{Map, Value};
 
 use crate::entry::ActorId;
 
-const SECRET_TOKEN_MIN: usize = 40;
+/// Largest unclassified, non-whitespace identifier that can be persisted
+/// without entering the Ledger's secret-token classification boundary.
+///
+/// Callers that persist operator-supplied identifiers in a Ledger payload
+/// must use this bound during their own input validation so they fail before
+/// creating related durable state.
+pub const MAX_UNCLASSIFIED_TOKEN_LEN: usize = 39;
+const SECRET_TOKEN_MIN: usize = MAX_UNCLASSIFIED_TOKEN_LEN + 1;
 const MAX_HASH_OR_ID_LEN: usize = 64;
 const MAX_DISCOVERY_MANIFEST_TOKEN_LEN: usize = 160;
 const MAX_QUANT_SLOT_METADATA_LEN: usize = 4096;
@@ -42,6 +49,20 @@ impl RedactionPolicy {
             Ok(value) => check_json_value(&value, None),
             Err(_) => check_text_tokens(&String::from_utf8_lossy(payload), None),
         }
+    }
+
+    /// Applies the same field-aware token policy used for a JSON Ledger
+    /// payload to one caller-supplied identifier.
+    ///
+    /// This lets producers validate identifiers before they create adjacent
+    /// durable state, while keeping the classification policy in one place.
+    pub fn check_public_identifier(field: &str, value: &str) -> Result<()> {
+        if is_secret_field(field) {
+            return Err(secret_error(format!(
+                "ledger payload field `{field}` is secret-like"
+            )));
+        }
+        check_text_tokens(value, Some(field))
     }
 
     /// Redacts the raw input pointer while preserving the stable content hash.

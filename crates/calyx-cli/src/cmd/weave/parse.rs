@@ -23,10 +23,10 @@ pub(crate) fn parse_weave_loom(rest: &[String]) -> CliResult<Subcommand> {
                 idx += 1;
                 args.knn = parse_usize(value(rest, idx, "--knn")?, "--knn", 1)?;
             }
-            "--edge-cos-threshold" => {
+            "--edge-score-threshold" | "--edge-cos-threshold" => {
                 idx += 1;
-                args.edge_cos_threshold =
-                    parse_threshold(value(rest, idx, "--edge-cos-threshold")?)?;
+                args.edge_score_threshold =
+                    parse_threshold(value(rest, idx, "--edge-score-threshold")?)?;
             }
             "--max-groundedness-distance" => {
                 idx += 1;
@@ -88,10 +88,10 @@ fn parse_usize(raw: &str, flag: &str, min: usize) -> CliResult<usize> {
 fn parse_threshold(raw: &str) -> CliResult<f32> {
     let value = raw
         .parse::<f32>()
-        .map_err(|err| CliError::usage(format!("parse --edge-cos-threshold {raw}: {err}")))?;
+        .map_err(|err| CliError::usage(format!("parse --edge-score-threshold {raw}: {err}")))?;
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         return Err(CliError::usage(
-            "--edge-cos-threshold must be finite and in [0,1]",
+            "--edge-score-threshold must be finite and in [0,1]",
         ));
     }
     Ok(value)

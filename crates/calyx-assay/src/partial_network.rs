@@ -7,6 +7,7 @@
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cuda_strict::strict_cuda_requested;
 use crate::partial_correlation::{
     PartialReport, invert_symmetric, partial_report_from_precision, pearson_r, to_finite_f64,
 };
@@ -61,6 +62,9 @@ pub fn partial_correlation_network(
     alpha: f32,
     min_abs_partial_r: f32,
 ) -> Result<PartialNetworkReport> {
+    if strict_cuda_requested() {
+        return partial_correlation_network_cuda_strict(series, alpha, min_abs_partial_r);
+    }
     validate_partial_network_inputs(series, alpha, min_abs_partial_r)?;
     let mut retained_edges = Vec::new();
     let mut pruned_edges = Vec::new();
@@ -97,6 +101,75 @@ pub fn partial_correlation_network(
         retained_edges,
         pruned_edges,
     })
+}
+
+/// Strict CUDA partial-correlation network. This never falls back to CPU.
+pub fn partial_correlation_network_cuda_strict(
+    series: &[PartialNetworkSeries<'_>],
+    alpha: f32,
+    min_abs_partial_r: f32,
+) -> Result<PartialNetworkReport> {
+    partial_correlation_network_cuda_strict_impl(series, alpha, min_abs_partial_r)
+}
+
+#[cfg(feature = "cuda")]
+fn partial_correlation_network_cuda_strict_impl(
+    series: &[PartialNetworkSeries<'_>],
+    alpha: f32,
+    min_abs_partial_r: f32,
+) -> Result<PartialNetworkReport> {
+    validate_partial_network_inputs(series, alpha, min_abs_partial_r)?;
+    let n = series[0].values.len();
+    let d = series.len();
+    let slices = series.iter().map(|item| item.values).collect::<Vec<_>>();
+    let columns = crate::partial_correlation::variable_major_columns(&slices);
+    let matrix =
+        crate::partial_correlation::correlation_precision_cuda(&columns, n, d, "partial network")?;
+    let matrix = PartialNetworkMatrix {
+        d,
+        corr: matrix.corr,
+        precision: matrix.precision,
+    };
+    let k = d - 2;
+    let mut retained_edges = Vec::new();
+    let mut pruned_edges = Vec::new();
+    for i in 0..d {
+        for j in (i + 1)..d {
+            let partial = matrix.partial_report(i, j, n, k)?;
+            let significant = partial.p_value < alpha;
+            let clears_floor = partial.partial_r.abs() >= min_abs_partial_r;
+            if significant && clears_floor {
+                retained_edges.push(edge_record(series, i, j, partial));
+            } else {
+                pruned_edges.push(pruned_record(
+                    series,
+                    i,
+                    j,
+                    partial,
+                    significant,
+                    clears_floor,
+                ));
+            }
+        }
+    }
+    Ok(PartialNetworkReport {
+        estimator: "gaussian_partial_correlation_network_cuda_strict".to_string(),
+        alpha,
+        min_abs_partial_r,
+        n_samples: n,
+        variables: series.iter().map(|item| item.name.to_string()).collect(),
+        retained_edges,
+        pruned_edges,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn partial_correlation_network_cuda_strict_impl(
+    _series: &[PartialNetworkSeries<'_>],
+    _alpha: f32,
+    _min_abs_partial_r: f32,
+) -> Result<PartialNetworkReport> {
+    Err(crate::cuda_strict::cuda_unavailable("partial network"))
 }
 
 fn validate_partial_network_inputs(

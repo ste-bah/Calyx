@@ -1,3 +1,4 @@
+#[path = "issue1313_support/mod.rs"]
 mod issue1313_support;
 
 use issue1313_support::{

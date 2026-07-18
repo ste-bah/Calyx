@@ -2,8 +2,10 @@
 
 //! PH56 T05 FSV for mmap-backed cold column reads.
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_aster::mmap_col::{CALYX_BOUNDS_EXCEEDED, CALYX_NOT_FOUND, MmapColumn};
-mod fsv_support;
 use fsv_support::{fsv_root_os, reset_dir};
 use serde_json::json;
 use sha2::{Digest, Sha256};

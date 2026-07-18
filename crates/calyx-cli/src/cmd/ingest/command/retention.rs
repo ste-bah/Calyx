@@ -46,15 +46,8 @@ pub(super) fn apply_existing_input_pointer(
     expected: &InputRef,
 ) -> CliResult<bool> {
     let outcome = vault.backfill_input_pointer(cx_id, expected)?;
-    let stored = vault.get(cx_id, vault.snapshot())?;
-    if &stored.input_ref != expected {
-        return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
-            "retained input pointer readback for {cx_id} does not match the exact incoming input reference"
-        ))
-        .into());
-    }
     ingest_runtime_log(format_args!(
-        "phase=retained_input_pointer_readback cx_id={cx_id} changed={} ledger_seq={}",
+        "phase=retained_input_pointer_commit_outcome cx_id={cx_id} changed={} ledger_seq={}",
         outcome.changed(),
         outcome.ledger_ref().seq
     ));

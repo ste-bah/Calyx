@@ -1,3 +1,5 @@
+#[path = "recurrence_anchor_support/mod.rs"]
+mod recurrence_anchor_support;
 use calyx_assay::{
     CALYX_ASSAY_MISSING_OUTCOME_SLOT, Domain, OutcomeAgreement, frequency_anchor_for,
     measure_outcome_agreement, oracle_self_consistency, oracle_self_consistency_from_agreements,
@@ -10,9 +12,6 @@ use calyx_aster::recurrence::{
 use calyx_aster::vault::AsterVault;
 use calyx_core::{AnchorKind, AnchorValue, CxId, VaultStore};
 use proptest::prelude::*;
-
-#[path = "recurrence_anchor_support/mod.rs"]
-mod recurrence_anchor_support;
 use recurrence_anchor_support::{append_outcomes, base_cx, cx_id, vault_id};
 
 #[test]

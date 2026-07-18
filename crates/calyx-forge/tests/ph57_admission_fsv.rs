@@ -56,7 +56,7 @@ fn controller<'b>(
 }
 
 fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "ph57-admission-fsv", || {
         PathBuf::from("target/ph57-admission-fsv")
     })
 }

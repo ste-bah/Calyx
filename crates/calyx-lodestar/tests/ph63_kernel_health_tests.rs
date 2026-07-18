@@ -312,10 +312,12 @@ fn pass_mode_reflects_persisted_recall_state() {
 }
 
 #[test]
-fn rebuild_overwrites_artifact_and_health_follows() {
+fn rebuild_cannot_overwrite_an_immutable_kernel_generation() {
     let store = store("rebuild");
     let kernel = known_kernel();
     write_kernel_artifact(&kernel, &store).expect("write v1");
+    let artifact = store.kernel_file_path(kernel.kernel_id);
+    let bytes_before = fs::read(&artifact).expect("read immutable v1 bytes");
     let before = kernel_health(kernel.kernel_id, &store).expect("health before");
     assert_eq!(before.recall.pass_mode, RecallPassMode::BelowGate);
 
@@ -325,18 +327,24 @@ fn rebuild_overwrites_artifact_and_health_follows() {
     rebuilt.recall.ratio = 0.99;
     rebuilt.recall.n_queries_tested = 25;
     rebuilt.built_at_millis = 67890;
-    write_kernel_artifact(&rebuilt, &store).expect("write v2");
+    let error = write_kernel_artifact(&rebuilt, &store)
+        .expect_err("different bytes under one kernel id must be refused");
+    assert_eq!(error.code(), "CALYX_KERNEL_INDEX_IO");
 
     let after = kernel_health(kernel.kernel_id, &store).expect("health after");
-    assert_eq!(after.recall.pass_mode, RecallPassMode::Passed);
-    assert_eq!(after.recall.ratio, 0.99);
-    assert_eq!(after.recall.n_queries_tested, 25);
-    assert_eq!(after.built_at_millis, 67890);
+    let bytes_after = fs::read(&artifact).expect("read immutable v1 bytes after refusal");
+    assert_eq!(after, before);
+    assert_eq!(bytes_after, bytes_before);
 
     write_readback(
         "rebuild",
         "kernel-health-rebuild.json",
-        json!({ "before": before, "after": after }),
+        json!({
+            "before": before,
+            "after": after,
+            "write_error_code": error.code(),
+            "artifact_unchanged": bytes_after == bytes_before,
+        }),
     );
 }
 

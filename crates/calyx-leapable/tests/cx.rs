@@ -400,6 +400,9 @@ fn cx_rpc_edges_fail_closed() {
     assert!(ok);
 }
 
+#[path = "cx/issue1547.rs"]
+mod issue1547;
+
 fn put_item(text: &str, chunk_id: &str) -> Value {
     json!({
         "panel_version": 7,

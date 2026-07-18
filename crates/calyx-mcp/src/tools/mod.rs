@@ -9,6 +9,7 @@ pub mod ingest;
 pub mod intelligence;
 pub mod provenance;
 pub mod search;
+mod search_generation;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod vault;

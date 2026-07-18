@@ -36,7 +36,7 @@ use tokio::net::TcpStream;
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{MatchedPath, Path, Request, State},
     http::{Method, StatusCode, Uri, header},
     middleware::{self, Next},
@@ -48,14 +48,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::ledger_view::AsterLedgerCfStore;
-use calyx_aster::manifest::is_vault_seq_quarantined;
+use calyx_aster::manifest::load_vault_quarantine_snapshot;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
-    AnchorKind, CxId, Input, Modality, Result as CalyxResult, Slot, SlotId, SlotShape, SlotState,
-    VaultId, VaultStore,
+    AnchorKind, CxId, Input, Modality, Slot, SlotId, SlotShape, SlotState, VaultId, VaultStore,
 };
 use calyx_ledger::{
-    LedgerCfStore, LedgerEntry, QuarantineLookup, VerifyResult, get_answer_trace, verify_chain,
+    DecodedLedgerSnapshot, LedgerCfStore, LedgerEntry, QuarantineSet, VerifyResult,
+    get_answer_trace_from_snapshot, verify_decoded_snapshot, verify_snapshot,
 };
 use calyx_lodestar::{
     KernelParams, RecallTestParams, measured_kernel_with_contributions_from_vault_allow_partial,
@@ -292,3 +292,5 @@ fn on_panic(payload: Box<dyn Any + Send + 'static>) -> Response {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod provenance_tests;

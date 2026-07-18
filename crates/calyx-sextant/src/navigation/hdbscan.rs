@@ -69,19 +69,71 @@ pub(crate) fn condensed_tree(
     min_cluster_size: usize,
     allow_single_cluster: bool,
 ) -> Result<Vec<CondensedCluster>> {
-    if min_cluster_size < 2 || min_samples < 1 {
-        return Err(sextant_error(
-            CALYX_SEXTANT_SKILL_PARAMS,
-            format!(
-                "min_cluster_size {min_cluster_size} must be >= 2 and min_samples {min_samples} >= 1"
-            ),
-        ));
-    }
+    validate_params(min_samples, min_cluster_size)?;
     let n = dist.n;
     if n == 0 {
         return Ok(Vec::new());
     }
-    let root = CondensedCluster {
+    if n == 1 {
+        return Ok(vec![root_cluster(n)]);
+    }
+    let mst = minimum_spanning_tree(dist, min_samples);
+    condensed_tree_from_mst(n, &mst, min_samples, min_cluster_size, allow_single_cluster)
+}
+
+pub(crate) fn condensed_tree_from_mst(
+    n: usize,
+    mst: &[(usize, usize, f64)],
+    min_samples: usize,
+    min_cluster_size: usize,
+    allow_single_cluster: bool,
+) -> Result<Vec<CondensedCluster>> {
+    validate_params(min_samples, min_cluster_size)?;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if n == 1 {
+        return Ok(vec![root_cluster(n)]);
+    }
+    if mst.len() != n - 1
+        || mst.iter().any(|(left, right, weight)| {
+            left >= right || *right >= n || !weight.is_finite() || *weight < 0.0
+        })
+    {
+        return Err(sextant_error(
+            CALYX_SEXTANT_SKILL_PARAMS,
+            format!("MST must contain {} finite canonical edges", n - 1),
+        ));
+    }
+    let dendrogram = single_linkage(n, mst);
+    let mut clusters = vec![root_cluster(n)];
+    condense(&dendrogram, n, min_cluster_size, &mut clusters);
+    select_clusters(&mut clusters, allow_single_cluster);
+    Ok(clusters)
+}
+
+pub(crate) fn minimum_spanning_tree(
+    dist: &DistanceMatrix,
+    min_samples: usize,
+) -> Vec<(usize, usize, f64)> {
+    let core = core_distances(dist, min_samples);
+    prim_mst(dist, &core)
+}
+
+fn validate_params(min_samples: usize, min_cluster_size: usize) -> Result<()> {
+    if min_cluster_size >= 2 && min_samples >= 1 {
+        return Ok(());
+    }
+    Err(sextant_error(
+        CALYX_SEXTANT_SKILL_PARAMS,
+        format!(
+            "min_cluster_size {min_cluster_size} must be >= 2 and min_samples {min_samples} >= 1"
+        ),
+    ))
+}
+
+fn root_cluster(n: usize) -> CondensedCluster {
+    CondensedCluster {
         parent: None,
         children: Vec::new(),
         birth_lambda: 0.0,
@@ -89,18 +141,7 @@ pub(crate) fn condensed_tree(
         members_at_birth: (0..n).collect(),
         stability: 0.0,
         selected: false,
-    };
-    if n == 1 {
-        return Ok(vec![root]);
     }
-
-    let core = core_distances(dist, min_samples);
-    let mst = prim_mst(dist, &core);
-    let dendrogram = single_linkage(n, &mst);
-    let mut clusters = vec![root];
-    condense(&dendrogram, n, min_cluster_size, &mut clusters);
-    select_clusters(&mut clusters, allow_single_cluster);
-    Ok(clusters)
 }
 
 /// Distance to the k-th nearest other point, k = min(min_samples, n-1).

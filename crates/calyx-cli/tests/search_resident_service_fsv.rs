@@ -48,7 +48,9 @@ fn search_uses_vault_resident_service_and_reads_back_physical_state() {
     println!("search_resident_fsv_before={before}");
 
     let template_progress = root.join("resident-template-progress.jsonl");
-    let mut template_service = spawn_template_resident_service(&root, template, &template_progress);
+    let template_stderr = root.join("resident-template.stderr.log");
+    let mut template_service =
+        spawn_template_resident_service(&root, template, &template_progress, &template_stderr);
     let template_ready = read_ready(&mut template_service);
     let template_addr = template_ready["bind"].as_str().unwrap().to_string();
 
@@ -159,10 +161,13 @@ fn search_uses_vault_resident_service_and_reads_back_physical_state() {
         after_rebuild,
         after_mismatch
     );
-    let template_service_output = stop_resident_service(&template_addr, template_service);
+    let template_service_output =
+        stop_resident_service(&template_addr, template_service, &template_stderr);
 
     let vault_progress = root.join("resident-vault-progress.jsonl");
-    let mut vault_service = spawn_vault_resident_service(&root, &vault_path, &vault_progress);
+    let vault_stderr = root.join("resident-vault.stderr.log");
+    let mut vault_service =
+        spawn_vault_resident_service(&root, &vault_path, &vault_progress, &vault_stderr);
     let vault_ready = read_ready(&mut vault_service);
     let vault_addr = vault_ready["bind"].as_str().unwrap().to_string();
     let process_id = vault_ready["process_id"].as_u64().unwrap();
@@ -182,14 +187,14 @@ fn search_uses_vault_resident_service_and_reads_back_physical_state() {
         "search with vault resident",
     );
     let after_search = cf_state(&vault_path, vault_id, "search-resident-vault");
-    let search_hits: Value = serde_json::from_slice(&search.stdout).expect("parse search output");
-    println!("search_resident_fsv_search_stdout={search_hits}");
+    let search_output: Value = serde_json::from_slice(&search.stdout).expect("parse search output");
+    println!("search_resident_fsv_search_stdout={search_output}");
     println!(
         "search_resident_fsv_search_stderr={}",
         String::from_utf8_lossy(&search.stderr)
     );
     println!("search_resident_fsv_after_search={after_search}");
-    let vault_service_output = stop_resident_service(&vault_addr, vault_service);
+    let vault_service_output = stop_resident_service(&vault_addr, vault_service, &vault_stderr);
     let vault_progress_text = fs::read_to_string(&vault_progress).unwrap_or_default();
     println!("search_resident_fsv_vault_progress_log={vault_progress_text}");
 
@@ -202,8 +207,11 @@ fn search_uses_vault_resident_service_and_reads_back_physical_state() {
     assert_eq!(after_unavailable, after_rebuild);
     assert_eq!(after_mismatch, after_rebuild);
     assert_eq!(after_search, after_rebuild);
-    assert_index_matches_manifest(&index);
-    let hits = search_hits.as_array().expect("search hits array");
+    assert_index_matches_manifest(&index, 10, 3);
+    let slots = &search_output["slots"];
+    assert_eq!(slots["resident_gpu"].as_array().unwrap().len(), 10);
+    assert!(slots["local_cpu"].as_array().unwrap().is_empty());
+    let hits = search_output["hits"].as_array().expect("search hits array");
     assert_eq!(hits.len(), 1);
     let hit_id = hits[0]["cx_id"].as_str().expect("hit cx_id");
     assert!(
@@ -253,7 +261,7 @@ fn search_uses_vault_resident_service_and_reads_back_physical_state() {
             "ingest_stdout": parse_json(&ingest.stdout),
             "rebuild_stdout": rebuild_json,
             "rebuild_progress_log": rebuild_progress_text,
-            "search_stdout": search_hits,
+            "search_stdout": search_output,
             "search_stderr": String::from_utf8_lossy(&search.stderr),
             "template_service_stderr": String::from_utf8_lossy(&template_service_output.stderr),
             "vault_service_stderr": vault_service_stderr,
@@ -300,3 +308,5 @@ fn search_uses_vault_resident_service_and_reads_back_physical_state() {
         fs::remove_dir_all(root).ok();
     }
 }
+#[path = "search_resident_service_fsv/gpu_roster.rs"]
+mod gpu_roster;

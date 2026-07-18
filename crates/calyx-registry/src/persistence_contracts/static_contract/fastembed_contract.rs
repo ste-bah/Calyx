@@ -8,7 +8,7 @@ use fastembed::{
 
 use super::{ensure_file, lens_config_invalid};
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
-use crate::{FastembedBgem3Output, LensSpec};
+use crate::{Bgem3Engine, FastembedBgem3Output, LensSpec};
 
 pub(super) fn fastembed_sparse_contract(
     spec: &LensSpec,
@@ -35,9 +35,8 @@ pub(super) fn fastembed_bgem3_contract(
     model_id: &str,
     files: &[PathBuf],
     output: FastembedBgem3Output,
+    engine: Bgem3Engine,
 ) -> Result<FrozenLensContract> {
-    let model = bgem3_model_from_name(model_id)?;
-    let info = Bgem3Embedding::get_model_info(&model);
     let (shape, norm, token): (SlotShape, NormPolicy, &[u8]) = match output {
         FastembedBgem3Output::Dense => (SlotShape::Dense(1024), NormPolicy::unit(), b"dense"),
         FastembedBgem3Output::Sparse => (SlotShape::Sparse(250_002), NormPolicy::Finite, b"sparse"),
@@ -47,13 +46,43 @@ pub(super) fn fastembed_bgem3_contract(
             b"colbert",
         ),
     };
-    fastembed_contract(
-        spec,
-        files,
-        shape,
-        norm,
-        &[b"fastembed-bgem3-v1", info.model_code.as_bytes(), token],
-    )
+    match engine {
+        Bgem3Engine::FastembedCpu => {
+            let model = bgem3_model_from_name(model_id)?;
+            let info = Bgem3Embedding::get_model_info(&model);
+            fastembed_contract(
+                spec,
+                files,
+                shape,
+                norm,
+                &[b"fastembed-bgem3-v1", info.model_code.as_bytes(), token],
+            )
+        }
+        Bgem3Engine::OnnxCuda => {
+            ensure_bgem3_cuda_model_id(model_id)?;
+            fastembed_contract(
+                spec,
+                files,
+                shape,
+                norm,
+                &[
+                    b"onnx-bgem3-cuda-v1",
+                    model_id.as_bytes(),
+                    b"max_tokens=512;device_postprocess=v1",
+                    token,
+                ],
+            )
+        }
+    }
+}
+
+fn ensure_bgem3_cuda_model_id(raw: &str) -> Result<()> {
+    match normalized(raw).as_str() {
+        "baai/bge-m3" | "bge-m3" => Ok(()),
+        other => Err(CalyxError::lens_unreachable(format!(
+            "unsupported CUDA BGE-M3 ONNX model {other}; expected BAAI/bge-m3"
+        ))),
+    }
 }
 
 pub(super) fn fastembed_reranker_contract(

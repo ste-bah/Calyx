@@ -19,13 +19,16 @@
 //! vector, a compressed slot row, an absent DiskANN slot index — all hard-error
 //! with the offending `cx_id`/slot named, never a silent skip or fabricated value.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::plain_graph::PlainGraph;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Clock, CxId, SlotId, SlotVector};
-use calyx_lodestar::{AsterAssocNodeProps, LodestarError, encode_assoc_node_props};
+use calyx_lodestar::{
+    AsterAssocNodeProps, LodestarError, PANEL_RRF_K, PanelFusionLane, PanelVectors,
+    encode_assoc_node_props, rank_panel_candidate_refs,
+};
 use calyx_loom::LoomStore;
 use calyx_paths::AssocGraph;
 use serde::Serialize;
@@ -57,9 +60,8 @@ pub(super) struct WithinDocResult {
     pub xterm_rows_persisted: usize,
     pub agreement_pairs: Vec<SlotPairAgreement>,
     pub anchors: Vec<CxId>,
-    /// `(cx_id, content-slot embedding)` for every node, in scan order — the
-    /// Pass-B k-NN query set. Held in memory (one dense vector per node).
-    pub knn_vectors: Vec<(CxId, Vec<f32>)>,
+    /// Complete no-flatten dense panel for every node, in scan order.
+    pub panel_vectors: Vec<(CxId, PanelVectors)>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -71,16 +73,19 @@ pub(super) struct BetweenDocProgress {
 
 pub(super) struct BetweenDocGraphRequest<'a> {
     pub indexes: &'a PersistedSearchIndexes,
-    pub knn_slot: SlotId,
+    pub embedding_slots: &'a [SlotId],
     pub knn: usize,
-    pub edge_cos_threshold: f32,
-    pub knn_vectors: &'a [(CxId, Vec<f32>)],
+    pub edge_score_threshold: f32,
+    pub panel_vectors: &'a [(CxId, PanelVectors)],
 }
 
 #[derive(Serialize)]
 struct EdgeValue {
-    cosine: f32,
-    rank: usize,
+    weight: f32,
+    fusion: &'static str,
+    rrf_k: u32,
+    fused_rank: usize,
+    lanes: Vec<PanelFusionLane>,
 }
 
 fn data_error<T>(detail: String) -> CliResult<T> {
@@ -93,7 +98,7 @@ pub(super) fn weave_within_doc<C: Clock>(
     vault: &AsterVault<C>,
     graph: &PlainGraph<'_, C>,
     preflight: &DenseSlotPreflight,
-    knn_slot: SlotId,
+    embedding_slots: &[SlotId],
     batch: usize,
 ) -> CliResult<WithinDocResult> {
     let bases = &preflight.candidates;
@@ -105,17 +110,15 @@ pub(super) fn weave_within_doc<C: Clock>(
         ));
     }
     let slot_maps = &preflight.slot_maps;
-    let knn_map = slot_maps
-        .get(&knn_slot)
-        .ok_or_else(|| LodestarError::KernelInvalidParams {
-            detail: format!("content slot {knn_slot} was not scanned"),
-        })?;
+    if embedding_slots.len() < 2 {
+        return data_error("panel-native weave needs at least two dense slots".to_string());
+    }
 
     // Weave per constellation, batched for XTerm/node persistence.
     let mut xterm_rows_persisted = 0usize;
     let mut agreement_acc: BTreeMap<(u16, u16), (f64, usize)> = BTreeMap::new();
     let mut anchors: Vec<CxId> = Vec::new();
-    let mut knn_vectors: Vec<(CxId, Vec<f32>)> = Vec::with_capacity(bases.len());
+    let mut panel_vectors: Vec<(CxId, PanelVectors)> = Vec::with_capacity(bases.len());
 
     for chunk in bases.chunks(batch.max(1)) {
         let mut loom = LoomStore::new(LOOM_CACHE_CAP);
@@ -123,16 +126,21 @@ pub(super) fn weave_within_doc<C: Clock>(
 
         for cx in chunk {
             let cx_id = cx.cx_id;
-            let knn_vec =
-                knn_map
-                    .get(&cx_id)
-                    .cloned()
-                    .ok_or_else(|| LodestarError::KernelInvalidParams {
-                        detail: format!(
-                            "constellation {cx_id} has no dense vector in content slot {knn_slot}; \
-                         the between-doc graph needs a per-node embedding"
-                        ),
-                    })?;
+            let vectors = embedding_slots
+                .iter()
+                .map(|slot| {
+                    let vector = slot_maps
+                        .get(slot)
+                        .and_then(|rows| rows.get(&cx_id))
+                        .cloned()
+                        .ok_or_else(|| LodestarError::KernelInvalidParams {
+                            detail: format!(
+                                "constellation {cx_id} has no dense vector in contracted slot {slot}; panel-native graph refuses partial constellations"
+                            ),
+                        })?;
+                    Ok((*slot, vector))
+                })
+                .collect::<Result<PanelVectors, LodestarError>>()?;
 
             // Agreement is defined only between equal-dimension lenses; weave each
             // dimension group independently.
@@ -156,7 +164,8 @@ pub(super) fn weave_within_doc<C: Clock>(
             }
 
             let props = AsterAssocNodeProps {
-                embedding: Some(knn_vec.clone()),
+                embedding: None,
+                embeddings: vectors.clone(),
                 ts: Some(cx.created_at),
                 anchors: cx
                     .anchors
@@ -175,7 +184,7 @@ pub(super) fn weave_within_doc<C: Clock>(
             if !cx.anchors.is_empty() {
                 anchors.push(cx_id);
             }
-            knn_vectors.push((cx_id, knn_vec));
+            panel_vectors.push((cx_id, vectors));
         }
 
         for edge in loom.agreement_graph()? {
@@ -214,11 +223,11 @@ pub(super) fn weave_within_doc<C: Clock>(
 
     Ok(WithinDocResult {
         constellations_in_vault,
-        constellations_processed: knn_vectors.len(),
+        constellations_processed: panel_vectors.len(),
         xterm_rows_persisted,
         agreement_pairs,
         anchors,
-        knn_vectors,
+        panel_vectors,
     })
 }
 
@@ -233,52 +242,81 @@ pub(super) fn build_between_doc_graph<C: Clock>(
 ) -> CliResult<(usize, AssocGraph)> {
     let mut builder = AssocGraph::builder();
     let node_set: HashSet<CxId> = request
-        .knn_vectors
+        .panel_vectors
         .iter()
         .map(|(cx_id, _)| *cx_id)
         .collect();
-    for (cx_id, _) in request.knn_vectors {
+    for (cx_id, _) in request.panel_vectors {
         builder.add_node(*cx_id, 1.0).map_err(LodestarError::from)?;
     }
 
     let mut edges_persisted = 0usize;
     let mut edge_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> = Vec::new();
 
-    let nodes_total = request.knn_vectors.len();
-    for (node_index, (cx_id, vector)) in request.knn_vectors.iter().enumerate() {
-        let query = SlotVector::Dense {
-            dim: vector.len() as u32,
-            data: vector.clone(),
-        };
-        let hits = request
-            .indexes
-            .search(request.knn_slot, &query, request.knn + 1)?;
+    let panel_lookup = request
+        .panel_vectors
+        .iter()
+        .map(|(id, vectors)| (*id, vectors))
+        .collect::<HashMap<_, _>>();
+    let candidate_k = request
+        .knn
+        .checked_mul(request.embedding_slots.len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| CliError::runtime("panel graph candidate k overflow"))?;
+    let nodes_total = request.panel_vectors.len();
+    for (node_index, (cx_id, vectors)) in request.panel_vectors.iter().enumerate() {
+        let mut candidate_ids = BTreeSet::new();
+        for slot in request.embedding_slots {
+            let vector = vectors.get(slot).ok_or_else(|| {
+                CliError::runtime(format!("graph source {cx_id} lost contracted slot {slot}"))
+            })?;
+            let query = SlotVector::Dense {
+                dim: vector.len() as u32,
+                data: vector.clone(),
+            };
+            for hit in request.indexes.search(*slot, &query, candidate_k)? {
+                if hit.cx_id != *cx_id && node_set.contains(&hit.cx_id) {
+                    candidate_ids.insert(hit.cx_id);
+                }
+            }
+        }
+        let candidates = candidate_ids
+            .into_iter()
+            .map(|id| {
+                let panel = panel_lookup.get(&id).ok_or_else(|| {
+                    CliError::runtime(format!("graph candidate {id} has no panel vectors"))
+                })?;
+                Ok((id, *panel))
+            })
+            .collect::<CliResult<BTreeMap<_, _>>>()?;
+        let hits =
+            rank_panel_candidate_refs(vectors, &candidates, request.embedding_slots, PANEL_RRF_K)?;
         let mut kept = 0usize;
-        for hit in hits {
+        for (fused_offset, hit) in hits.into_iter().enumerate() {
             // Skip self, sub-threshold, and any neighbour outside the processed
             // node set (only possible under `--limit`; the full corpus run keeps
             // every neighbour). Guarantees every edge endpoint has a graph node.
-            if hit.cx_id == *cx_id
-                || hit.score < request.edge_cos_threshold
-                || !node_set.contains(&hit.cx_id)
-            {
+            if hit.score < request.edge_score_threshold {
                 continue;
             }
             if kept >= request.knn {
                 break;
             }
-            let cosine = hit.score.clamp(0.0, 1.0);
+            let weight = hit.score.clamp(0.0, 1.0);
             let out_key = graph.edge_out_key(*cx_id, EDGE_TYPE, hit.cx_id)?;
             let in_key = graph.edge_in_key(hit.cx_id, EDGE_TYPE, *cx_id)?;
             let value = serde_json::to_vec(&EdgeValue {
-                cosine: hit.score,
-                rank: hit.rank,
+                weight,
+                fusion: "rrf",
+                rrf_k: PANEL_RRF_K,
+                fused_rank: fused_offset + 1,
+                lanes: hit.lanes,
             })
             .map_err(|error| CliError::runtime(format!("serialize edge value: {error}")))?;
             edge_rows.push((ColumnFamily::Graph, out_key.clone(), value));
             edge_rows.push((ColumnFamily::Graph, in_key, out_key));
             builder
-                .add_edge(*cx_id, hit.cx_id, cosine)
+                .add_edge(*cx_id, hit.cx_id, weight)
                 .map_err(LodestarError::from)?;
             kept += 1;
             edges_persisted += 1;

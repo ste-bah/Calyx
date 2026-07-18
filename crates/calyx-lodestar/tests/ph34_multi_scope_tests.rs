@@ -10,7 +10,9 @@ use calyx_lodestar::{
 use calyx_paths::AssocGraph;
 use serde_json::json;
 
-mod memory_assoc_support;
+// calyx-shared-module: path=memory_assoc_support/mod.rs alias=__calyx_shared_memory_assoc_support_mod_rs local=memory_assoc_support visibility=private
+
+use crate::__calyx_shared_memory_assoc_support_mod_rs as memory_assoc_support;
 use memory_assoc_support::{MemoryAssocStore, cx, ids};
 
 fn store(temporal_ready: bool) -> MemoryAssocStore {

@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use calyx_sextant::index::{DenseVectorFile, cuvs_bruteforce_topk};
+use calyx_sextant::index::{
+    CuvsChunkedExactReport, DenseVectorFile, PartitionDistanceMetric, PartitionedSearch,
+};
 use serde_json::{Value, json};
 
 use crate::a35_signal::require_recorded_countable_content_signal_kind;
 use crate::error::{CliError, CliResult};
+use crate::partitioned_bench::brute_force::exact_topk_vecfile_chunked;
 use crate::partitioned_bench::rrf_plan::{self, LoadedPlan, Plan, PlanSlot};
 use crate::partitioned_bench::slot_truth_store::{FORMAT, MODE, ROW_ID_SPACE};
 
@@ -23,7 +26,7 @@ mod support;
 use args::Args;
 use support::{io_error, sha256_file, st_error};
 
-const BACKEND: &str = "cuvs-bruteforce-chunked-v1";
+const BACKEND: &str = "cuvs-resident-chunked-exact-v2";
 const MIN_A35_LENSES: usize = 10;
 #[derive(Clone, Debug)]
 struct SlotEvidence {
@@ -41,6 +44,7 @@ struct SlotEvidence {
     dim: usize,
     chunks: usize,
     elapsed_ms: u128,
+    execution: CuvsChunkedExactReport,
     rank_rows: Vec<Vec<u64>>,
 }
 
@@ -170,6 +174,8 @@ fn generate_slot(
     let started = Instant::now();
     let corpus_path = rrf_plan::resolve(plan_base, &slot.corpus);
     let query_path = rrf_plan::resolve(plan_base, &slot.queries);
+    let vault_path = rrf_plan::resolve(plan_base, &slot.vault);
+    let search = PartitionedSearch::open(&vault_path).map_err(CliError::Calyx)?;
     let corpus = DenseVectorFile::open(&corpus_path).map_err(CliError::Calyx)?;
     let queries = DenseVectorFile::open(&query_path).map_err(CliError::Calyx)?;
     let query_start = usize::try_from(slot.query_start_row).map_err(|_| {
@@ -180,28 +186,29 @@ fn generate_slot(
         )
     })?;
     validate_files(&corpus, &queries, args, corpus_rows, slot, query_start)?;
-    let mut query_rows = load_rows(&queries, query_start, args.query_count)?;
-    let mut merged = vec![Vec::<(u64, f32)>::new(); args.query_count];
-    let mut chunks = 0usize;
-    let mut base = 0usize;
-    while base < corpus_rows {
-        let take = args.chunk_rows.min(corpus_rows - base);
-        let mut chunk = load_rows(&corpus, base, take)?;
-        let chunk_k = args.truth_depth.min(take);
-        let result = cuvs_bruteforce_topk(
-            &mut chunk,
-            take,
-            corpus.dim(),
-            &mut query_rows,
-            args.query_count,
-            chunk_k,
-        )
-        .map_err(CliError::Calyx)?;
-        merge_chunk(&mut merged, &result, base, args.truth_depth)?;
-        chunks += 1;
-        base += take;
+    if search.dim() != corpus.dim() {
+        return Err(st_error(
+            "CALYX_FSV_PARTITIONED_RRF_SLOT_TRUTH_MISMATCH",
+            format!(
+                "slot {} vault dim {} != corpus dim {}",
+                slot.slot,
+                search.dim(),
+                corpus.dim()
+            ),
+            "regenerate/export a consistent partitioned RRF plan",
+        ));
     }
-    let rows = merged
+    let distance_metric = search.manifest().distance_metric;
+    let query_rows = load_rows(&queries, query_start, args.query_count, distance_metric);
+    let truth = exact_topk_vecfile_chunked(
+        &corpus,
+        &query_rows,
+        args.truth_depth,
+        distance_metric,
+        args.chunk_rows,
+    )?;
+    let rows = truth
+        .ranked
         .iter()
         .map(|row| {
             row.iter()
@@ -231,42 +238,11 @@ fn generate_slot(
         queries: query_path.display().to_string(),
         query_start_row: slot.query_start_row,
         dim: corpus.dim(),
-        chunks,
+        chunks: truth.execution.chunks,
         elapsed_ms: started.elapsed().as_millis(),
+        execution: truth.execution,
         rank_rows: rows,
     })
-}
-
-fn merge_chunk(
-    merged: &mut [Vec<(u64, f32)>],
-    result: &calyx_sextant::index::CuvsBruteForceTopK,
-    base: usize,
-    depth: usize,
-) -> CliResult {
-    if result.query_count != merged.len() {
-        return Err(st_error(
-            "CALYX_FSV_PARTITIONED_RRF_SLOT_TRUTH_BACKEND",
-            "cuVS result query count mismatch",
-            "inspect cuVS brute-force output before trusting generated truth",
-        ));
-    }
-    for (query_idx, row) in merged.iter_mut().enumerate() {
-        let (neighbors, distances) = result.row(query_idx);
-        for (&neighbor, &distance) in neighbors.iter().zip(distances) {
-            let neighbor = u64::try_from(neighbor).map_err(|_| {
-                st_error(
-                    "CALYX_FSV_PARTITIONED_RRF_SLOT_TRUTH_BACKEND",
-                    "cuVS returned a negative row id",
-                    "inspect cuVS brute-force output before trusting generated truth",
-                )
-            })?;
-            row.push((base as u64 + neighbor, distance));
-        }
-        row.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
-        row.dedup_by_key(|(id, _)| *id);
-        row.truncate(depth);
-    }
-    Ok(())
 }
 
 fn validate_plan(plan: &Plan) -> CliResult {
@@ -340,12 +316,18 @@ fn validate_files(
     Ok(())
 }
 
-fn load_rows(file: &DenseVectorFile, start: usize, rows: usize) -> CliResult<Vec<f32>> {
-    let mut out = Vec::with_capacity(rows * file.dim());
-    for offset in 0..rows {
-        out.extend(file.row_f32((start + offset) as u64));
-    }
-    Ok(out)
+fn load_rows(
+    file: &DenseVectorFile,
+    start: usize,
+    rows: usize,
+    metric: PartitionDistanceMetric,
+) -> Vec<Vec<f32>> {
+    (0..rows)
+        .map(|offset| match metric {
+            PartitionDistanceMetric::UnitL2 => file.row_f32((start + offset) as u64),
+            PartitionDistanceMetric::RawL2 => file.row_f32_raw((start + offset) as u64),
+        })
+        .collect()
 }
 
 fn write_i32bin(path: &Path, rows: &[Vec<u64>], width: usize) -> CliResult {
@@ -419,6 +401,7 @@ fn slot_report(slot: &SlotEvidence) -> Value {
         "dim": slot.dim,
         "chunks": slot.chunks,
         "elapsed_ms": slot.elapsed_ms,
+        "execution": slot.execution,
     })
 }
 

@@ -1,5 +1,9 @@
 use super::*;
 
+pub(super) fn manifest_path(vault_dir: &Path) -> PathBuf {
+    vault_dir.join(INDEX_ROOT).join(MANIFEST_NAME)
+}
+
 pub(super) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> CliResult {
     write_bytes_atomic(path, &serde_json::to_vec_pretty(value)?)
 }

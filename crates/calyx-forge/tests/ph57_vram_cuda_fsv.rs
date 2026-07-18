@@ -5,7 +5,7 @@
 //! marked `#[ignore]` so it only runs on a GPU host (manual, CUDA GPU):
 //!
 //! ```text
-//! cargo test -p calyx-forge --features cuda --test ph57_vram_cuda_fsv \
+//! cargo test -p calyx-forge --features cuda --test __calyx_integration_platform_0 ph57_vram_cuda_fsv \
 //!     -- --ignored --nocapture
 //! ```
 //!

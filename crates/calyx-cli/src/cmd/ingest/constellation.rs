@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Instant;
 
+mod measurement;
+
 use calyx_aster::vault::AsterVault;
 use calyx_core::{
     AbsentReason, CalyxError, CalyxErrorCode, Constellation, CxFlags, Input, InputRef, LedgerRef,
-    LensId, Modality, Placement, SlotId, SlotState, SlotVector,
+    LensId, MeasurementGroupKey, Modality, Placement, SlotId, SlotState, SlotVector,
 };
 use calyx_registry::VaultPanelState;
 pub(crate) use calyx_registry::measure::{absent, input_hash};
@@ -17,6 +19,7 @@ use super::worker::measure_lens_in_worker;
 use crate::error::CliResult;
 use crate::lens_commands::support::runtime_name;
 use crate::panel_commands::measure_resident_batch_at;
+use measurement::*;
 
 /// Doctrine #1273 rule 3 ("never single — fail hard"): an ingest that leaves
 /// every declared, applicable content lens unmeasured would silently persist a
@@ -134,124 +137,9 @@ struct ApplicableLens {
     placement: Placement,
 }
 
-fn persisted_snapshot_for_lens(
-    state: &VaultPanelState,
-    lens_id: LensId,
-) -> Option<&calyx_registry::RegistryLensSnapshot> {
-    state
-        .registry_snapshot
-        .as_ref()?
-        .lenses
-        .iter()
-        .find(|snapshot| snapshot.lens_id == lens_id)
-}
-
-fn measure_persisted_lens_in_worker(
-    snapshot: &calyx_registry::RegistryLensSnapshot,
-    inputs: &[Input],
-    runtime_batch_limit: Option<usize>,
-) -> calyx_core::Result<Vec<SlotVector>> {
-    let vectors = measure_lens_in_worker(snapshot, inputs, runtime_batch_limit)?;
-    if vectors.len() != inputs.len() {
-        return Err(CalyxError::lens_dim_mismatch(format!(
-            "ingest lens worker for lens {} returned {} vectors for {} inputs",
-            snapshot.lens_id,
-            vectors.len(),
-            inputs.len()
-        )));
-    }
-    for vector in &vectors {
-        snapshot.contract.verify_vector(snapshot.lens_id, vector)?;
-    }
-    Ok(vectors)
-}
-
-fn measure_registry_lens_batch_with_limit(
-    state: &VaultPanelState,
-    lens_id: LensId,
-    inputs: &[Input],
-    runtime_batch_limit: Option<usize>,
-) -> calyx_core::Result<Vec<SlotVector>> {
-    calyx_registry::measure_registry_batch_with_runtime_limit(
-        &state.registry,
-        lens_id,
-        inputs,
-        runtime_batch_limit,
-    )
-}
-
-fn measure_applicable_lens_batch(
-    state: &VaultPanelState,
-    lens: ApplicableLens,
-    modality: Modality,
-    inputs: &[Input],
-    runtime_batch_limit: Option<usize>,
-) -> calyx_core::Result<Vec<SlotVector>> {
-    let started = Instant::now();
-    let spec = state.registry.lens_spec(lens.lens_id);
-    let spec_name = spec
-        .map(|spec| spec.name.as_str())
-        .unwrap_or("missing_registry_snapshot");
-    let runtime = spec
-        .map(|spec| runtime_name(&spec.runtime))
-        .unwrap_or("unregistered");
-    ingest_runtime_log(format_args!(
-        "phase=measure_lens_start lens_id={} slot={} name={} runtime={} modality={:?} placement={:?} batch_size={} runtime_batch_limit={:?}",
-        lens.lens_id,
-        lens.slot_id.get(),
-        spec_name,
-        runtime,
-        modality,
-        lens.placement,
-        inputs.len(),
-        runtime_batch_limit
-    ));
-    let result = if lens.placement == Placement::Gpu {
-        if let Some(snapshot) = persisted_snapshot_for_lens(state, lens.lens_id) {
-            ingest_runtime_log(format_args!(
-                "phase=measure_lens_worker_start lens_id={} slot={} name={} inputs={} runtime_batch_limit={:?}",
-                lens.lens_id,
-                lens.slot_id.get(),
-                spec_name,
-                inputs.len(),
-                runtime_batch_limit
-            ));
-            let result = measure_persisted_lens_in_worker(snapshot, inputs, runtime_batch_limit);
-            if result.is_ok() {
-                ingest_runtime_log(format_args!(
-                    "phase=measure_lens_worker_ok lens_id={} slot={} name={}",
-                    lens.lens_id,
-                    lens.slot_id.get(),
-                    spec_name
-                ));
-            }
-            result
-        } else {
-            measure_registry_lens_batch_with_limit(state, lens.lens_id, inputs, runtime_batch_limit)
-        }
-    } else {
-        measure_registry_lens_batch_with_limit(state, lens.lens_id, inputs, runtime_batch_limit)
-    };
-    match &result {
-        Ok(vectors) => ingest_runtime_log(format_args!(
-            "phase=measure_lens_ok lens_id={} slot={} name={} vectors={} elapsed_ms={}",
-            lens.lens_id,
-            lens.slot_id.get(),
-            spec_name,
-            vectors.len(),
-            started.elapsed().as_millis()
-        )),
-        Err(error) => ingest_runtime_log(format_args!(
-            "phase=measure_lens_err lens_id={} slot={} name={} code={} message={} elapsed_ms={}",
-            lens.lens_id,
-            lens.slot_id.get(),
-            spec_name,
-            error.code,
-            error.message,
-            started.elapsed().as_millis()
-        )),
-    }
-    result
+struct ApplicableLensJob {
+    lenses: Vec<ApplicableLens>,
+    grouped: bool,
 }
 
 /// Batch-measure a modality-uniform microbatch of inputs through every applicable
@@ -327,10 +215,6 @@ pub(crate) fn measure_constellation_microbatch_with_runtime_limit(
         runtime_batch_limit,
         gpu_route.resident_addr
     ));
-    let measure_one = |lens: ApplicableLens| {
-        measure_applicable_lens_batch(state, lens, batch_modality, inputs, runtime_batch_limit)
-            .map(|vectors| (lens.lens_id, vectors))
-    };
     let (gpu_vectors, cpu_vectors) = if let Some(addr) = gpu_route.resident_addr {
         if !gpu_lenses.is_empty() {
             ingest_runtime_log(format_args!(
@@ -347,10 +231,16 @@ pub(crate) fn measure_constellation_microbatch_with_runtime_limit(
             runtime_batch_limit,
             addr,
         )?;
-        let cpu_vectors = cpu_lenses
+        let cpu_jobs = group_applicable_lenses(state, &cpu_lenses)?;
+        let cpu_vectors: Vec<(LensId, Vec<SlotVector>)> = cpu_jobs
             .par_iter()
-            .map(|&lens| measure_one(lens))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .map(|job| {
+                measure_applicable_lens_job(state, job, batch_modality, inputs, runtime_batch_limit)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         (gpu_vectors, cpu_vectors)
     } else {
         // #1004 fail-closed gate: active GPU lenses without a resident route
@@ -361,18 +251,48 @@ pub(crate) fn measure_constellation_microbatch_with_runtime_limit(
                 gpu_route_required_error(gpu_lenses.len(), batch_modality, gpu_route).into(),
             );
         }
+        let gpu_jobs = group_applicable_lenses(state, &gpu_lenses)?;
+        let cpu_jobs = group_applicable_lenses(state, &cpu_lenses)?;
         let (gpu_result, cpu_result) = rayon::join(
             || {
-                gpu_lenses
+                gpu_jobs
                     .iter()
-                    .map(|&lens| measure_one(lens))
+                    .map(|job| {
+                        measure_applicable_lens_job(
+                            state,
+                            job,
+                            batch_modality,
+                            inputs,
+                            runtime_batch_limit,
+                        )
+                    })
                     .collect::<std::result::Result<Vec<_>, _>>()
+                    .map(|groups| {
+                        groups
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<(LensId, Vec<SlotVector>)>>()
+                    })
             },
             || {
-                cpu_lenses
+                cpu_jobs
                     .par_iter()
-                    .map(|&lens| measure_one(lens))
+                    .map(|job| {
+                        measure_applicable_lens_job(
+                            state,
+                            job,
+                            batch_modality,
+                            inputs,
+                            runtime_batch_limit,
+                        )
+                    })
                     .collect::<std::result::Result<Vec<_>, _>>()
+                    .map(|groups| {
+                        groups
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<(LensId, Vec<SlotVector>)>>()
+                    })
             },
         );
         (gpu_result?, cpu_result?)

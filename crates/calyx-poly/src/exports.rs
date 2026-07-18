@@ -304,8 +304,9 @@ pub use crate::parameter_adaptation::{
     ParameterAdaptationReport, ParameterAdaptationRequest, ParameterAdaptationRun,
     ParameterAdaptationSchedule, ParameterAdaptationStatus, ParameterObservation,
     ParameterSetSnapshot, compute_parameter_adaptation_report,
-    read_parameter_adaptation_ledger_entries, read_parameter_adaptation_report,
-    run_parameter_adaptation_report, write_parameter_adaptation_report,
+    compute_parameter_adaptation_report_with_execution, read_parameter_adaptation_ledger_entries,
+    read_parameter_adaptation_report, run_parameter_adaptation_report,
+    run_parameter_adaptation_report_with_execution, write_parameter_adaptation_report,
 };
 pub use crate::pending_forecast_register::{
     ERR_PENDING_FORECAST_INVALID, ERR_PENDING_FORECAST_LEDGER_APPEND, ERR_PENDING_FORECAST_PAYLOAD,

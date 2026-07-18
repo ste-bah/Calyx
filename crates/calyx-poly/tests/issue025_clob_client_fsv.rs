@@ -3,8 +3,8 @@
 //! Source of truth for live FSV: persisted public CLOB HTTP body bytes read back from disk and
 //! parsed into normalized book, scalar, and history records for one Gamma-derived token.
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use std::fs;
 use std::path::Path;

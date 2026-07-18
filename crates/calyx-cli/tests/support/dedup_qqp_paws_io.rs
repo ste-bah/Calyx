@@ -14,8 +14,8 @@ use calyx_core::{
 };
 use serde_json::json;
 
-#[path = "dedup_fsv_io.rs"]
-mod dedup_fsv_io;
+// calyx-shared-module: path=support/dedup_fsv_io.rs alias=__calyx_shared_support_dedup_fsv_io_rs local=dedup_fsv_io visibility=private
+use crate::__calyx_shared_support_dedup_fsv_io_rs as dedup_fsv_io;
 
 pub(crate) use dedup_fsv_io::{write_blake3_sums, write_json};
 

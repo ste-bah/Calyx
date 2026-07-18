@@ -23,15 +23,8 @@ pub trait KernelArtifactStore {
 
 impl KernelArtifactStore for FsKernelStore {
     fn write_kernel_bytes(&self, kernel_id: CxId, bytes: &[u8]) -> Result<()> {
-        let dir = self.index_dir(kernel_id);
-        fs::create_dir_all(&dir).map_err(io_error)?;
         let path = self.kernel_file_path(kernel_id);
-        let tmp = dir.join("kernel.json.tmp");
-        fs::write(&tmp, bytes).map_err(io_error)?;
-        if path.exists() {
-            fs::remove_file(&path).map_err(io_error)?;
-        }
-        fs::rename(&tmp, &path).map_err(io_error)
+        crate::kernel_index::install_immutable_file(&path, bytes)
     }
 
     fn read_kernel_bytes(&self, kernel_id: CxId) -> Result<Option<Vec<u8>>> {

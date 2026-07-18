@@ -389,6 +389,7 @@ fn card(
         },
         health: LensHealth::Loaded,
         low_spread: false,
+        execution: Default::default(),
     }
 }
 

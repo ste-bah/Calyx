@@ -3,13 +3,15 @@ use std::io::Write;
 
 use calyx_aster::cf::{ColumnFamily, anchor_key, base_key};
 use calyx_aster::dedup::{AnchorConflictResult, check_anchor_conflict};
-use calyx_aster::vault::AsterVault;
 use calyx_aster::vault::encode::{self, decode_constellation_base};
+use calyx_aster::vault::{AsterVault, IngestPrecondition};
 use calyx_core::{Anchor, AnchorKind, Constellation, CxId, Input, InputRef, Modality, VaultStore};
 use calyx_ledger::EntryKind;
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
 
-use super::super::search::{rebuild_persistent_indexes, rebuild_persistent_indexes_with_progress};
+use super::super::search::{
+    rebuild_persistent_indexes, rebuild_persistent_indexes_with_fallible_progress,
+};
 use super::super::vault::{ResolvedVault, now_ms};
 use super::super::{AnchorArgs, IngestArgs, MeasureArgs, Subcommand};
 use super::anchor::{parse_anchor_kind, parse_anchor_value};
@@ -59,10 +61,11 @@ const MEASURE_BATCH_ENV: &str = "CALYX_MEASURE_BATCH";
 const MEASURE_WINDOW_ENV: &str = "CALYX_INGEST_MEASURE_WINDOW";
 
 #[derive(Clone, Copy)]
-struct BatchFlushOptions {
+struct BatchFlushOptions<'a> {
     output: IngestOutput,
     runtime_batch_limit: usize,
     gpu_route: IngestGpuRoute,
+    preflight: &'a replay::BatchExistingPreflight,
 }
 
 pub(crate) fn ingest_runtime_log(args: std::fmt::Arguments<'_>) {
@@ -210,6 +213,16 @@ fn ingest_command(args: IngestArgs) -> CliResult {
             session.session_id(),
             session.status_path().display()
         );
+        let precondition_result = claim_batch_precondition(
+            &resolved,
+            &args.precondition,
+            validation.row_count,
+            &mut session,
+        );
+        if let Err(error) = precondition_result {
+            session.fail_with_error(&error)?;
+            return Err(error);
+        }
         let mut emitted_summary = false;
         let result = if validation.row_count == 0 {
             (|| {
@@ -274,6 +287,27 @@ fn ingest_command(args: IngestArgs) -> CliResult {
         }
     }
     Ok(())
+}
+
+fn claim_batch_precondition(
+    resolved: &ResolvedVault,
+    expected: &IngestPrecondition,
+    row_count: usize,
+    session: &mut BatchIngestSession,
+) -> CliResult<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    session.declare_precondition(expected)?;
+    let vault = open_vault(resolved)?;
+    if row_count == 0 {
+        let observed = vault.verify_ingest_precondition(expected)?;
+        session.record_precondition_verification(observed)?;
+        return Ok(());
+    }
+    let claim =
+        vault.claim_ingest_precondition(expected.clone(), session.precondition_context())?;
+    session.record_precondition_claim(claim)
 }
 
 fn anchor_command(args: AnchorArgs) -> CliResult {
@@ -485,3 +519,7 @@ pub(super) use batch_stream::{
 };
 #[cfg(test)]
 pub(crate) use batch_support::should_stage_batch_constellation;
+#[cfg(test)]
+pub(crate) use replay::{
+    backfill_batch_existing_input_pointers, preflight_batch_existing_identity,
+};

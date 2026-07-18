@@ -6,7 +6,7 @@
 //! return value. Synthetic, hand-computed I/O; ≥3 edge cases print SoT state
 //! BEFORE and AFTER; a JSON artifact captures the residing data.
 //!
-//! Run: `cargo test -p calyx-lodestar --test issue576_summarize_fsv -- --nocapture`.
+//! Run: `cargo test -p calyx-lodestar --test __calyx_integration_suite_0 issue576_summarize_fsv -- --nocapture`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -22,7 +22,9 @@ use calyx_lodestar::{
 };
 use calyx_paths::AssocGraph;
 
-mod memory_assoc_support;
+// calyx-shared-module: path=memory_assoc_support/mod.rs alias=__calyx_shared_memory_assoc_support_mod_rs local=memory_assoc_support visibility=private
+
+use crate::__calyx_shared_memory_assoc_support_mod_rs as memory_assoc_support;
 use memory_assoc_support::{MemoryAssocStore, cx};
 
 /// Bundles the engine plumbing into a [`SummarizeCtx`] for one call.

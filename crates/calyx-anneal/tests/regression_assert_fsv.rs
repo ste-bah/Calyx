@@ -19,12 +19,14 @@ use calyx_core::{
 use calyx_ledger::{EntryKind, decode as decode_ledger};
 use serde_json::{Value, json};
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::vault_id;
 
 #[allow(dead_code)]
-#[path = "support/fsv_bad_change.rs"]
-mod support;
+// calyx-shared-module: path=support/fsv_bad_change.rs alias=__calyx_shared_support_fsv_bad_change_rs local=support visibility=private
+use crate::__calyx_shared_support_fsv_bad_change_rs as support;
 
 const TEST_TS: u64 = 1_785_500_410;
 

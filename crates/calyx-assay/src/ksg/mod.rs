@@ -13,6 +13,7 @@ use self::math::{
 use crate::bootstrap::{
     BootstrapCi, BootstrapConfig, DEFAULT_BOOTSTRAP_RESAMPLES, DEFAULT_BOOTSTRAP_SEED,
 };
+use crate::cuda_strict::strict_cuda_requested;
 use crate::estimate::{EstimatorKind, MiEstimate, TrustTag, trust_for_anchor};
 use crate::samples::validate_rectangular_finite;
 use crate::subsample::{m_out_of_n_size, sample_without_replacement_indices};
@@ -40,6 +41,9 @@ fn ksg_mi_continuous_with_trust(
     k: usize,
     trust: TrustTag,
 ) -> Result<MiEstimate> {
+    if strict_cuda_requested() {
+        return ksg_mi_continuous_with_trust_cuda_strict(x, y, k, trust);
+    }
     validate_samples(x, y, k)?;
     let n = x.len();
     let bits = ksg_bits_from_validated_samples(x, y, k);
@@ -56,7 +60,47 @@ fn ksg_mi_continuous_with_trust(
 
 pub(crate) fn ksg_mi_continuous_point(x: &[Vec<f32>], y: &[Vec<f32>], k: usize) -> Result<f32> {
     validate_samples(x, y, k)?;
+    if strict_cuda_requested() {
+        return ksg_bits_from_validated_samples_cuda(x, y, k);
+    }
     Ok(ksg_bits_from_validated_samples(x, y, k))
+}
+
+pub fn ksg_mi_continuous_cuda_strict(
+    x: &[Vec<f32>],
+    y: &[Vec<f32>],
+    k: usize,
+) -> Result<MiEstimate> {
+    ksg_mi_continuous_with_trust_cuda_strict(x, y, k, TrustTag::Provisional)
+}
+
+pub fn ksg_mi_continuous_with_anchor_cuda_strict(
+    x: &[Vec<f32>],
+    y: &[Vec<f32>],
+    k: usize,
+    anchor: &Anchor,
+) -> Result<MiEstimate> {
+    ksg_mi_continuous_with_trust_cuda_strict(x, y, k, trust_for_anchor(Some(anchor)))
+}
+
+fn ksg_mi_continuous_with_trust_cuda_strict(
+    x: &[Vec<f32>],
+    y: &[Vec<f32>],
+    k: usize,
+    trust: TrustTag,
+) -> Result<MiEstimate> {
+    validate_samples(x, y, k)?;
+    let n = x.len();
+    let bits = ksg_bits_from_validated_samples_cuda(x, y, k)?;
+    let ci = ksg_subsample_ci_cuda(x, y, bits, k, KSG_BOOTSTRAP_CONFIG)?;
+    Ok(MiEstimate::new(
+        bits,
+        ci.ci_low,
+        ci.ci_high,
+        n,
+        EstimatorKind::Ksg,
+        trust,
+    ))
 }
 
 fn ksg_bits_from_validated_samples(x: &[Vec<f32>], y: &[Vec<f32>], k: usize) -> f32 {
@@ -100,6 +144,55 @@ fn ksg_subsample_ci(
         point_estimate,
         (m as f32 / x.len() as f32).sqrt(),
     ))
+}
+
+#[cfg(feature = "cuda")]
+fn ksg_subsample_ci_cuda(
+    x: &[Vec<f32>],
+    y: &[Vec<f32>],
+    point_estimate: f32,
+    k: usize,
+    config: BootstrapConfig,
+) -> Result<BootstrapCi> {
+    if config.resamples == 0 {
+        return Err(CalyxError::assay_insufficient_samples(
+            "KSG no-replacement CI requires at least one resample",
+        ));
+    }
+    let m = m_out_of_n_size(x.len(), k, MIN_ASSAY_SAMPLES, "KSG")?;
+    let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
+    let mut estimates = Vec::with_capacity(config.resamples);
+    let backend = calyx_forge::CudaBackend::new()
+        .map_err(|err| crate::cuda_strict::forge_to_calyx("KSG", err))?;
+    for _ in 0..config.resamples {
+        let indices = sample_without_replacement_indices(x.len(), m, &mut rng)?;
+        let sampled_x: Vec<Vec<f32>> = indices.iter().map(|index| x[*index].clone()).collect();
+        let sampled_y: Vec<Vec<f32>> = indices.iter().map(|index| y[*index].clone()).collect();
+        validate_samples(&sampled_x, &sampled_y, k)?;
+        estimates.push(ksg_bits_from_validated_samples_cuda_with_context(
+            backend.context(),
+            &sampled_x,
+            &sampled_y,
+            k,
+        )?);
+    }
+    Ok(ci_from_resample_estimates(
+        estimates,
+        point_estimate,
+        (m as f32 / x.len() as f32).sqrt(),
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn ksg_subsample_ci_cuda(
+    x: &[Vec<f32>],
+    y: &[Vec<f32>],
+    point_estimate: f32,
+    k: usize,
+    config: BootstrapConfig,
+) -> Result<BootstrapCi> {
+    let _ = (x, y, point_estimate, k, config);
+    Err(crate::cuda_strict::cuda_unavailable("KSG"))
 }
 
 fn ci_from_resample_estimates(
@@ -146,7 +239,39 @@ fn ksg_mi_continuous_discrete_with_anchor_opt(
     validate_sample_counts(x.len(), labels.len(), k)?;
     validate_rectangular_finite("x", x)?;
     validate_finite_chebyshev_domain("x", x)?;
+    if strict_cuda_requested() {
+        return mixed_ci::estimate_cuda_strict(x, labels, k, trust_for_anchor(anchor));
+    }
     mixed_ci::estimate(x, labels, k, trust_for_anchor(anchor))
+}
+
+pub fn ksg_mi_continuous_discrete_cuda_strict(
+    x: &[Vec<f32>],
+    labels: &[usize],
+    k: usize,
+) -> Result<MiEstimate> {
+    ksg_mi_continuous_discrete_with_anchor_opt_cuda_strict(x, labels, k, None)
+}
+
+pub fn ksg_mi_continuous_discrete_with_anchor_cuda_strict(
+    x: &[Vec<f32>],
+    labels: &[usize],
+    k: usize,
+    anchor: &Anchor,
+) -> Result<MiEstimate> {
+    ksg_mi_continuous_discrete_with_anchor_opt_cuda_strict(x, labels, k, Some(anchor))
+}
+
+fn ksg_mi_continuous_discrete_with_anchor_opt_cuda_strict(
+    x: &[Vec<f32>],
+    labels: &[usize],
+    k: usize,
+    anchor: Option<&Anchor>,
+) -> Result<MiEstimate> {
+    validate_sample_counts(x.len(), labels.len(), k)?;
+    validate_rectangular_finite("x", x)?;
+    validate_finite_chebyshev_domain("x", x)?;
+    mixed_ci::estimate_cuda_strict(x, labels, k, trust_for_anchor(anchor))
 }
 
 fn validate_samples(x: &[Vec<f32>], y: &[Vec<f32>], k: usize) -> Result<()> {
@@ -198,6 +323,88 @@ fn neighbor_count(values: &[Vec<f32>], i: usize, radius: f32) -> usize {
         .enumerate()
         .filter(|(j, row)| *j != i && chebyshev(&values[i], row) < radius)
         .count()
+}
+
+fn ksg_bits_from_validated_samples_cuda(x: &[Vec<f32>], y: &[Vec<f32>], k: usize) -> Result<f32> {
+    #[cfg(feature = "cuda")]
+    {
+        let backend = calyx_forge::CudaBackend::new()
+            .map_err(|err| crate::cuda_strict::forge_to_calyx("KSG", err))?;
+        ksg_bits_from_validated_samples_cuda_with_context(backend.context(), x, y, k)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, y, k);
+        Err(crate::cuda_strict::cuda_unavailable("KSG"))
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ksg_mi_continuous_point_cuda_with_context(
+    ctx: &calyx_forge::CudaContext,
+    x: &[Vec<f32>],
+    y: &[Vec<f32>],
+    k: usize,
+) -> Result<f32> {
+    validate_samples(x, y, k)?;
+    ksg_bits_from_validated_samples_cuda_with_context(ctx, x, y, k)
+}
+
+#[cfg(feature = "cuda")]
+fn ksg_bits_from_validated_samples_cuda_with_context(
+    ctx: &calyx_forge::CudaContext,
+    x: &[Vec<f32>],
+    y: &[Vec<f32>],
+    k: usize,
+) -> Result<f32> {
+    let dim_x = x.first().map_or(0, Vec::len);
+    let dim_y = y.first().map_or(0, Vec::len);
+    let flat_x = flatten_matrix(x)?;
+    let flat_y = flatten_matrix(y)?;
+    let counts =
+        calyx_forge::ksg_continuous_counts_host(ctx, &flat_x, &flat_y, x.len(), dim_x, dim_y, k)
+            .map_err(|err| crate::cuda_strict::forge_to_calyx("KSG", err))?;
+    ksg_bits_from_cuda_counts(x.len(), k, &counts.nx, &counts.ny)
+}
+
+#[cfg(feature = "cuda")]
+fn flatten_matrix(values: &[Vec<f32>]) -> Result<Vec<f32>> {
+    let dim = values.first().map_or(0, Vec::len);
+    let len = values
+        .len()
+        .checked_mul(dim)
+        .ok_or_else(|| CalyxError::forge_vram_budget("KSG flat matrix length overflow"))?;
+    let mut flat = Vec::with_capacity(len);
+    for row in values {
+        flat.extend_from_slice(row);
+    }
+    Ok(flat)
+}
+
+#[cfg(feature = "cuda")]
+fn ksg_bits_from_cuda_counts(n: usize, k: usize, nx: &[usize], ny: &[usize]) -> Result<f32> {
+    if nx.len() != n || ny.len() != n {
+        return Err(CalyxError::forge_numerical_invariant(format!(
+            "KSG CUDA count readback length mismatch: n={n} nx={} ny={}",
+            nx.len(),
+            ny.len()
+        )));
+    }
+    let mut local_bits = Vec::with_capacity(n);
+    for i in 0..n {
+        let local = digamma(k as f64) + digamma(n as f64)
+            - digamma((nx[i] + 1) as f64)
+            - digamma((ny[i] + 1) as f64);
+        let bits = (local / std::f64::consts::LN_2) as f32;
+        if !bits.is_finite() {
+            return Err(CalyxError::forge_numerical_invariant(format!(
+                "KSG CUDA produced non-finite local bits at row {i}: nx={} ny={}",
+                nx[i], ny[i]
+            )));
+        }
+        local_bits.push(bits);
+    }
+    Ok(mean(&local_bits).max(0.0))
 }
 
 #[cfg(test)]

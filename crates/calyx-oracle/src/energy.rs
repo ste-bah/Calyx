@@ -8,8 +8,10 @@ use crate::{DomainId, OracleError};
 pub const MAX_STEPS: usize = 20;
 pub const DEFAULT_EPS: f32 = 1.0e-4;
 pub const DEFAULT_BETA: f32 = 1.0;
+pub const ENERGY_CUDA_MIN_ELEMENTS: usize = 262_144;
 pub const CALYX_ORACLE_ENERGY_EMPTY_REGION: &str = "CALYX_ORACLE_ENERGY_EMPTY_REGION";
 pub const CALYX_ORACLE_ENERGY_INVALID_INPUT: &str = "CALYX_ORACLE_ENERGY_INVALID_INPUT";
+pub const CALYX_ORACLE_ENERGY_CUDA_REQUIRED: &str = "CALYX_ORACLE_ENERGY_CUDA_REQUIRED";
 
 const ENERGY_REMEDIATION: &str = "provide finite, same-dimensional non-empty region members";
 const FORGE_REMEDIATION: &str = "repair Forge cosine/normalize inputs before energy descent";
@@ -62,6 +64,22 @@ pub fn descend(
 ) -> Result<DescentResult, OracleError> {
     validate_eps(eps)?;
     validate_beta(beta)?;
+    let elements = validate_dispatch_shape(free_slot, region_members)?;
+    if elements < ENERGY_CUDA_MIN_ELEMENTS {
+        return descend_cpu(free_slot, region_members, beta, max_steps, eps);
+    }
+    descend_cuda(free_slot, region_members, beta, max_steps, eps)
+}
+
+pub(crate) fn descend_cpu(
+    free_slot: &mut [f32],
+    region_members: &[&[f32]],
+    beta: f32,
+    max_steps: usize,
+    eps: f32,
+) -> Result<DescentResult, OracleError> {
+    validate_eps(eps)?;
+    validate_beta(beta)?;
     let region = FlatRegion::new(free_slot, region_members)?;
     let mut similarities = scaled_similarities_prepared(free_slot, &region, beta)?;
     let mut previous = energy_from_scaled(&similarities, &region, beta);
@@ -90,6 +108,58 @@ pub fn descend(
         converged: false,
         final_energy: previous,
     })
+}
+
+#[cfg(feature = "cuda")]
+fn descend_cuda(
+    free_slot: &mut [f32],
+    region_members: &[&[f32]],
+    beta: f32,
+    max_steps: usize,
+    eps: f32,
+) -> Result<DescentResult, OracleError> {
+    use std::sync::OnceLock;
+
+    use calyx_forge::CudaEnergyContext;
+
+    static CUDA: OnceLock<std::result::Result<CudaEnergyContext, String>> = OnceLock::new();
+    let context = CUDA.get_or_init(|| CudaEnergyContext::new(0).map_err(|error| error.to_string()));
+    let context = context.as_ref().map_err(|detail| {
+        energy_error(
+            CALYX_ORACLE_ENERGY_CUDA_REQUIRED,
+            format!("strict CUDA energy provider initialization failed: {detail}"),
+        )
+    })?;
+    debug_assert_eq!(
+        ENERGY_CUDA_MIN_ELEMENTS,
+        calyx_forge::ENERGY_CUDA_MIN_ELEMENTS
+    );
+    let output = context
+        .descend(free_slot, region_members, beta, max_steps, eps)
+        .map_err(forge_error)?;
+    free_slot.copy_from_slice(&output.vector);
+    Ok(DescentResult {
+        steps_taken: output.steps_taken,
+        converged: output.converged,
+        final_energy: output.final_energy,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn descend_cuda(
+    free_slot: &mut [f32],
+    region_members: &[&[f32]],
+    _beta: f32,
+    _max_steps: usize,
+    _eps: f32,
+) -> Result<DescentResult, OracleError> {
+    let elements = free_slot.len().saturating_mul(region_members.len());
+    Err(energy_error(
+        CALYX_ORACLE_ENERGY_CUDA_REQUIRED,
+        format!(
+            "energy descent shape elements={elements} reached the CUDA crossover {ENERGY_CUDA_MIN_ELEMENTS}, but calyx-oracle was compiled without feature `cuda`; refusing silent CPU fallback"
+        ),
+    ))
 }
 
 pub fn get_beta(domain: DomainId, anneal: &dyn AnnealConfig) -> f32 {
@@ -214,6 +284,40 @@ fn validate_region_shape(x: &[f32], region_members: &[&[f32]]) -> Result<usize, 
         check_finite_slice("region_member", member)?;
     }
     Ok(dim)
+}
+
+fn validate_dispatch_shape(x: &[f32], region_members: &[&[f32]]) -> Result<usize, OracleError> {
+    if region_members.is_empty() {
+        return Err(energy_error(
+            CALYX_ORACLE_ENERGY_EMPTY_REGION,
+            "region_members must contain at least one attractor",
+        ));
+    }
+    if x.is_empty() {
+        return Err(energy_error(
+            CALYX_ORACLE_ENERGY_INVALID_INPUT,
+            "free slot vector must be non-empty",
+        ));
+    }
+    check_finite_slice("free_slot", x)?;
+    for (index, member) in region_members.iter().enumerate() {
+        if member.len() != x.len() {
+            return Err(energy_error(
+                CALYX_ORACLE_ENERGY_INVALID_INPUT,
+                format!(
+                    "region member {index} dim {} does not match free slot dim {}",
+                    member.len(),
+                    x.len()
+                ),
+            ));
+        }
+    }
+    x.len().checked_mul(region_members.len()).ok_or_else(|| {
+        energy_error(
+            CALYX_ORACLE_ENERGY_INVALID_INPUT,
+            "energy descent shape overflowed usize",
+        )
+    })
 }
 
 fn validate_beta(beta: f32) -> Result<(), OracleError> {

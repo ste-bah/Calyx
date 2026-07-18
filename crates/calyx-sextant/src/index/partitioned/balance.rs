@@ -1,3 +1,5 @@
+mod gpu;
+
 use std::path::Path;
 
 use calyx_core::Result;
@@ -10,6 +12,7 @@ use super::assignment::{AssignmentRegion, read_ids};
 #[cfg(test)]
 use super::gen_row;
 use super::{IDX_MIX, PartitionDistanceMetric, VectorSource, normalize};
+pub(super) use gpu::balance_region_files_gpu;
 
 #[cfg(test)]
 type RegionSplit = (Vec<Vec<f32>>, Vec<Vec<u64>>);

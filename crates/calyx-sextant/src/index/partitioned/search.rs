@@ -7,7 +7,12 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::index::distance::l2_sq;
-use crate::index::{DiskAnnSearch, DiskAnnSearchParams, SpannCentroidIndex, open_diskann_graph};
+use crate::index::{
+    CagraPartitionRegion, CagraPartitionSearchRequest, CagraServingDiagnostics, CagraServingMetric,
+    CagraServingRegion, DiskAnnBuildBackend, DiskAnnSearch, DiskAnnSearchParams,
+    SpannCentroidIndex, cagra_dataset_sidecar_path, cagra_partitioned_search,
+    cagra_serving_diagnostics, cagra_serving_region, cagra_sidecar_path, open_diskann_graph,
+};
 
 use super::assignment::read_ids;
 use super::{CENTROID_DIR, PartitionDistanceMetric, PartitionedManifest, RegionMeta, cx, manifest};
@@ -31,12 +36,13 @@ pub struct PartitionedSearch {
     manifest: PartitionedManifest,
     centroids: SpannCentroidIndex,
     region_meta: BTreeMap<u32, RegionMeta>,
+    serving_regions: BTreeMap<u32, CagraServingRegion>,
     cache: Mutex<BTreeMap<u32, RegionHandle>>,
 }
 
 /// A reference-counted, opened region graph plus its local->global id map. Cloned
 /// out of the cache so probed regions can be searched in parallel without the lock.
-type RegionHandle = Arc<(DiskAnnSearch, Vec<u64>)>;
+type RegionHandle = Arc<(DiskAnnSearch, Vec<u64>, PathBuf)>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartitionedSearchReadback {
@@ -47,13 +53,14 @@ pub struct PartitionedSearchReadback {
 impl PartitionedSearch {
     pub fn open(root: &Path) -> Result<Self> {
         let manifest = manifest::read_manifest_db(root)?;
-        validate_manifest_artifacts(root, &manifest)?;
+        let serving_regions = validate_manifest_artifacts(root, &manifest)?;
         let centroids = SpannCentroidIndex::open(root.join(CENTROID_DIR))?;
         let region_meta = manifest.regions.iter().map(|m| (m.id, m.clone())).collect();
         Ok(Self {
             root: root.to_path_buf(),
             dim: manifest.dim,
             region_meta,
+            serving_regions,
             centroids,
             manifest,
             cache: Mutex::new(BTreeMap::new()),
@@ -154,35 +161,68 @@ impl PartitionedSearch {
                 touched_regions.push(region);
                 if let std::collections::btree_map::Entry::Vacant(slot) = cache.entry(region) {
                     let ids = read_ids(&self.root.join(&meta.ids_rel))?;
-                    let search = DiskAnnSearch::open(
-                        SlotId::new(0),
-                        self.root.join(&meta.graph_rel),
-                        ids.iter().map(|&i| cx(i)).collect(),
-                        None,
-                        sp,
-                    )?;
-                    slot.insert(Arc::new((search, ids)));
+                    let graph = self.root.join(&meta.graph_rel);
+                    let serving_graph = graph.clone();
+                    let local_ids = ids.iter().map(|&i| cx(i)).collect();
+                    let search = match self.manifest.graph_build_backend {
+                        DiskAnnBuildBackend::CuvsCagra => DiskAnnSearch::open_gpu_serving(
+                            SlotId::new(0),
+                            graph,
+                            local_ids,
+                            None,
+                            sp,
+                        )?,
+                        DiskAnnBuildBackend::CpuVamana => {
+                            DiskAnnSearch::open(SlotId::new(0), graph, local_ids, None, sp)?
+                        }
+                    };
+                    slot.insert(Arc::new((search, ids, serving_graph)));
                 }
                 handles.push(cache.get(&region).expect("just inserted").clone());
             }
         }
-        let per_region: Vec<Vec<(u64, f32)>> = handles
-            .par_iter()
-            .map(|handle| -> Result<Vec<(u64, f32)>> {
-                let (search, ids) = handle.as_ref();
-                let mut local = Vec::with_capacity(k);
-                for (pos, dist) in search.search_ids(query, k, &sp)? {
-                    if let Some(&global) = ids.get(pos as usize) {
-                        local.push((global, dist));
+        let hits = if self.manifest.graph_build_backend == DiskAnnBuildBackend::CuvsCagra {
+            let batch_regions = handles
+                .iter()
+                .zip(&touched_regions)
+                .map(|(handle, region)| CagraPartitionRegion {
+                    serving: self
+                        .serving_regions
+                        .get(region)
+                        .expect("validated CAGRA serving region"),
+                    global_ids: &handle.1,
+                })
+                .collect::<Vec<_>>();
+            let metric = match self.manifest.distance_metric {
+                PartitionDistanceMetric::UnitL2 => CagraServingMetric::UnitL2,
+                PartitionDistanceMetric::RawL2 => CagraServingMetric::RawL2,
+            };
+            cagra_partitioned_search(CagraPartitionSearchRequest {
+                metric,
+                query,
+                k,
+                regions: &batch_regions,
+            })?
+        } else {
+            let per_region: Vec<Vec<(u64, f32)>> = handles
+                .par_iter()
+                .map(|handle| -> Result<Vec<(u64, f32)>> {
+                    let (search, ids, _) = handle.as_ref();
+                    let mut local = Vec::with_capacity(k);
+                    for (pos, dist) in search.search_ids(query, k, &sp)? {
+                        if let Some(&global) = ids.get(pos as usize) {
+                            local.push((global, dist));
+                        }
                     }
-                }
-                Ok(local)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut hits: Vec<(u64, f32)> = per_region.into_iter().flatten().collect();
-        hits.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        hits.dedup_by_key(|(id, _)| *id);
-        hits.truncate(k);
+                    Ok(local)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut hits: Vec<(u64, f32)> = per_region.into_iter().flatten().collect();
+            hits.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            hits.dedup_by_key(|(id, _)| *id);
+            hits.truncate(k);
+            hits
+        };
         Ok(PartitionedSearchReadback {
             hits,
             touched_regions,
@@ -225,15 +265,28 @@ impl PartitionedSearch {
     pub fn dim(&self) -> usize {
         self.dim
     }
+
+    pub fn serving_diagnostics(&self) -> CagraServingDiagnostics {
+        cagra_serving_diagnostics()
+    }
 }
 
-fn validate_manifest_artifacts(root: &Path, manifest: &PartitionedManifest) -> Result<()> {
+fn validate_manifest_artifacts(
+    root: &Path,
+    manifest: &PartitionedManifest,
+) -> Result<BTreeMap<u32, CagraServingRegion>> {
+    let mut serving_regions = BTreeMap::new();
+    let serving_metric = match manifest.distance_metric {
+        PartitionDistanceMetric::UnitL2 => CagraServingMetric::UnitL2,
+        PartitionDistanceMetric::RawL2 => CagraServingMetric::RawL2,
+    };
     validate_graph(
         root,
         &manifest.root_graph_rel,
         manifest.dim,
         manifest.n_regions as u64,
         "root graph",
+        manifest.graph_build_backend,
     )?;
     for meta in &manifest.regions {
         let label = format!("region {} graph", meta.id);
@@ -243,6 +296,7 @@ fn validate_manifest_artifacts(root: &Path, manifest: &PartitionedManifest) -> R
             manifest.dim,
             meta.count as u64,
             &label,
+            manifest.graph_build_backend,
         )?;
         let ids = read_ids(&root.join(&meta.ids_rel))?;
         if ids.len() != meta.count {
@@ -254,8 +308,15 @@ fn validate_manifest_artifacts(root: &Path, manifest: &PartitionedManifest) -> R
                 meta.count
             )));
         }
+        if manifest.graph_build_backend == DiskAnnBuildBackend::CuvsCagra {
+            let graph = root.join(&meta.graph_rel);
+            serving_regions.insert(
+                meta.id,
+                cagra_serving_region(&graph, &ids, serving_metric, manifest.dim)?,
+            );
+        }
     }
-    Ok(())
+    Ok(serving_regions)
 }
 
 fn validate_graph(
@@ -264,6 +325,7 @@ fn validate_graph(
     expected_dim: usize,
     expected_nodes: u64,
     label: &str,
+    backend: DiskAnnBuildBackend,
 ) -> Result<()> {
     let path = root.join(rel);
     let reader = open_diskann_graph(&path).map_err(|error| {
@@ -288,6 +350,23 @@ fn validate_graph(
             "{label} {rel} node_count {} != manifest count {expected_nodes}",
             header.node_count
         )));
+    }
+    if backend == DiskAnnBuildBackend::CuvsCagra {
+        for asset in [cagra_sidecar_path(&path), cagra_dataset_sidecar_path(&path)] {
+            if !asset.is_file()
+                || asset
+                    .metadata()
+                    .map_or(true, |metadata| metadata.len() == 0)
+            {
+                return Err(crate::error::sextant_error(
+                    crate::error::CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE,
+                    format!(
+                        "{label} requires CUDA serving asset {}; rebuild the partitioned vault",
+                        asset.display()
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }

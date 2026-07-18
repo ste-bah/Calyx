@@ -1,6 +1,6 @@
 mod checkpointing;
 mod manifest_ops;
-mod recovery_readback;
+pub(in crate::vault) mod recovery_readback;
 pub(in crate::vault) mod router_coverage;
 
 use recovery_readback::read_manifested_batches;
@@ -14,7 +14,7 @@ use crate::pressure::DiskPressureGuard;
 use crate::resource::ResourceCounters;
 use crate::security::value_crypto::{SharedVaultContext, open_rows, seal_rows};
 use crate::timetravel::RetentionHorizon;
-use crate::wal::{GroupCommitBatcher, WalOptions, replay_dir};
+use crate::wal::{GroupCommitBatcher, ReplayRecord, WalOptions, replay_dir};
 use calyx_core::{CalyxError, Panel, Result, SystemClock, TemporalPolicy};
 use calyx_ledger::CheckpointConfig;
 use std::fs;
@@ -24,6 +24,32 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Optional durable-recovery progress hook: `(bytes_replayed, bytes_total)`.
+///
+/// The vault invokes this only as WAL replay genuinely advances, so startup
+/// owners can surface real intra-`vault_open` liveness instead of timer
+/// heartbeats that would mask a true recovery deadlock.
+#[derive(Clone)]
+pub struct RecoveryProgressHook(Arc<dyn Fn(u64, u64) + Send + Sync>);
+
+impl RecoveryProgressHook {
+    pub fn new(hook: impl Fn(u64, u64) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(hook))
+    }
+
+    fn report(&self, bytes_replayed: u64, bytes_total: u64) {
+        (self.0)(bytes_replayed, bytes_total);
+    }
+}
+
+impl std::fmt::Debug for RecoveryProgressHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryProgressHook")
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct VaultOptions {
@@ -59,6 +85,10 @@ pub struct VaultOptions {
     /// Restricts router recovery to a concrete CF set for read-only handles.
     /// This keeps analytical/search reads from enumerating unrelated large CFs.
     pub selected_cfs: Option<Vec<ColumnFamily>>,
+    /// Optional hook fired as WAL replay advances during open. Default `None`
+    /// = zero behavior change for callers that do not observe recovery
+    /// progress.
+    pub recovery_progress: Option<RecoveryProgressHook>,
 }
 
 impl Default for VaultOptions {
@@ -79,6 +109,7 @@ impl Default for VaultOptions {
             restore_ledger_hook: true,
             read_only: false,
             selected_cfs: None,
+            recovery_progress: None,
         }
     }
 }
@@ -96,8 +127,8 @@ pub(super) struct DurableVault {
     disk_pressure_guard: Option<DiskPressureGuard>,
     value_crypto: Option<SharedVaultContext>,
     pending_checkpoint: Mutex<Vec<(u64, Vec<WriteRow>)>>,
-    /// Max checkpointed seq whose batch wrote derived-search-content CF rows
-    /// (issue #1100); persisted into every manifest write as
+    /// Max checkpointed seq whose batch wrote a persistent-search-input CF
+    /// (issues #1100 and #1808); persisted into every manifest write as
     /// `derived_content_seq`, clamped to that manifest's `durable_seq`.
     checkpointed_derived_content_seq: AtomicU64,
     #[cfg(test)]
@@ -122,6 +153,9 @@ pub(super) struct RecoveredBatches {
     /// Durably recorded derived-content watermark floor for seqs at or below
     /// `wal_replay_floor_seq`; WAL replay re-derives the rest per batch.
     pub derived_content_floor_seq: u64,
+    /// The pointed manifest predates the exact persistent-search-input model;
+    /// open must re-derive and prove its floor from validated relevant levels.
+    pub migrate_derived_content_model: bool,
     pub torn_tail: Option<crate::wal::TornTail>,
     pub temporal_policy: Option<TemporalPolicy>,
     pub dedup_policy: Option<DedupPolicy>,
@@ -176,6 +210,7 @@ impl DurableVault {
         root: impl AsRef<Path>,
         options: &VaultOptions,
         wal_replay_floor_seq: u64,
+        derived_content_floor_seq: u64,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         Self::validate_options(options)?;
@@ -219,12 +254,9 @@ impl DurableVault {
             #[cfg(test)]
             fail_next_checkpoint: Arc::new(AtomicBool::new(false)),
         };
-        if durable.root.join("CURRENT").exists() {
-            let manifest = crate::manifest::ManifestStore::open(&durable.root).load_current()?;
-            durable
-                .checkpointed_derived_content_seq
-                .store(manifest.effective_derived_content_seq(), Ordering::Release);
-        }
+        durable
+            .checkpointed_derived_content_seq
+            .store(derived_content_floor_seq, Ordering::Release);
         if durable.panel.is_some() && !durable.root.join("CURRENT").exists() {
             durable.write_manifest_with_seq(1, 0)?;
         }
@@ -258,20 +290,24 @@ impl DurableVault {
                     std::mem::take(&mut batch.rows),
                 )?;
             }
-            for record in recovery.wal_records {
-                batches.push(RecoveredBatch {
-                    seq: record.seq,
-                    rows: open_rows(
-                        options.value_crypto.as_ref(),
-                        decode_write_batch(&record.payload)?,
-                    )?,
-                });
-            }
+            replay_records_into(
+                &mut batches,
+                recovery.wal_records,
+                options.value_crypto.as_ref(),
+                options.recovery_progress.as_ref(),
+            )?;
+            let migrate_derived_content_model =
+                !recovery.manifest.uses_persistent_search_content_model();
             return Ok(RecoveredBatches {
                 batches,
                 last_recovered_seq: recovery.last_recovered_seq,
                 wal_replay_floor_seq: recovery.manifest.durable_seq,
-                derived_content_floor_seq: recovery.manifest.effective_derived_content_seq(),
+                derived_content_floor_seq: if migrate_derived_content_model {
+                    0
+                } else {
+                    recovery.manifest.effective_derived_content_seq()
+                },
+                migrate_derived_content_model,
                 torn_tail: recovery.torn_tail,
                 temporal_policy: recovery.manifest.temporal_policy,
                 dedup_policy: recovery.manifest.dedup_policy,
@@ -282,24 +318,19 @@ impl DurableVault {
 
         let replay = replay_dir(root.join("wal"))?;
         let last_recovered_seq = replay.records.last().map_or(0, |record| record.seq);
-        let batches = replay
-            .records
-            .iter()
-            .map(|record| {
-                Ok(RecoveredBatch {
-                    seq: record.seq,
-                    rows: open_rows(
-                        options.value_crypto.as_ref(),
-                        decode_write_batch(&record.payload)?,
-                    )?,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let mut batches = Vec::new();
+        replay_records_into(
+            &mut batches,
+            replay.records,
+            options.value_crypto.as_ref(),
+            options.recovery_progress.as_ref(),
+        )?;
         Ok(RecoveredBatches {
             batches,
             last_recovered_seq,
             wal_replay_floor_seq: 0,
             derived_content_floor_seq: 0,
+            migrate_derived_content_model: false,
             torn_tail: replay.torn_tail,
             temporal_policy: options.temporal_policy,
             dedup_policy: options.dedup_policy.clone(),
@@ -374,7 +405,10 @@ impl DurableVault {
     }
 
     fn advance_checkpointed_derived_content(&self, seq: u64, rows: &[WriteRow]) {
-        if rows.iter().any(|row| row.cf.feeds_derived_search_content()) {
+        if rows
+            .iter()
+            .any(|row| row.cf.feeds_persistent_search_index())
+        {
             self.checkpointed_derived_content_seq
                 .fetch_max(seq, Ordering::AcqRel);
         }
@@ -450,6 +484,50 @@ impl DurableVault {
             |policy| policy.place_current_cf(cf).absolute_dir(),
         )
     }
+}
+
+/// WAL payload bytes replayed between recovery-progress callbacks (~4 MiB).
+const RECOVERY_PROGRESS_STRIDE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Decodes replayed WAL records into `batches`, firing `progress` as real
+/// bytes are consumed: once at `(0, total)`, every ~4 MiB, and once at
+/// `(total, total)`. The hook is invoked only when replay actually advances,
+/// so a genuine deadlock stays observable as a frozen trace.
+fn replay_records_into(
+    batches: &mut Vec<RecoveredBatch>,
+    records: Vec<ReplayRecord>,
+    value_crypto: Option<&SharedVaultContext>,
+    progress: Option<&RecoveryProgressHook>,
+) -> Result<()> {
+    let total_bytes: u64 = records
+        .iter()
+        .map(|record| record.payload.len() as u64)
+        .sum();
+    if let Some(hook) = progress {
+        hook.report(0, total_bytes);
+    }
+    let mut replayed_bytes: u64 = 0;
+    let mut last_reported: u64 = 0;
+    for record in records {
+        let payload_bytes = record.payload.len() as u64;
+        batches.push(RecoveredBatch {
+            seq: record.seq,
+            rows: open_rows(value_crypto, decode_write_batch(&record.payload)?)?,
+        });
+        replayed_bytes += payload_bytes;
+        if let Some(hook) = progress
+            && replayed_bytes.saturating_sub(last_reported) >= RECOVERY_PROGRESS_STRIDE_BYTES
+        {
+            hook.report(replayed_bytes, total_bytes);
+            last_reported = replayed_bytes;
+        }
+    }
+    if let Some(hook) = progress
+        && replayed_bytes != last_reported
+    {
+        hook.report(replayed_bytes, total_bytes);
+    }
+    Ok(())
 }
 
 fn validate_dedup_policy(policy: &DedupPolicy, panel: Option<&Panel>) -> Result<()> {

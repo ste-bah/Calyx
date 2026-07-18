@@ -1,14 +1,16 @@
 use std::path::{Path, PathBuf};
 
 use calyx_core::{LensCost, LensId, Modality, Placement, SlotShape};
+use calyx_registry::{LensForgeManifest, LensRuntime, LensSpec, derive_runtime_contract_from_spec};
 
 use super::model::A38_COVERAGE_STATUS;
 use super::store::A38BundleStore;
 use super::*;
 use crate::panel_commands::template_model::{
-    A37_ADMISSION_VERSION, CARD_VERSION, CATALOG_VERSION, CapabilityCardRef, PanelTemplateCatalog,
-    PanelTemplateIndexEntry, PanelTemplateVersionRef, SavedPanelTemplate, TemplateA37Admission,
-    TemplateEnsembleCard, TemplateLensRef, default_time_controls,
+    A37_ADMISSION_VERSION, CARD_VERSION, CATALOG_VERSION, CapabilityCardRef, LENS_SNAPSHOT_VERSION,
+    PanelTemplateCatalog, PanelTemplateIndexEntry, PanelTemplateVersionRef, SavedPanelTemplate,
+    TemplateA37Admission, TemplateEnsembleCard, TemplateLensRef, TemplateLensSnapshot,
+    default_time_controls,
 };
 use crate::panel_commands::{LensCatalog, LensCatalogEntry};
 
@@ -171,12 +173,20 @@ fn fixture_entries(image_vram_bytes: u64) -> Vec<LensCatalogEntry> {
 }
 
 fn lens_entry(idx: u8, name: &str, modality: &str, vram_bytes: u64) -> LensCatalogEntry {
+    let fixture_spec = name.starts_with("text-").then(|| fixture_spec(idx));
     LensCatalogEntry {
-        lens_id: LensId::from_bytes([idx; 16]).to_string(),
+        lens_id: fixture_spec
+            .as_ref()
+            .map(LensSpec::lens_id)
+            .unwrap_or_else(|| LensId::from_bytes([idx; 16]))
+            .to_string(),
         name: name.to_string(),
         modality: modality.to_string(),
         runtime: "fixture".to_string(),
-        dim: 8,
+        dim: fixture_spec.as_ref().map_or(8, |spec| match spec.output {
+            SlotShape::Dense(dim) | SlotShape::Sparse(dim) => dim,
+            SlotShape::Multi { token_dim } => token_dim,
+        }),
         retrieval_only: false,
         excluded_from_dedup: false,
         weights_sha256: "11".repeat(32),
@@ -232,20 +242,96 @@ fn write_template(home: &Path, gate_passed: bool) -> String {
 }
 
 fn template_lens(idx: u8) -> TemplateLensRef {
+    let spec = fixture_spec(idx);
+    let runtime_contract = derive_runtime_contract_from_spec(&spec).unwrap();
+    let manifest = fixture_manifest(idx);
+    let snapshot = TemplateLensSnapshot {
+        schema_version: LENS_SNAPSHOT_VERSION,
+        manifest_blake3: fixture_blake3(&manifest),
+        spec_blake3: fixture_blake3(&spec),
+        runtime_contract_blake3: fixture_blake3(&runtime_contract),
+        manifest,
+        manifest_base_dir: PathBuf::from("/tmp"),
+        spec: spec.clone(),
+        runtime_contract,
+    };
     TemplateLensRef {
         slot_key: format!("text_{idx}"),
         lens_name: format!("text-{idx}"),
-        lens_id: LensId::from_bytes([idx; 16]),
+        lens_id: spec.lens_id(),
         runtime_lens_id: None,
-        weights_sha256: "11".repeat(32),
-        runtime: "fixture".to_string(),
+        weights_sha256: hex32(&spec.weights_sha256),
+        runtime: "algorithmic".to_string(),
         modality: Modality::Text,
-        shape: SlotShape::Dense(8),
+        shape: spec.output,
         placement: Placement::Gpu,
         cost: LensCost::default(),
         manifest: format!("/tmp/text-{idx}.json"),
+        immutable_snapshot: Some(snapshot),
         counts_toward_a35: true,
     }
+}
+
+fn fixture_spec(idx: u8) -> LensSpec {
+    let contract = calyx_registry::FrozenLensContract::algorithmic_byte_features(
+        format!("text-{idx}"),
+        Modality::Text,
+    );
+    LensSpec {
+        name: format!("text-{idx}"),
+        runtime: LensRuntime::Algorithmic {
+            kind: "byte".to_string(),
+        },
+        output: contract.shape(),
+        modality: Modality::Text,
+        weights_sha256: contract.weights_sha256(),
+        corpus_hash: contract.corpus_hash(),
+        norm_policy: contract.norm_policy(),
+        max_batch: None,
+        axis: Some(format!("text-{idx}")),
+        asymmetry: calyx_core::Asymmetry::None,
+        quant_default: calyx_core::QuantPolicy::turboquant_default(),
+        truncate_dim: None,
+        recall_delta: 0.0,
+        retrieval_only: false,
+        excluded_from_dedup: false,
+    }
+}
+
+fn fixture_manifest(idx: u8) -> LensForgeManifest {
+    LensForgeManifest {
+        name: format!("text-{idx}"),
+        modality: Modality::Text,
+        runtime: "algorithmic-byte".to_string(),
+        dim: 16,
+        shape: None,
+        dtype: "f32".to_string(),
+        weights_sha256: "00".repeat(32),
+        artifact_set_sha256: None,
+        files: Vec::new(),
+        pooling: "none".to_string(),
+        norm: "finite".to_string(),
+        source_hf_id: "calyx/algorithmic-byte".to_string(),
+        endpoint: None,
+        license: Some("apache-2.0".to_string()),
+        non_commercial: false,
+        quant_default: calyx_core::QuantPolicy::turboquant_default(),
+        truncate_dim: None,
+        recall_delta: 0.0,
+        max_batch: None,
+        max_tokens: None,
+        batch_policy: None,
+    }
+}
+
+fn fixture_blake3<T: serde::Serialize>(value: &T) -> String {
+    blake3::hash(&serde_json::to_vec(value).unwrap())
+        .to_hex()
+        .to_string()
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn template_card(gate_passed: bool) -> TemplateEnsembleCard {

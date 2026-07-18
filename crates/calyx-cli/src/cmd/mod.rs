@@ -4,6 +4,9 @@ mod biomedical_blindspot_audit;
 mod bridge_corpus;
 mod build_info;
 mod chain_walks;
+mod citation_overlay;
+mod citation_part_attribution;
+mod courtlistener_locator_audit;
 mod discovery_bridge;
 mod discovery_chain;
 mod discovery_gate;
@@ -22,13 +25,17 @@ mod hypothesis_falsification;
 mod hypothesis_rank;
 mod ingest;
 mod intelligence;
+mod judge_association_overlay;
 mod kernel_build;
+mod kernel_generation;
+mod kernel_scope;
 mod known_commands;
 mod lens;
 mod lincs_reversal;
 pub(crate) mod mechanistic_direction;
 mod molecular_vault;
 mod novelty_split;
+mod opinion_alias_overlay;
 mod panel_templates;
 mod parse_helpers;
 mod probe_matrix;
@@ -36,10 +43,13 @@ mod provenance;
 mod readback;
 mod search;
 mod spectral_communities;
+mod summary_attribution;
 mod typed_association_miner;
 pub(crate) mod vault;
+mod vault_rebuild_preflight;
 mod vault_retire;
 mod weave;
+use calyx_aster::vault::IngestPrecondition;
 use calyx_core::Modality;
 pub(crate) use ingest::run_lens_worker as run_ingest_lens_worker;
 use ingest::{IngestOutput, IngestStatusArgs};
@@ -89,6 +99,7 @@ pub(crate) enum Subcommand {
     WeaveLoom(weave::WeaveLoomArgs),
     DomainBridges(domain_bridges::DomainBridgesArgs),
     MaterializeBridgeCorpus(bridge_corpus::MaterializeBridgeCorpusArgs),
+    MaterializeCitationOverlay(citation_overlay::MaterializeCitationOverlayArgs),
     DiscoveryChain(discovery_chain::DiscoveryChainArgs),
     ChainWalks(chain_walks::ChainWalksArgs),
     ProbeMatrix(probe_matrix::ProbeMatrixArgs),
@@ -146,6 +157,7 @@ pub(crate) struct IngestArgs {
     pub resident_addr: Option<SocketAddr>,
     pub allow_cold_gpu_workers: bool,
     pub session_id: Option<String>,
+    pub precondition: IngestPrecondition,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -186,6 +198,12 @@ pub(crate) fn try_run(args: &[String]) -> Option<CliResult> {
         hypothesis_evaluate::try_run,
         hypothesis_evaluator::try_run,
         hypothesis_rank::try_run,
+        opinion_alias_overlay::try_run,
+        judge_association_overlay::try_run,
+        citation_part_attribution::try_run,
+        summary_attribution::try_run,
+        courtlistener_locator_audit::try_run,
+        vault_rebuild_preflight::try_run,
     ] {
         if let Some(result) = direct(args) {
             return Some(result);
@@ -242,6 +260,7 @@ fn run(command: Subcommand) -> CliResult {
         Subcommand::WeaveLoom(_) => weave::run(command),
         Subcommand::DomainBridges(_) => domain_bridges::run(command),
         Subcommand::MaterializeBridgeCorpus(_) => bridge_corpus::run(command),
+        Subcommand::MaterializeCitationOverlay(_) => citation_overlay::run(command),
         Subcommand::DiscoveryChain(_) => discovery_chain::run(command),
         Subcommand::ChainWalks(_) => chain_walks::run(command),
         Subcommand::ProbeMatrix(_) => probe_matrix::run(command),
@@ -294,6 +313,9 @@ pub(crate) fn parse(args: &[String]) -> CliResult<Subcommand> {
         "weave-loom" => weave::parse_weave_loom(rest),
         "domain-bridges" => domain_bridges::parse_domain_bridges(rest),
         "materialize-bridge-corpus" => bridge_corpus::parse_materialize_bridge_corpus(rest),
+        "materialize-citation-overlay" => {
+            citation_overlay::parse_materialize_citation_overlay(rest)
+        }
         "discovery-chain" => discovery_chain::parse_discovery_chain(rest),
         "chain-walks" => chain_walks::parse_chain_walks(rest),
         "probe-matrix" => probe_matrix::parse_probe_matrix(rest),

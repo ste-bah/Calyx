@@ -19,9 +19,10 @@ pub(crate) fn print_command_usage(command: &str) -> CliResult {
 
 fn command_usage(command: &str) -> Option<&'static str> {
     let prefix = format!("calyx {command}");
-    usage().lines().find(|line| {
+    usage().lines().find_map(|line| {
         let trimmed = line.trim_start();
-        trimmed == prefix || trimmed.starts_with(&format!("{prefix} "))
+        let trimmed = trimmed.strip_prefix("usage: ").unwrap_or(trimmed);
+        (trimmed == prefix || trimmed.starts_with(&format!("{prefix} "))).then_some(trimmed)
     })
 }
 
@@ -33,16 +34,19 @@ pub(crate) fn usage() -> &'static str {
        calyx retire-lens <vault> --slot <u16>
        calyx park-lens <vault> --slot <u16>
        calyx retire-vault <vault> --reason <text> [--superseded-by <replacement-vault-or-corpus> --source-issue <issue> --fsv-readback <json> --fsv-sha256 <sha256>]
+       calyx vault-rebuild-preflight <source-vault> --target <existing-dir> [--projected-bytes <n>] [--rollback-reserve-bytes <n>] [--temporary-bps <0..10000>] [--safety-bps <0..10000>] [--out <json>] [--home <dir>]
+       calyx courtlistener-locator-audit --input <jsonl> --out <json> [--token-env <name>] [--min-interval-ms <n>=12000] [--timeout-ms <n>] [--base-url <https://www.courtlistener.com|http://127.0.0.1:port>]
        calyx list-panel <vault>
        calyx profile-lens [--name <n>] [--runtime <r>] [--endpoint <url-or-runtime-id>] [--weights <path>] [--shape Dense(<dim>)|Sparse(<dim>)] [--modality <m>] [--probe <path>]
-       calyx ingest <vault> (--text <s> | --batch <jsonl-path> | --file <path> --modality <image|audio|video>) [--idempotent] [--output <summary|rows>] [--resident-addr <127.0.0.1:port>] [--session-id <id>]
+       calyx ingest <vault> (--text <s> | --batch <jsonl-path> | --file <path> --modality <image|audio|video>) [--idempotent] [--output <summary|rows>] [--resident-addr <127.0.0.1:port>] [--session-id <id>] [--expect-durable-seq <u64> --expect-manifest-seq <u64> --expect-base-count <u64>]
        calyx ingest-status <vault> --session <id>
        calyx anchor <vault> <cx_id> --kind <test-pass|thumbs-up|thumbs-down|label:<s>|speaker-match|style-hold> --value <v> [--confidence <0..1>] [--source <s>]
        calyx measure <vault> --text <s>
        calyx erase <vault> --cx-id <cx_id> [--fsv-out <json>]
-       calyx search <vault> <query> [--k <n>] [--fusion <rrf|weighted-rrf|single-lens|kernel-first|pipeline>] [--guard <off|in-region>] [--explain] [--provenance|--no-provenance] [--fresh|--stale-ok] [--filter <json-predicate>] [--resident-addr <127.0.0.1:port>]
+       calyx search <vault> <query> [--k <n>] [--fusion <rrf|weighted-rrf|single-lens|kernel-first|pipeline>] [--guard <off|in-region>] [--rerank] [--explain] [--provenance|--no-provenance] [--fresh|--stale-ok] [--filter <json-predicate>] [--resident-addr <127.0.0.1:port>]
        calyx probe-matrix <vault> --frontier <text> [--slot <u16>] [--weighted-profile <name>] [--phrasing <terse|clinical|mechanistic|analogical|contrast>] [--length <entity|phrase|paragraph>] [--top-k <n>] [--guard <off|in-region>] [--guard-tau <cosine in (0,1]>] [--stale-ok] [--out <json>] [--resident-addr <127.0.0.1:port>] [--max-variants <n>] [--time-budget-ms <ms>] [--search-miss-budget-ms <ms>] [--search-hit-budget-ms <ms>]
-       calyx kernel-answer <vault> <query> [--anchor <kind>] [--explain]
+       calyx spectral-communities <vault> [--communities <2..256>] [--eigen-k <n>=communities] [--eigen-max-iter <n>=1] [--cluster-max-iter <n>=1] [--centrality-max-iter <n>=1] [--centrality-tol <positive-finite>] [--max-bridge-candidates <n>=1] [--max-centrality-candidates <n>=1] [--out <json>]
+       calyx kernel-answer <vault> <query> [--anchor <kind>] [--explain] [--resident-addr <127.0.0.1:port>] [--max-hops <1..=32>] [--citation-target <opinion-id>] [--citation-collection <name>]
        calyx bits <vault> <anchor-kind> [--explain]
        calyx kernel <vault> [--anchor <kind>] [--rebuild]
        calyx guard <vault> <calibrate|check|generate> [args]
@@ -51,8 +55,8 @@ pub(crate) fn usage() -> &'static str {
        calyx provenance <vault> <cx_id>
        calyx verify-chain [--vault] <vault> [--from <seq>] [--to <seq>] [--batch-size <n>] [--progress-jsonl <stderr|path>] [--time-budget-ms <ms>]
        calyx rebuild-search-index <vault>
-       calyx kernel-build <vault> [--held-out-fraction <0..1>] [--top-k <n>] [--min-recall <0..1>]
-       calyx weave-loom <vault> [--content-slot <u16>] [--candidate-selection covered|base-prefix] [--coverage-only] [--knn <n>] [--edge-cos-threshold <0..1>] [--max-groundedness-distance <n>] [--batch <n>] [--limit <n>] [--time-budget-ms <ms>]
+       calyx kernel-build <vault> [--held-out-fraction <0..1>] [--top-k <n>] [--min-recall <0..1>] [--admission-queries <jsonl> --resident-addr <loopback-address>]
+       calyx weave-loom <vault> [--candidate-selection covered|base-prefix] [--coverage-only] [--knn <n>] [--edge-score-threshold <0..1>] [--max-groundedness-distance <n>] [--batch <n>] [--limit <n>] [--time-budget-ms <ms>]
        calyx discovery-chain <vault> --start <cx> (--anchor <cx>|--anchor-file <path>) [--assay-domain <domain>] [--assay-anchor <reward|label:name|test_pass|tie_formed|thumbs|speaker_match|style_hold|recurrence>] [--max-hops <n>] [--branch-width <n>] [--probe-width <n>] [--max-groundedness-distance <n>] [--min-gate-confidence <f>] [--novelty-weight <f>] [--out <json>]
        calyx chain-walks <vault> --seed-file <json> (--anchor <cx>|--anchor-file <path>) [--assay-domain <domain>] [--assay-anchor <reward|label:name|test_pass|tie_formed|thumbs|speaker_match|style_hold|recurrence>] [--max-hops <n>] [--branch-width <n>] [--probe-width <n>] [--max-groundedness-distance <n>] [--min-gate-confidence <f>] [--novelty-weight <f>] [--max-hypotheses-per-seed <n>] [--min-terminal-confidence <f>] [--out <json>]
        calyx assemble-hypothesis-evidence <vault> --chain <chain.json> --out <input.json>
@@ -64,6 +68,16 @@ pub(crate) fn usage() -> &'static str {
        calyx novelty-calibration-split --atlas <issue>|<domain>|<jsonl> [--atlas <issue>|<domain>|<jsonl> ...] --out-dir <dir> [--top-k <n>] [--run-manifest <manifest.json> --run-stage-id <stage-id>]
        calyx discovery-run (seal --manifest <manifest.json> --ledger <ledger-dir> --out <seal.json> | reproduce --manifest <manifest.json> --observed <observed.json> --out <report.json> | verify --manifest <manifest.json> --ledger <ledger-dir> --seq <n> --out <verify.json>)
        calyx materialize-bridge-corpus <name> --rows <jsonl> [--home <dir>]
+       calyx materialize-citation-overlay <vault> --idmap <csv> --citations <csv> [--collection <name>] [--skip-report <json>] [--report <json>] [--home <dir>]
+       calyx materialize-citation-attribution <vault> --aliases <opinion_cx_aliases.csv> --opinions <opinions.raw.jsonl> --citations <citations.csv> --explicit-parts <jsonl> [--collection <name>] --report <json> [--home <dir>]
+       calyx citation-part-traction <vault> <opinion-id> [--collection <name>] [--home <dir>]
+       calyx materialize-summary-attribution <vault> --cx-set <json> [--alias-vault <canonical-vault>] --aliases <opinion_cx_aliases.csv> --parentheticals <csv> --operator-summaries <jsonl> [--collection <name>] --report <json> [--home <dir>]
+       calyx summary-coverage <vault> --cx-set <json> [--collection <name>] [--report <json>] [--home <dir>]
+       calyx materialize-opinion-aliases <vault> --aliases <opinion_cx_aliases.csv> [--collection <name>] [--report <json>] [--home <dir>]
+       calyx opinion-alias-resolve <vault> <opinion-id> [--collection <name>] [--home <dir>]
+       calyx materialize-judge-associations <vault> --judge-generation <dir> --aliases <opinion_cx_aliases.csv> [--collection <name>] [--report <json>] [--home <dir>]
+       calyx judge-association-resolve <vault> <opinion-id> [--collection <name>] [--home <dir>]
+       calyx judge-association-census <vault> [--collection <name>] [--home <dir>]
        calyx materialize-molecular-vault <vault> --rows <jsonl> [--home <dir>]
        calyx materialize-evidence-substrate <vault> --pubtator-root <dir> --clinicaltrials-root <dir> --dgidb-root <dir> [--collection <name>] [--report <json>] [--home <dir>]
        calyx materialize-lincs-reversal <vault> --root <dir> [--metadata-root <dir>] [--collection <name>] [--report <json>] [--home <dir>]
@@ -72,7 +86,7 @@ pub(crate) fn usage() -> &'static str {
        calyx hypothesis-falsification-sweep --hypotheses-report <json> [--hypotheses-report <json> ...] --pubtator-root <dir> --clinicaltrials-root <dir> --dgidb-root <dir> --open-targets-root <dir> --out-dir <dir> [--max-hypotheses <n>] [--run-manifest <manifest.json> --run-stage-id <stage-id>]
        calyx graph-collection-generations <vault> [--collection <name>] [--home <dir>]
        calyx graph-collection-state <vault> --collection <name> --generation <id> --state <writing|accepted|failed|tombstoned> --command <name> [--reason <text>] [--detail <k=v>] [--home <dir>]
-       calyx reproduce [--record] <vault> <answer_id>
+       calyx reproduce [--record] [--resident-addr <127.0.0.1:port>] <vault> <answer_id>
        calyx anneal-status <vault>
        calyx healthcheck [--vault <vault>] [--json|--no-json] [--tei <http://host:port[/path]>]
        calyx build-info
@@ -89,15 +103,16 @@ pub(crate) fn usage() -> &'static str {
        calyx lens list [--home <dir>]
        calyx lens migrate-catalog [--home <dir>] [--from <registry.json>]
        calyx lens remove (--name <name>|--lens-id <id>) [--home <dir>]
-       calyx lens commission --hf <id|fastembed-model> --runtime <onnx-int8|onnx-fp32|onnx-colbert|fastembed-onnx|fastembed-sparse|fastembed-bgem3-*|fastembed-reranker|fastembed-qwen3|candle-fp16|tei> [--home <dir>] [--out <dir>] [--name <n>] [--endpoint <url>] [--dim <n>] [--max-batch <n>]
+       calyx lens commission --hf <id|fastembed-model> --runtime <onnx-int8|onnx-fp32|onnx-colbert|fastembed-onnx|fastembed-sparse|fastembed-bgem3-*|fastembed-reranker|fastembed-qwen3|candle-fp16|tei> [--home <dir>] [--out <dir>] [--name <n>] [--endpoint <url>] [--dim <n>] [--max-batch <n>] [--max-tokens <n>]
        calyx lens explain --manifest <manifest.json> [--input <text>|--input-file <path>] [--repeat <n>] [--full-vector]
        calyx lens scale-audit --manifest <manifest.json> [--manifest <manifest.json> ...] --out <report.json> [--batch-size <n>] [--min-content-lenses <n>] [--min-gpu-content-lenses <n>] [--min-effective-batch <n>] [--lens-timeout-secs <n>] [--probe <text>] [--probe-file <path>]
        calyx panel template seed [--home <dir>]
        calyx panel template save --name <name> (--all-current [--modality <m>] | --lens <name-or-id> ...) [--home <dir>] [--notes <text>]
        calyx panel template list [--home <dir>]
        calyx panel template fork --from <name-or-id> --name <name> [--home <dir>] [--notes <text>]
+       calyx panel template refresh --template <name-or-id> [--home <dir>] [--notes <text>]
        calyx panel template profile --template <name-or-id> (--card <json> ... | --card-dir <dir>) [--assay-card <ensemble_card.json>] [--home <dir>]
-       calyx panel template swap --template <name-or-id> --vault <vault> [--require-a37-gate] [--home <dir>]
+       calyx panel template swap --template <name-or-id> --vault <vault> --resident-addr <127.0.0.1:port> [--require-a37-gate] [--home <dir>]
        calyx panel batch-limit --vault <vault> --set <name-or-id>=<max_batch> [--set <name-or-id>=<max_batch> ...] [--preflight-text <text>] [--preflight-repeat <n>]
        calyx panel registry-audit --vault <vault>
        calyx panel registry-repair --vault <vault> (--slot <u16>|--all)
@@ -209,4 +224,19 @@ pub(crate) fn usage() -> &'static str {
        calyx navigate traverse --spec <json> --anchor <cx> --direction <forward|backward|both> --hops <1-10> [--out <json>]
        calyx navigate skills --spec <json> [--min-cluster-size <n>] [--min-samples <n>] [--max-constellations <n>] [--slots <a,b>] [--allow-single] [--out <json>]
        calyx navigate search-skill --spec <json> --skill <name> --slot <n> --k <n> --vec <a,b> [--text <s>] [--min-cluster-size <n>] [--min-samples <n>] [--out <json>]"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_usage;
+
+    #[test]
+    fn command_usage_normalizes_the_top_level_usage_prefix() {
+        let readback = command_usage("readback").expect("readback usage");
+        assert!(readback.starts_with("calyx readback "));
+        assert!(!readback.starts_with("usage:"));
+
+        let spectral = command_usage("spectral-communities").expect("spectral usage");
+        assert!(spectral.contains("--max-centrality-candidates"));
+    }
 }

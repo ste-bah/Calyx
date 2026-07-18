@@ -1,9 +1,8 @@
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{Result, SlotId, SlotVector};
 use calyx_forge::QuantLevel;
 use calyx_sextant::{CALYX_SEXTANT_VECTOR_SHAPE, HnswIndex, QuantConfig, SextantIndex};
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
 use sextant_support::cx_u8_fill as cx;
 
 #[test]

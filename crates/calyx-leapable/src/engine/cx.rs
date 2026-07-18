@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use calyx_aster::cf::{ColumnFamily, KeyRange};
 use calyx_aster::erase::{EraseRegistry, EraseScope};
 use calyx_core::{Ts, VaultStore};
@@ -7,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::{Engine, EngineResult, VaultHandle, parse_params, vault_not_open};
 use crate::paths::VaultRef;
-use anchors::{merge_duplicate_anchors, repair_duplicate_anchor_bloat};
+use anchors::{classify_batch_put_error, classify_put_error, repair_duplicate_anchor_bloat};
 use codec::{
     append_recurrence_if_needed, constellation_value, constellation_value_from_base,
     cx_id_from_key, decode_put_input, delete_input_row, input_row, parse_cx_id, prepare_put,
@@ -25,17 +23,19 @@ impl Engine {
         let flush_policy = self.config.flush_policy.clone();
         let vault_ref = VaultRef::parse(&params.vault_ref)?;
         let handle = self.open_vault_for_cx(&vault_ref, params.ts)?;
-        let prepared = prepare_put(handle, params.item, params.ts, false)?;
+        let prepared = prepare_put(handle, params.item, params.ts)?;
         let id = prepared.constellation.cx_id;
-        let deduped = prepared.deduped;
         let input_len = prepared.input_len;
         let input_hash = prepared.input_hash;
         let recurrence_context = prepared.recurrence_context;
-        if deduped {
-            merge_duplicate_anchors(handle, &prepared.constellation)?;
-        } else {
+        let incoming_anchors = prepared.constellation.anchors.clone();
+        let outcome = handle
+            .vault
+            .put_observation_with_outcome(prepared.constellation)
+            .map_err(|error| classify_put_error(handle, id, &incoming_anchors, error))?;
+        let deduped = outcome.deduped();
+        if outcome.inserted() {
             let row = input_row(id, prepared.input_bytes);
-            handle.vault.put(prepared.constellation)?;
             handle.vault.write_cf_batch([row])?;
         }
         let recurrence =
@@ -59,7 +59,6 @@ impl Engine {
         let vault_ref = VaultRef::parse(&params.vault_ref)?;
         let handle = self.open_vault_for_cx(&vault_ref, params.ts)?;
         let mut prepared = Vec::with_capacity(params.items.len());
-        let mut seen = BTreeSet::new();
         let mut total_bytes = 0_usize;
         for item in params.items {
             let decoded = decode_put_input(&item)?;
@@ -68,29 +67,43 @@ impl Engine {
             let id = handle
                 .vault
                 .cx_id_for_input(&decoded.bytes, item.panel_version);
-            let within_batch_duplicate = !seen.insert(id);
-            prepared.push(prepare_put_decoded(
-                handle,
-                item,
-                params.ts,
-                within_batch_duplicate,
-                decoded,
-                id,
-            )?);
+            prepared.push(prepare_put_decoded(handle, item, params.ts, decoded, id)?);
         }
 
-        let mut constellations = Vec::new();
-        let mut duplicate_constellations = Vec::new();
+        let outcomes = handle
+            .vault
+            .put_observation_batch_with_outcomes(
+                prepared.iter().map(|item| item.constellation.clone()),
+            )
+            .map_err(|error| {
+                let constellations = prepared
+                    .iter()
+                    .map(|item| item.constellation.clone())
+                    .collect::<Vec<_>>();
+                classify_batch_put_error(handle, &constellations, error)
+            })?;
+        if outcomes.len() != prepared.len() {
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "Aster returned {} put outcomes for {} submitted cx.put_batch items",
+                outcomes.len(),
+                prepared.len()
+            ))
+            .into());
+        }
         let mut input_rows = Vec::new();
         let mut ack_parts = Vec::with_capacity(prepared.len());
-        for prepared in prepared {
+        for (prepared, outcome) in prepared.into_iter().zip(outcomes) {
             let id = prepared.constellation.cx_id;
-            let deduped = prepared.deduped;
-            if deduped {
-                duplicate_constellations.push(prepared.constellation);
-            } else {
+            if outcome.cx_id != id {
+                return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                    "Aster put outcome order mismatch: expected {id}, got {}",
+                    outcome.cx_id
+                ))
+                .into());
+            }
+            let deduped = outcome.deduped();
+            if outcome.inserted() {
                 input_rows.push(input_row(id, prepared.input_bytes));
-                constellations.push(prepared.constellation);
             }
             ack_parts.push((
                 id,
@@ -100,11 +113,7 @@ impl Engine {
                 prepared.input_hash,
             ));
         }
-        handle.vault.put_batch(constellations)?;
         handle.vault.write_cf_batch(input_rows)?;
-        for constellation in &duplicate_constellations {
-            merge_duplicate_anchors(handle, constellation)?;
-        }
         let mut response_items = Vec::with_capacity(ack_parts.len());
         for (id, deduped, recurrence_context, input_len, input_hash) in ack_parts {
             let recurrence =

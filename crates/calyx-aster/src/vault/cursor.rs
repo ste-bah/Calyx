@@ -64,4 +64,8 @@ impl<'a> Cursor<'a> {
     pub(super) fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.offset)
     }
+
+    pub(super) fn position(&self) -> usize {
+        self.offset
+    }
 }

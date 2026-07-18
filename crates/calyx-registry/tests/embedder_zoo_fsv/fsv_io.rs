@@ -6,8 +6,8 @@ use calyx_core::{FixedClock, VaultId};
 use calyx_ledger::{ActorId, DirectoryLedgerStore, LedgerAppender, LedgerCfStore, decode};
 use serde_json::{Value, json};
 
+use super::model::EvaluatedSlot;
 use super::{FSV_TS, RSS_BUDGET_KIB};
-use crate::model::EvaluatedSlot;
 
 pub fn fsv_root() -> PathBuf {
     calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {

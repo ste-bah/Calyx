@@ -1,6 +1,6 @@
-//! Issue #1100: the derived-content watermark must survive checkpoint +
-//! cold reopen so a separate search process can distinguish content-neutral
-//! ledger appends from commits that changed derived-search inputs.
+//! Issues #1100/#1808: the derived-content watermark survives checkpoint +
+//! cold reopen and tracks only inputs actually consumed by the persistent
+//! search builder.
 
 use super::*;
 use crate::manifest::ManifestStore;
@@ -35,6 +35,28 @@ fn watermark_survives_checkpoint_and_cold_reopen() {
     let content_seq = vault.latest_seq();
     assert_eq!(vault.derived_content_seq(), content_seq);
 
+    vault
+        .write_cf(ColumnFamily::Graph, b"graph".to_vec(), b"edge".to_vec())
+        .expect("independent Graph write");
+    vault
+        .write_cf(ColumnFamily::Assay, b"assay".to_vec(), b"row".to_vec())
+        .expect("independent Assay write");
+    vault
+        .write_cf(ColumnFamily::Kernel, b"kernel".to_vec(), b"row".to_vec())
+        .expect("independent Kernel write");
+    vault
+        .write_cf(
+            ColumnFamily::slot_raw(calyx_core::SlotId::new(9)),
+            b"raw".to_vec(),
+            b"sidecar".to_vec(),
+        )
+        .expect("independent raw-slot write");
+    assert_eq!(
+        vault.derived_content_seq(),
+        content_seq,
+        "independent databases must not invalidate persistent search artifacts"
+    );
+
     // Content-neutral appends (idempotent replay ledger rows): the raw seq
     // advances, the watermark must not.
     let after_first = neutral_ledger_append(&vault);
@@ -47,6 +69,10 @@ fn watermark_survives_checkpoint_and_cold_reopen() {
     let manifest = ManifestStore::open(&dir).load_current().expect("manifest");
     assert_eq!(manifest.durable_seq, after_second);
     assert_eq!(manifest.derived_content_seq, Some(content_seq));
+    assert_eq!(
+        manifest.derived_content_model,
+        Some(crate::manifest::PERSISTENT_SEARCH_CONTENT_MODEL)
+    );
     assert_eq!(manifest.effective_derived_content_seq(), content_seq);
     drop(vault);
 
@@ -59,6 +85,78 @@ fn watermark_survives_checkpoint_and_cold_reopen() {
     assert_eq!(pin.seq(), after_second);
     assert_eq!(pin.derived_content_seq(), content_seq);
     reopened.release_reader(pin.lease().id());
+    cleanup(dir);
+}
+
+#[test]
+fn pre_model_manifest_is_physically_rederived_and_persisted_on_next_write() {
+    let dir = test_dir("derived-watermark-model-migration");
+    let vault =
+        AsterVault::new_durable(&dir, vault_id(), b"salt".to_vec(), VaultOptions::default())
+            .expect("open durable");
+    let cx = sample_constellation(&AsterVault::with_clock(
+        vault_id(),
+        b"salt".to_vec(),
+        FixedClock::new(123),
+    ));
+    vault.put(cx).expect("durable Base/slot input");
+    vault.flush().expect("flush search input");
+    let content_seq = vault.derived_content_seq();
+    vault
+        .write_cf(ColumnFamily::Graph, b"graph-1".to_vec(), b"edge-1".to_vec())
+        .expect("legacy broad-classifier Graph write");
+    vault.flush().expect("flush Graph");
+    let graph_seq = vault.latest_seq();
+    assert!(graph_seq > content_seq);
+    drop(vault);
+
+    // Reproduce a pre-#1808 MANIFEST whose broad classifier recorded the
+    // Graph commit as derived search content.
+    let store = ManifestStore::open(&dir);
+    let mut legacy = store.load_current().expect("current manifest");
+    legacy.derived_content_model = None;
+    legacy.derived_content_seq = Some(graph_seq);
+    legacy.manifest_seq += 1;
+    store.write_current(&legacy).expect("write legacy manifest");
+
+    let reopened = AsterVault::open(
+        &dir,
+        vault_id(),
+        b"salt".to_vec(),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(vec![ColumnFamily::Base]),
+            ..VaultOptions::default()
+        },
+    )
+    .expect("physically rederive legacy watermark");
+    assert_eq!(reopened.latest_seq(), graph_seq);
+    assert_eq!(reopened.derived_content_seq(), content_seq);
+    drop(reopened);
+
+    // The next real write publishes model 2 without carrying forward the
+    // legacy broad watermark. No search rebuild or MANIFEST hand-edit is used.
+    let writable = AsterVault::open(&dir, vault_id(), b"salt".to_vec(), VaultOptions::default())
+        .expect("open migrated writer");
+    writable
+        .write_cf(ColumnFamily::Graph, b"graph-2".to_vec(), b"edge-2".to_vec())
+        .expect("write independent Graph row");
+    writable.flush().expect("persist migrated model");
+    let tip = writable.latest_seq();
+    drop(writable);
+
+    let manifest = store.load_current().expect("migrated manifest");
+    assert_eq!(manifest.durable_seq, tip);
+    assert_eq!(manifest.derived_content_seq, Some(content_seq));
+    assert_eq!(
+        manifest.derived_content_model,
+        Some(crate::manifest::PERSISTENT_SEARCH_CONTENT_MODEL)
+    );
+    let cold = AsterVault::open(&dir, vault_id(), b"salt".to_vec(), VaultOptions::default())
+        .expect("cold reopen migrated model");
+    assert_eq!(cold.derived_content_seq(), content_seq);
     cleanup(dir);
 }
 

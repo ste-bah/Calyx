@@ -5,14 +5,16 @@ use std::sync::Arc;
 use calyx_anneal::{
     AsterMistakeStorage, AsterReplayStorage, CALYX_ANNEAL_REPLAY_INVALID_ROW,
     CALYX_ASTER_CF_UNAVAILABLE, DEFAULT_REPLAY_CAPACITY, MistakeLog, MistakeRef, ReplayBuffer,
-    ReplayEntry, ReplayStorage, decode_replay_snapshot,
+    ReplayEntry, ReplayStorage, ReplayWrite,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{AnchorKind, CalyxError, Clock, CxId, FixedClock, Result};
 use serde_json::{Value, json};
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::vault_id;
 
 #[test]
@@ -147,11 +149,11 @@ fn issue407_manual_fsv_fixture_writes_anneal_replay_bytes() {
 struct FailingStorage;
 
 impl ReplayStorage for FailingStorage {
-    fn load_snapshot(&self) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+    fn scan_rows(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(Vec::new())
     }
 
-    fn save_snapshot(&self, _value: &[u8]) -> Result<()> {
+    fn commit(&self, _writes: &[ReplayWrite]) -> Result<()> {
         Err(CalyxError {
             code: CALYX_ASTER_CF_UNAVAILABLE,
             message: "injected issue407 FSV CF outage".to_string(),
@@ -193,12 +195,11 @@ fn raw_rows<C: Clock>(vault: &AsterVault<C>) -> Vec<Value> {
         .expect("scan anneal_replay")
         .into_iter()
         .map(|(key, value)| {
-            let snapshot = decode_replay_snapshot(&value).expect("decode replay snapshot");
             json!({
+                "key_utf8": String::from_utf8_lossy(&key),
                 "key_hex": hex_bytes(&key),
                 "value_hex": hex_bytes(&value),
                 "value_len": value.len(),
-                "snapshot": snapshot,
             })
         })
         .collect::<Vec<_>>()

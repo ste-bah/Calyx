@@ -1,36 +1,35 @@
-use calyx_anneal::{decode_replay_snapshot, replay_snapshot_key};
+use calyx_anneal::decode_replay_rows;
 use calyx_aster::cf::ColumnFamily;
+use calyx_aster::mvcc::is_tombstone_value;
 use calyx_aster::sst::SstReader;
 use serde_json::json;
 use std::path::Path;
 
-use crate::cf_read::{hex_bytes, list_sst_files};
+use crate::cf_read::{hex_bytes, latest_cf_rows, list_sst_files};
 use crate::error::CliError;
 
 pub fn replay_status(vault: &Path) -> crate::error::CliResult {
     let cf = ColumnFamily::AnnealReplay;
-    let snapshot_key = replay_snapshot_key();
     let mut physical_rows = Vec::new();
-    let mut latest = None;
     for file in list_sst_files(&vault.join("cf").join(cf.name()))? {
         let reader = SstReader::open(&file)?;
         for row in reader.iter()? {
-            let snapshot = decode_replay_snapshot(&row.value)?;
             let readback = json!({
                 "file": file.display().to_string(),
                 "key_hex": hex_bytes(&row.key),
                 "value_hex": hex_bytes(&row.value),
                 "value_len": row.value.len(),
-                "snapshot": snapshot.clone(),
+                "tombstone": is_tombstone_value(&row.value),
             });
             physical_rows.push(readback);
-            if row.key == snapshot_key {
-                latest = Some((row.key, row.value, snapshot));
-            }
         }
     }
-    let (capacity, len, top_surprises, rows) = match latest {
-        Some((key, value, snapshot)) => {
+    let live_rows = latest_cf_rows(vault, cf)?
+        .into_iter()
+        .filter(|(_, value)| !is_tombstone_value(value))
+        .collect::<Vec<_>>();
+    let (capacity, len, top_surprises, rows) = match decode_replay_rows(&live_rows)? {
+        Some(snapshot) => {
             let mut entries = snapshot.entries;
             entries.sort_by(|left, right| right.cmp(left));
             let top_surprises = entries
@@ -39,8 +38,7 @@ pub fn replay_status(vault: &Path) -> crate::error::CliResult {
                 .map(|entry| entry.surprise)
                 .collect::<Vec<_>>();
             let rows = json!({
-                "key_hex": hex_bytes(&key),
-                "value_hex": hex_bytes(&value),
+                "keys_hex": live_rows.iter().map(|(key, _)| hex_bytes(key)).collect::<Vec<_>>(),
                 "entries": entries,
             });
             (json!(snapshot.capacity), entries.len(), top_surprises, rows)
@@ -49,7 +47,7 @@ pub fn replay_status(vault: &Path) -> crate::error::CliResult {
             json!(null),
             0,
             Vec::new(),
-            json!({"key_hex": hex_bytes(&snapshot_key), "entries": []}),
+            json!({"keys_hex": [], "entries": []}),
         ),
     };
     let readback = json!({

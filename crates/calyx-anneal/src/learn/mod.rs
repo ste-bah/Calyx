@@ -44,6 +44,7 @@ pub use regression_assert::{
 };
 pub use replay_buffer::{
     AsterReplayStorage, CALYX_ANNEAL_INVALID_CAPACITY, CALYX_ANNEAL_REPLAY_INVALID_ROW,
-    DEFAULT_REPLAY_CAPACITY, ReplayBuffer, ReplayEntry, ReplaySnapshot, ReplayStorage,
-    decode_replay_snapshot, encode_replay_snapshot, replay_snapshot_key,
+    DEFAULT_REPLAY_CAPACITY, DEFAULT_REPLAY_CHECKPOINT_INTERVAL, ReplayBuffer, ReplayEntry,
+    ReplaySnapshot, ReplayStorage, ReplayWrite, decode_replay_rows, decode_replay_snapshot,
+    encode_replay_snapshot, replay_snapshot_key,
 };

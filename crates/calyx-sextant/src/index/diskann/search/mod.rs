@@ -1,6 +1,9 @@
 //! DiskANN beam search and raw-f32 rescore (PH68 T02).
 
 mod construct;
+#[cfg(all(test, sextant_cuvs))]
+#[path = "gpu_tests.rs"]
+mod gpu_tests;
 mod helpers;
 mod pq_support;
 mod scratch;
@@ -14,6 +17,7 @@ use std::path::{Path, PathBuf};
 use calyx_core::{CxId, Result, SlotId, SlotShape, SlotVector};
 
 use super::build::{DiskAnnBuildBackend, DiskAnnBuildParams};
+use super::cagra_serve::{CagraSearchRequest, CagraServingMetric, cagra_search_batch};
 use super::graph::DiskAnnGraphReader;
 use super::pq::{DiskAnnPqBuildParams, DiskAnnPqIndex, default_pq_sidecar};
 use crate::error::{CALYX_INDEX_DIM_MISMATCH, CALYX_INDEX_IO, sextant_error};
@@ -87,19 +91,114 @@ pub struct DiskAnnSearch {
     positions: HashMap<CxId, u32>,
     build_params: DiskAnnBuildParams,
     build_backend: DiskAnnBuildBackend,
+    serving: DiskAnnServing,
     default_search: DiskAnnSearchParams,
     built_at_seq: u64,
     base_seq: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DiskAnnServing {
+    CpuReference,
+    CudaRequired,
+}
+
 impl DiskAnnSearch {
+    pub fn local_id(&self, cx_id: CxId) -> Option<u32> {
+        self.positions.get(&cx_id).copied()
+    }
+
+    pub fn cx_id(&self, local_id: u32) -> Option<CxId> {
+        self.ids.get(local_id as usize).copied()
+    }
+
     pub fn search_ids(
         &self,
         query: &[f32],
         k: usize,
         params: &DiskAnnSearchParams,
     ) -> Result<Vec<(u32, f32)>> {
-        scratch::search_ids(self, query, k, params)
+        if self.serving == DiskAnnServing::CpuReference {
+            return scratch::search_ids(self, query, k, params);
+        }
+        let mut rows = self.search_ids_batch(query, 1, k, params)?;
+        Ok(rows.pop().expect("one CAGRA query row"))
+    }
+
+    /// Search a flattened query matrix in one CUDA launch when GPU serving is required.
+    pub fn search_ids_batch(
+        &self,
+        queries: &[f32],
+        query_count: usize,
+        k: usize,
+        params: &DiskAnnSearchParams,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        let expected = query_count.saturating_mul(self.dim as usize);
+        if query_count == 0 || queries.len() != expected {
+            return Err(invalid("DiskANN batch query shape mismatch"));
+        }
+        if k == 0 {
+            return Ok(vec![Vec::new(); query_count]);
+        }
+        if self.serving == DiskAnnServing::CpuReference {
+            return queries
+                .chunks_exact(self.dim as usize)
+                .map(|query| scratch::search_ids(self, query, k, params))
+                .collect();
+        }
+        params.validate()?;
+        for query in queries.chunks_exact(self.dim as usize) {
+            self.validate_query(query)?;
+        }
+        cagra_search_batch(CagraSearchRequest {
+            graph_path: &self.graph_path,
+            metric: self.cagra_metric()?,
+            queries,
+            query_count,
+            k: k.min(self.ids.len()),
+            ef_search: params.ef_search.max(params.rescore_k),
+            allowed_ids: None,
+        })
+    }
+
+    /// Exact, device-filtered search over local row ids. This API intentionally
+    /// has no CPU bulk fallback.
+    pub fn search_ids_filtered_cuda(
+        &self,
+        query: &[f32],
+        k: usize,
+        params: &DiskAnnSearchParams,
+        allowed_ids: &[u32],
+    ) -> Result<Vec<(u32, f32)>> {
+        if self.serving != DiskAnnServing::CudaRequired {
+            return Err(sextant_error(
+                crate::error::CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE,
+                "device-filtered DiskANN search requires open_gpu_serving",
+            ));
+        }
+        self.validate_query(query)?;
+        params.validate()?;
+        let mut rows = cagra_search_batch(CagraSearchRequest {
+            graph_path: &self.graph_path,
+            metric: self.cagra_metric()?,
+            queries: query,
+            query_count: 1,
+            k: k.min(self.ids.len()),
+            ef_search: params.ef_search.max(params.rescore_k),
+            allowed_ids: Some(allowed_ids),
+        })?;
+        Ok(rows.pop().expect("one filtered CAGRA query row"))
+    }
+
+    fn cagra_metric(&self) -> Result<CagraServingMetric> {
+        match self.distance_mode {
+            DiskAnnDistanceMode::UnitL2 => Ok(CagraServingMetric::UnitL2),
+            DiskAnnDistanceMode::RawL2 => Ok(CagraServingMetric::RawL2),
+            DiskAnnDistanceMode::RawCosine => Err(sextant_error(
+                crate::error::CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE,
+                "legacy raw-cosine DiskANN graph has no compatible CAGRA serving asset; rebuild",
+            )),
+        }
     }
 
     fn graph_query<'a>(&self, query: &'a [f32]) -> Cow<'a, [f32]> {
@@ -278,7 +377,12 @@ impl SextantIndex for DiskAnnSearch {
         )?;
         self.reader = Some(open_for_search(&self.graph_path)?);
         self.pq = if let Some(pq_params) = pq_params {
-            Some(write_pq_sidecar(&self.graph_path, &dense_rows, pq_params)?)
+            Some(write_pq_sidecar(
+                &self.graph_path,
+                &dense_rows,
+                pq_params,
+                self.build_backend,
+            )?)
         } else {
             DiskAnnPqIndex::read_if_exists(&default_pq_sidecar(&self.graph_path))?
         };
@@ -329,7 +433,12 @@ impl SextantIndex for DiskAnnSearch {
         )?;
         self.reader = Some(open_for_search(&self.graph_path)?);
         self.pq = if let Some(pq_params) = pq_params {
-            Some(write_pq_sidecar(&self.graph_path, &dense_rows, pq_params)?)
+            Some(write_pq_sidecar(
+                &self.graph_path,
+                &dense_rows,
+                pq_params,
+                self.build_backend,
+            )?)
         } else {
             DiskAnnPqIndex::read_if_exists(&default_pq_sidecar(&self.graph_path))?
         };

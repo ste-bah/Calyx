@@ -3,10 +3,9 @@
 //! Synthetic known-I/O: every expected score is hand-computed from the
 //! planted vectors / edge weights before the engine runs.
 
-use std::collections::BTreeMap;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
 
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, VaultId,
 };
@@ -18,6 +17,7 @@ use calyx_sextant::{
     TraverseDirection, agree, disagree, traverse,
 };
 use sextant_support::{cx_u128_be as cx, dense};
+use std::collections::BTreeMap;
 
 const EPS: f32 = 1e-6;
 

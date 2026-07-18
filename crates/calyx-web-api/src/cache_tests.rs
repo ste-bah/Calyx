@@ -1,16 +1,18 @@
 use super::*;
+use crate::cache::{cached_json_response, store_and_respond};
+use http_body_util::BodyExt;
 
-fn bytes(s: &str) -> Arc<[u8]> {
-    Arc::from(s.as_bytes().to_vec().into_boxed_slice())
+fn bytes(s: &str) -> Bytes {
+    Bytes::copy_from_slice(s.as_bytes())
 }
 
 #[test]
 fn hit_returns_byte_identical_body() {
     let cache = ResponseCache::new(Duration::from_secs(60), 16);
     let body = bytes(r#"{"id":"a","found":true}"#);
-    cache.put("k".to_string(), Arc::clone(&body));
+    cache.put("k".to_string(), body.clone());
     let (got, age) = cache.get("k").expect("fresh entry must hit");
-    assert_eq!(&*got, &*body, "hit must replay the exact stored bytes");
+    assert_eq!(got, body, "hit must replay the exact stored bytes");
     assert!(age < Duration::from_secs(60), "fresh entry age < ttl");
 }
 
@@ -37,12 +39,14 @@ fn entry_expires_after_ttl_and_is_dropped() {
 #[test]
 fn zero_ttl_disables_caching() {
     let cache = ResponseCache::new(Duration::ZERO, 16);
+    println!("CACHE_EDGE_ZERO_TTL_BEFORE entries=0");
     cache.put("k".to_string(), bytes("v"));
     assert!(cache.get("k").is_none(), "TTL=0 never serves a hit");
     assert!(
         cache.entries.lock().unwrap().is_empty(),
         "TTL=0 never stores an entry"
     );
+    println!("CACHE_EDGE_ZERO_TTL_AFTER entries=0 hit=false");
 }
 
 #[test]
@@ -70,6 +74,154 @@ fn age_reflects_time_since_store() {
         age >= Duration::from_millis(25),
         "age tracks elapsed: {age:?}"
     );
+}
+
+#[tokio::test]
+async fn response_body_reuses_shared_bytes_for_empty_small_and_large_payloads() {
+    for (case, source) in [
+        ("empty", Bytes::new()),
+        ("small", Bytes::from_static(br#"{"ok":true}"#)),
+        ("large_2mib", Bytes::from(vec![b'x'; 2 * 1024 * 1024])),
+    ] {
+        let source_ptr = source.as_ptr();
+        let source_len = source.len();
+        println!("CACHE_SHARED_BEFORE case={case} len={source_len} ptr={source_ptr:p}");
+        let response = cached_json_response(source, "HIT", Duration::from_secs(7));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()["x-cache"], "HIT");
+        assert_eq!(response.headers()[header::AGE], "7");
+
+        let frame = response.into_body().frame().await;
+        if source_len == 0 {
+            assert!(frame.is_none(), "empty body has no data frame");
+            println!("CACHE_SHARED_AFTER case={case} len=0 frame=none");
+            continue;
+        }
+        let frame = frame
+            .expect("one body frame")
+            .expect("infallible cached body");
+        let delivered = frame.into_data().expect("cached body is a data frame");
+        assert_eq!(delivered.len(), source_len);
+        assert_eq!(
+            delivered.as_ptr(),
+            source_ptr,
+            "Body::from(Bytes) must retain the shared allocation"
+        );
+        println!(
+            "CACHE_SHARED_AFTER case={case} len={} ptr={:p} same_allocation=true",
+            delivered.len(),
+            delivered.as_ptr()
+        );
+    }
+}
+
+#[tokio::test]
+async fn response_owns_bytes_after_cache_eviction() {
+    let cache = ResponseCache::new(Duration::from_secs(60), 1);
+    let original = Bytes::from(vec![0x5a; 1024 * 1024]);
+    cache.put("original".to_string(), original.clone());
+    let (hit, age) = cache.get("original").expect("original cache hit");
+    let response = cached_json_response(hit, "HIT", age);
+    println!(
+        "CACHE_EVICTION_BEFORE original_present=true response_len={}",
+        original.len()
+    );
+
+    cache.put(
+        "replacement".to_string(),
+        Bytes::from_static(b"replacement"),
+    );
+    assert!(cache.get("original").is_none(), "source entry was evicted");
+
+    let delivered = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect cached response")
+        .to_bytes();
+    assert_eq!(
+        delivered, original,
+        "response retains independent shared ownership"
+    );
+    println!(
+        "CACHE_EVICTION_AFTER original_present=false replacement_present=true response_len={}",
+        delivered.len()
+    );
+}
+
+#[tokio::test]
+async fn over_capacity_vec_conversion_moves_the_allocation_without_copying() {
+    let mut source = Vec::with_capacity(4 * 1024 * 1024);
+    source.extend_from_slice(br#"{"bounded":"payload"}"#);
+    let source_ptr = source.as_ptr();
+    let source_len = source.len();
+    let shared = Bytes::from(source);
+    println!("CACHE_OVERCAP_BEFORE len={source_len} capacity=4194304 ptr={source_ptr:p}");
+    assert_eq!(shared.as_ptr(), source_ptr, "Vec allocation is transferred");
+
+    let delivered = cached_json_response(shared, "MISS", Duration::ZERO)
+        .into_body()
+        .collect()
+        .await
+        .expect("collect response")
+        .to_bytes();
+    assert_eq!(delivered.len(), source_len);
+    assert_eq!(
+        delivered.as_ptr(),
+        source_ptr,
+        "response still shares the allocation"
+    );
+    println!(
+        "CACHE_OVERCAP_AFTER len={} ptr={:p} same_allocation=true",
+        delivered.len(),
+        delivered.as_ptr()
+    );
+}
+
+#[tokio::test]
+async fn serialized_miss_cache_entry_and_response_share_one_allocation() {
+    let cache = ResponseCache::new(Duration::from_secs(60), 4);
+    let value = json!({"id":"shared-miss","payload":"x".repeat(1024 * 1024)});
+    println!("CACHE_MISS_BEFORE entries=0 payload_bytes=1048576");
+    let response = store_and_respond(&cache, "shared-miss".to_string(), &value);
+    let (cached, _) = cache.get("shared-miss").expect("serialized bytes cached");
+    let cached_ptr = cached.as_ptr();
+    let delivered = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect miss response")
+        .to_bytes();
+    assert_eq!(delivered, cached);
+    assert_eq!(delivered.as_ptr(), cached_ptr);
+    println!(
+        "CACHE_MISS_AFTER entries=1 response_len={} same_allocation=true ptr={cached_ptr:p}",
+        delivered.len()
+    );
+}
+
+#[test]
+#[ignore = "manual response-cache construction scaling FSV"]
+fn cached_response_construction_scaling_fsv() {
+    for size in [1024, 1024 * 1024, 16 * 1024 * 1024] {
+        let cache = ResponseCache::new(Duration::from_secs(60), 1);
+        cache.put("k".to_string(), Bytes::from(vec![0x41; size]));
+        for hits in [1_u32, 100, 10_000] {
+            let started = Instant::now();
+            for _ in 0..hits {
+                let (body, age) = cache.get("k").expect("cache hit");
+                let response = cached_json_response(body, "HIT", age);
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            println!(
+                "CACHE_SCALE size={} hits={} elapsed_us={} retained_entries=1",
+                size,
+                hits,
+                started.elapsed().as_micros()
+            );
+        }
+    }
 }
 
 // --- /metrics exposition rendering (#1249 G11, #597) ----------------

@@ -251,7 +251,7 @@ fn calyx_exe() -> PathBuf {
 }
 
 fn write_fsv_readback(vault_id: VaultId, readback: &Value) -> PathBuf {
-    let root = calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
+    let root = calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "resident-worker-fsv", || {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/fsv/resident-worker-fsv")
     });
     fs::create_dir_all(&root).expect("create resident-worker FSV evidence root");

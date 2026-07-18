@@ -37,30 +37,36 @@ impl VersionedCfStore {
             return Ok(());
         }
         if self.router_latest_readback.load(Ordering::Acquire) {
-            self.ensure_router_latest_snapshot(snapshot)
+            // Values in embedding CFs can be multiple MiB each.  The former
+            // router fast path cloned every visible table value into one
+            // overlay Vec before emitting its first page, so `limit` bounded
+            // callback size but not memory.  Resolve the (small) visible key
+            // set once, then point-read only one page of values at a time at
+            // the exact same pinned snapshot.
+            let keys = self
+                .scan_cf_range_keys_at(snapshot, cf, range, clock)
                 .map_err(E::from)?;
-            let mut overlay = Some(self.visible_table_entries(snapshot, cf, Some(range)));
-            let streamed = {
-                let router = self.router.read().expect("mvcc router poisoned");
-                if let Some(router) = router.as_ref() {
-                    router.range_pages_until(
-                        cf,
-                        &range.start,
-                        range.end.as_deref(),
-                        limit,
-                        overlay.take().expect("overlay not consumed"),
-                        |entries| self.emit_entry_page(cf, entries, &mut on_page),
-                    )?;
-                    true
-                } else {
-                    false
+            for page_keys in keys.chunks(limit) {
+                let reads = page_keys
+                    .iter()
+                    .cloned()
+                    .map(|key| CfRead::new(cf, key))
+                    .collect::<Vec<_>>();
+                let values = self.read_batch(snapshot, &reads, clock).map_err(E::from)?;
+                let mut page = Vec::with_capacity(page_keys.len());
+                for (key, value) in page_keys.iter().cloned().zip(values) {
+                    let value = value.ok_or_else(|| {
+                        E::from(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                            "visible {} key {} disappeared during pinned paged read",
+                            cf.name(),
+                            super::read::hex_prefix(&key)
+                        )))
+                    })?;
+                    page.push((key, value));
                 }
-            };
-            if streamed {
-                return Ok(());
+                on_page(page)?;
             }
-            let overlay = overlay.expect("overlay retained when router is absent");
-            return self.emit_entry_pages(cf, overlay, limit, &mut on_page);
+            return Ok(());
         }
         let mut after_key = None::<Vec<u8>>;
         loop {
@@ -75,81 +81,4 @@ impl VersionedCfStore {
         }
         Ok(())
     }
-
-    fn visible_table_entries(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        range: Option<&KeyRange>,
-    ) -> Vec<SstEntry> {
-        let table = self.rows.read().expect("mvcc row table poisoned");
-        table
-            .iter()
-            .filter(|((row_cf, key), _)| {
-                *row_cf == cf && range.is_none_or(|range| range.contains(key))
-            })
-            .filter_map(|((_, key), versions)| visible_entry(key, versions, snapshot.seq()))
-            .collect()
-    }
-
-    fn emit_entry_pages<F, E>(
-        &self,
-        cf: ColumnFamily,
-        entries: Vec<SstEntry>,
-        limit: usize,
-        on_page: &mut F,
-    ) -> std::result::Result<(), E>
-    where
-        F: FnMut(Vec<(Vec<u8>, Vec<u8>)>) -> std::result::Result<(), E>,
-        E: From<calyx_core::CalyxError>,
-    {
-        let mut rows = Vec::with_capacity(limit);
-        for entry in entries
-            .into_iter()
-            .filter(|entry| !is_tombstone_value(&entry.value))
-        {
-            self.ensure_unbarriered(cf, &entry.key).map_err(E::from)?;
-            rows.push((entry.key, entry.value));
-            if rows.len() == limit {
-                on_page(std::mem::take(&mut rows))?;
-            }
-        }
-        if !rows.is_empty() {
-            on_page(rows)?;
-        }
-        Ok(())
-    }
-
-    fn emit_entry_page<F, E>(
-        &self,
-        cf: ColumnFamily,
-        entries: Vec<SstEntry>,
-        on_page: &mut F,
-    ) -> std::result::Result<(), E>
-    where
-        F: FnMut(Vec<(Vec<u8>, Vec<u8>)>) -> std::result::Result<(), E>,
-        E: From<calyx_core::CalyxError>,
-    {
-        let mut rows = Vec::with_capacity(entries.len());
-        for entry in entries {
-            self.ensure_unbarriered(cf, &entry.key).map_err(E::from)?;
-            rows.push((entry.key, entry.value));
-        }
-        if !rows.is_empty() {
-            on_page(rows)?;
-        }
-        Ok(())
-    }
-}
-
-fn visible_entry(key: &[u8], versions: &[VersionedValue], seq: Seq) -> Option<SstEntry> {
-    let version = visible_version(versions, seq)?;
-    Some(SstEntry {
-        key: key.to_vec(),
-        value: version.value.clone(),
-    })
-}
-
-fn visible_version(versions: &[VersionedValue], seq: Seq) -> Option<&VersionedValue> {
-    versions.iter().rev().find(|version| version.seq <= seq)
 }

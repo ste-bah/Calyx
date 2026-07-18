@@ -51,6 +51,7 @@ struct Summary {
     pq_ram_bytes: Option<usize>,
     pq_subvectors: Option<usize>,
     pq_centroids: Option<usize>,
+    pq_build_diagnostics: Option<calyx_sextant::index::DiskAnnPqBuildDiagnostics>,
     hits_tsv: String,
 }
 
@@ -163,6 +164,7 @@ fn run_happy(request: &Request) -> crate::error::CliResult {
         pq_ram_bytes: index.pq_ram_bytes(),
         pq_subvectors: index.pq_summary().map(|(_, subvectors, _)| subvectors),
         pq_centroids: index.pq_summary().map(|(_, _, centroids)| centroids),
+        pq_build_diagnostics: index.pq_build_diagnostics().cloned(),
         hits_tsv: hits_path.display().to_string(),
     };
     let summary_path = paths.metrics_dir.join("diskann_search_summary.json");
@@ -448,6 +450,7 @@ mod tests {
             pq_ram_bytes: None,
             pq_subvectors: None,
             pq_centroids: None,
+            pq_build_diagnostics: None,
             hits_tsv: "root/metrics/diskann_hits.tsv".to_string(),
         }
     }

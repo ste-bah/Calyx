@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 
-use super::{AsterVault, anchor_merge, encode, ledger_hook};
+#[cfg(test)]
+use std::cell::Cell;
+
+use super::store::DuplicatePutPolicy;
+use super::{AsterVault, PutDisposition, PutOutcome, anchor_merge, ledger_hook, prepared};
 use crate::cf::{ColumnFamily, base_key};
 use crate::media_artifact::{
     DerivedMediaArtifactDraft, DerivedMediaArtifactRecord, derived_media_artifact_write_rows,
@@ -11,6 +15,23 @@ use calyx_ledger::{ActorId, EntryKind, PayloadBuilder, RedactionPolicy, SubjectI
 use serde_json::json;
 
 const BATCH_ACTOR: &str = "calyx-aster-batch-ingest";
+
+#[cfg(test)]
+thread_local! {
+    static BASE_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    static SNAPSHOT_PINS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_batch_read_counts() {
+    BASE_LOOKUPS.set(0);
+    SNAPSHOT_PINS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn batch_read_counts() -> (usize, usize) {
+    (BASE_LOOKUPS.get(), SNAPSHOT_PINS.get())
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaArtifactIngestCommit {
@@ -26,11 +47,53 @@ where
     where
         I: IntoIterator<Item = Constellation>,
     {
+        self.put_batch_with_outcomes(constellations)
+            .map(|outcomes| outcomes.into_iter().map(|outcome| outcome.cx_id).collect())
+    }
+
+    /// Writes a batch under one durable lock and returns one authoritative
+    /// disposition for every input item in the original order.
+    pub fn put_batch_with_outcomes<I>(&self, constellations: I) -> Result<Vec<PutOutcome>>
+    where
+        I: IntoIterator<Item = Constellation>,
+    {
         let input = constellations.into_iter().collect::<Vec<_>>();
         if input.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_durable_commit_lock(|| self.put_batch_locked(input))
+        self.with_durable_commit_lock(|| {
+            self.put_batch_locked_with_options(
+                input,
+                None,
+                None,
+                DuplicatePutPolicy::StrictConstellation,
+            )
+            .map(|commit| commit.outcomes)
+        })
+    }
+
+    /// Batch form of [`AsterVault::put_observation_with_outcome`], returning one
+    /// ordered authoritative disposition per input under one durable lock.
+    pub fn put_observation_batch_with_outcomes<I>(
+        &self,
+        constellations: I,
+    ) -> Result<Vec<PutOutcome>>
+    where
+        I: IntoIterator<Item = Constellation>,
+    {
+        let input = constellations.into_iter().collect::<Vec<_>>();
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_durable_commit_lock(|| {
+            self.put_batch_locked_with_options(
+                input,
+                None,
+                None,
+                DuplicatePutPolicy::ContentObservation,
+            )
+            .map(|commit| commit.outcomes)
+        })
     }
 
     pub fn put_batch_with_ingest_ledger<I>(
@@ -82,6 +145,7 @@ where
                     actor,
                 }),
                 Some(artifact),
+                DuplicatePutPolicy::StrictConstellation,
             )?;
             let artifact = commit.artifact.ok_or_else(|| {
                 CalyxError::aster_corrupt_shard(
@@ -89,14 +153,14 @@ where
                 )
             })?;
             Ok(MediaArtifactIngestCommit {
-                ids: commit.ids,
+                ids: commit
+                    .outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.cx_id)
+                    .collect(),
                 artifact,
             })
         })
-    }
-
-    fn put_batch_locked(&self, input: Vec<Constellation>) -> Result<Vec<CxId>> {
-        self.put_batch_locked_with_ledger(input, None)
     }
 
     fn put_batch_locked_with_ledger(
@@ -104,8 +168,19 @@ where
         input: Vec<Constellation>,
         ledger_entry: Option<BatchLedgerEntry>,
     ) -> Result<Vec<CxId>> {
-        self.put_batch_locked_with_options(input, ledger_entry, None)
-            .map(|commit| commit.ids)
+        self.put_batch_locked_with_options(
+            input,
+            ledger_entry,
+            None,
+            DuplicatePutPolicy::StrictConstellation,
+        )
+        .map(|commit| {
+            commit
+                .outcomes
+                .into_iter()
+                .map(|outcome| outcome.cx_id)
+                .collect()
+        })
     }
 
     fn put_batch_locked_with_options(
@@ -113,14 +188,21 @@ where
         input: Vec<Constellation>,
         ledger_entry: Option<BatchLedgerEntry>,
         artifact: Option<DerivedMediaArtifactDraft>,
+        duplicate_policy: DuplicatePutPolicy,
     ) -> Result<BatchIngestCommit> {
         let latest = self.snapshot();
         let snapshot = self.snapshot_handle(latest);
+        #[cfg(test)]
+        SNAPSHOT_PINS.set(SNAPSHOT_PINS.get() + 1);
         let mut accepted_indexes = BTreeMap::<Vec<u8>, usize>::new();
+        // Cache both present and absent Base rows. Every unique CxId is looked
+        // up at most once from the single pinned snapshot, regardless of how
+        // many times that identity occurs in the input batch.
+        let mut base_rows = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
         let mut existing_merges = BTreeMap::<Vec<u8>, Constellation>::new();
         let mut anchor_merge_rows = Vec::new();
-        let mut accepted = Vec::<Constellation>::new();
-        let mut ids = Vec::with_capacity(input.len());
+        let mut accepted = Vec::<PreparedBatchConstellation>::new();
+        let mut outcomes = Vec::with_capacity(input.len());
         for constellation in input {
             if constellation.vault_id != self.vault_id {
                 return Err(CalyxError::vault_access_denied(
@@ -128,15 +210,50 @@ where
                 ));
             }
             constellation.validate_schema()?;
+            let prepared = prepared::PreparedConstellationEncoding::new(&constellation)?;
             let id = constellation.cx_id;
             let key = base_key(id);
-            let base = encode::encode_constellation_base(&constellation)?;
-            if let Some(existing) =
-                self.rows
-                    .read_at(snapshot.snapshot(), ColumnFamily::Base, &key, &self.clock)?
-            {
-                if existing == base {
-                    ids.push(id);
+            let base = prepared.encode_base(&constellation)?;
+            if let Some(index) = accepted_indexes.get(&key).copied() {
+                let added = match duplicate_policy {
+                    DuplicatePutPolicy::StrictConstellation => {
+                        anchor_merge::merge_duplicate_anchors(
+                            &mut accepted[index].constellation,
+                            &constellation,
+                        )?
+                    }
+                    DuplicatePutPolicy::ContentObservation => {
+                        anchor_merge::merge_observation_anchors(
+                            &mut accepted[index].constellation,
+                            &constellation,
+                        )?
+                    }
+                };
+                outcomes.push(PutOutcome {
+                    cx_id: id,
+                    disposition: PutDisposition::InBatchDuplicate {
+                        anchors_added: added.len(),
+                    },
+                });
+                continue;
+            }
+            if !base_rows.contains_key(&key) {
+                #[cfg(test)]
+                BASE_LOOKUPS.set(BASE_LOOKUPS.get() + 1);
+                let persisted = self.rows.read_at(
+                    snapshot.snapshot(),
+                    ColumnFamily::Base,
+                    &key,
+                    &self.clock,
+                )?;
+                base_rows.insert(key.clone(), persisted);
+            }
+            if let Some(existing) = base_rows.get(&key).and_then(Option::as_ref) {
+                if existing.as_slice() == base.as_slice() {
+                    outcomes.push(PutOutcome {
+                        cx_id: id,
+                        disposition: PutDisposition::ExistingIdentical,
+                    });
                     continue;
                 }
                 let merged = if let Some(merged) = existing_merges.get_mut(&key) {
@@ -148,29 +265,44 @@ where
                         .get_mut(&key)
                         .expect("inserted existing merge")
                 };
-                let added = anchor_merge::merge_duplicate_anchors(merged, &constellation)?;
+                let added = match duplicate_policy {
+                    DuplicatePutPolicy::StrictConstellation => {
+                        anchor_merge::merge_duplicate_anchors(merged, &constellation)?
+                    }
+                    DuplicatePutPolicy::ContentObservation => {
+                        anchor_merge::merge_observation_anchors(merged, &constellation)?
+                    }
+                };
                 if !added.is_empty() {
                     anchor_merge_rows
                         .extend(anchor_merge::stage_anchor_merge_rows(id, merged, &added)?);
                 }
-                ids.push(id);
-                continue;
-            }
-            if let Some(index) = accepted_indexes.get(&key).copied() {
-                anchor_merge::merge_duplicate_anchors(&mut accepted[index], &constellation)?;
-                ids.push(id);
+                outcomes.push(PutOutcome {
+                    cx_id: id,
+                    disposition: if added.is_empty() {
+                        PutDisposition::ExistingIdentical
+                    } else {
+                        PutDisposition::ExistingAnchorsMerged { added: added.len() }
+                    },
+                });
                 continue;
             }
             accepted_indexes.insert(key, accepted.len());
-            ids.push(id);
-            accepted.push(constellation);
+            outcomes.push(PutOutcome {
+                cx_id: id,
+                disposition: PutDisposition::Inserted,
+            });
+            accepted.push(PreparedBatchConstellation {
+                constellation,
+                encoding: prepared,
+            });
         }
         if accepted.is_empty() && artifact.is_none() {
             if !anchor_merge_rows.is_empty() {
                 self.commit_rows_locked(&anchor_merge_rows)?;
             }
             return Ok(BatchIngestCommit {
-                ids,
+                outcomes,
                 artifact: None,
             });
         }
@@ -199,6 +331,7 @@ where
                                 "batch ingest without accepted rows requires explicit ledger entry",
                             )
                         })?
+                        .constellation
                         .cx_id,
                     batch_payload(&accepted),
                 )?,
@@ -226,6 +359,7 @@ where
                                 "batch ingest without accepted rows requires explicit ledger entry",
                             )
                         })?
+                        .constellation
                         .cx_id,
                     batch_payload(&accepted),
                 )?,
@@ -240,23 +374,28 @@ where
         } else {
             None
         };
-        for mut constellation in accepted {
+        for accepted in accepted {
+            let mut constellation = accepted.constellation;
             constellation.provenance = ledger_ref.clone();
-            self.stage_constellation_rows(&mut rows, &constellation)?;
+            prepared::stage_validated_constellation_rows(
+                &mut rows,
+                &constellation,
+                accepted.encoding,
+            )?;
         }
         self.commit_rows_locked(&rows)?;
         if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref()) {
             ledger_hook::commit_staged(hook, staged)?;
         }
         Ok(BatchIngestCommit {
-            ids,
+            outcomes,
             artifact: artifact_record,
         })
     }
 }
 
 struct BatchIngestCommit {
-    ids: Vec<CxId>,
+    outcomes: Vec<PutOutcome>,
     artifact: Option<DerivedMediaArtifactRecord>,
 }
 
@@ -266,26 +405,35 @@ struct BatchLedgerEntry {
     actor: ActorId,
 }
 
-fn batch_payload(constellations: &[Constellation]) -> Vec<u8> {
+struct PreparedBatchConstellation {
+    constellation: Constellation,
+    encoding: prepared::PreparedConstellationEncoding,
+}
+
+fn batch_payload(constellations: &[PreparedBatchConstellation]) -> Vec<u8> {
     let mut payload = PayloadBuilder::default();
     let cx_ids = constellations
         .iter()
-        .map(|cx| cx.cx_id.to_string())
+        .map(|cx| cx.constellation.cx_id.to_string())
         .collect::<Vec<_>>();
     let hashes = constellations
         .iter()
-        .map(|cx| hex(&cx.input_ref.hash))
+        .map(|cx| hex(&cx.constellation.input_ref.hash))
         .collect::<Vec<_>>();
     payload
         .insert_str("mode", BATCH_ACTOR)
         .insert_u64("count", constellations.len() as u64)
         .insert_value("cx_id", json!(cx_ids))
-        .insert_str("first_cx_id", constellations[0].cx_id.to_string())
+        .insert_str(
+            "first_cx_id",
+            constellations[0].constellation.cx_id.to_string(),
+        )
         .insert_str(
             "last_cx_id",
             constellations
                 .last()
                 .expect("non-empty batch")
+                .constellation
                 .cx_id
                 .to_string(),
         )

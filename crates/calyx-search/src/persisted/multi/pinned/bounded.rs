@@ -40,6 +40,7 @@ pub(in crate::persisted::multi) fn memoized_bounded_segment_files(
     slot: SlotId,
     entry_sha256: &str,
 ) -> CliResult<Option<Arc<Vec<BoundedSegmentFile>>>> {
+    super::cache::observe_generation(vault_dir, slot, entry_sha256)?;
     let key = (pinned::canonical_vault_dir(vault_dir)?, slot.get());
     let cache = bounded_cache()
         .lock()

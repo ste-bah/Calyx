@@ -3,17 +3,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     ActionMetricSnapshot, AnnealAction, BudgetHandle, HeldOutReplay, MetricSide, ReplayAnchor,
     ReplayQuery, ShadowExecutor, ShadowRevertReason, ShadowVerdict, TripwireMetric,
     TripwireRegistry, tripwire_config_path,
 };
 use calyx_core::{CxId, FixedClock};
-use serde_json::json;
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
 use fsv_support::{write_json, write_manifest};
+use serde_json::json;
 
 const FSV_TS: u64 = 1_785_500_395;
 

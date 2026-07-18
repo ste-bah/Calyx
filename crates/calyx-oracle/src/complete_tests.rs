@@ -11,6 +11,104 @@ use crate::{CALYX_ORACLE_ENERGY_EMPTY_REGION, CALYX_ORACLE_INSUFFICIENT};
 mod support;
 use support::*;
 
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "manual GPU-host FSV for issue #1521 end-to-end complete()"]
+fn issue1521_complete_cuda_is_faster_and_matches_cpu_reference() {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    let root = PathBuf::from(
+        std::env::var("CALYX_FSV_ROOT").expect("CALYX_FSV_ROOT must name the issue FSV root"),
+    );
+    let members = env_usize("CALYX_ENERGY_COMPLETE_FSV_MEMBERS", 32_768);
+    let dim = env_usize("CALYX_ENERGY_COMPLETE_FSV_DIM", 384);
+    let free_slots = env_usize("CALYX_ENERGY_COMPLETE_FSV_SLOTS", 4);
+    assert!(free_slots > 0 && free_slots <= u8::MAX as usize);
+    assert!(members * dim >= crate::ENERGY_CUDA_MIN_ELEMENTS);
+    fs::create_dir_all(&root).expect("create issue1521 FSV root");
+
+    let fixture = Fixture::new_with_dim(free_slots as u8, dim);
+    let region = MapRegion::deterministic(&fixture.panel, members, dim);
+    let free = (1..=free_slots)
+        .map(|slot| lens(slot as u8))
+        .collect::<SlotSet>();
+    let run = |provider: crate::complete::DescentProvider| {
+        crate::complete::complete_with_descent_provider(
+            &FakeAssay::sufficient(),
+            &MemoryLedger::default(),
+            &fixture.cx,
+            &fixture.panel,
+            DomainId::from("issue1521-fsv"),
+            SlotSet::new(),
+            free.clone(),
+            &region,
+            OracleSelfConsistency::measured(0.0, 1.0),
+            &FixedAnneal,
+            &fixture.clock,
+            provider,
+        )
+        .expect("complete provider")
+    };
+
+    // The production CUDA provider and loaded module are process-global.
+    drop(run(crate::descend));
+
+    let cpu_started = Instant::now();
+    let cpu = run(crate::energy::descend_cpu);
+    let cpu_us = cpu_started.elapsed().as_micros();
+    let gpu_started = Instant::now();
+    let gpu = run(crate::descend);
+    let gpu_us = gpu_started.elapsed().as_micros();
+    assert_eq!(gpu.converged, cpu.converged);
+    assert_eq!(gpu.filled_cx.len(), cpu.filled_cx.len());
+    let mut max_vector_delta = 0.0_f32;
+    for (gpu_slot, cpu_slot) in gpu.filled_cx.iter().zip(&cpu.filled_cx) {
+        assert_eq!(gpu_slot.lens_id, cpu_slot.lens_id);
+        assert_eq!(gpu_slot.tag, cpu_slot.tag);
+        for (gpu_value, cpu_value) in gpu_slot.vector.iter().zip(&cpu_slot.vector) {
+            max_vector_delta = max_vector_delta.max((gpu_value - cpu_value).abs());
+        }
+    }
+    let energy_delta = (gpu.energy - cpu.energy).abs();
+    assert!(
+        max_vector_delta <= 2.0e-4,
+        "vector delta={max_vector_delta}"
+    );
+    assert!(energy_delta <= 2.0e-4, "energy delta={energy_delta}");
+    let speedup = cpu_us as f64 / gpu_us.max(1) as f64;
+    assert!(speedup > 1.0, "complete CUDA speedup={speedup}");
+    let report = serde_json::json!({
+        "format": "calyx-issue1521-complete-fsv-v1",
+        "members_per_slot": members,
+        "dim": dim,
+        "free_slots": free_slots,
+        "elements_per_slot": members * dim,
+        "configured_crossover_elements": crate::ENERGY_CUDA_MIN_ELEMENTS,
+        "cpu_us": cpu_us,
+        "gpu_us": gpu_us,
+        "speedup": speedup,
+        "converged": gpu.converged,
+        "energy_delta": energy_delta,
+        "max_vector_delta": max_vector_delta,
+        "filled_slots": gpu.filled_cx.len(),
+    });
+    let path = root.join("issue1521-complete-fsv.json");
+    let bytes = serde_json::to_vec_pretty(&report).expect("serialize issue1521 FSV");
+    fs::write(&path, &bytes).expect("write issue1521 FSV");
+    assert_eq!(fs::read(&path).expect("read issue1521 FSV"), bytes);
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+}
+
+#[cfg(feature = "cuda")]
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 #[test]
 fn complete_tags_three_clamped_and_four_free_slots() {
     let fixture = Fixture::new(7).with_dense_slots();

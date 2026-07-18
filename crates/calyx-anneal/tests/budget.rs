@@ -130,6 +130,7 @@ fn probe_warning_code_overrides_static_vram_warning() {
     expect_exhausted(enforcer.acquire(0.0, 0));
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[test]
 fn proc_stat_probe_first_sample_establishes_cpu_baseline() {
     let clock = FixedClock::new(TEST_TS);
@@ -140,11 +141,61 @@ fn proc_stat_probe_first_sample_establishes_cpu_baseline() {
     )
     .unwrap();
 
-    let handle = enforcer
-        .acquire(0.01, 0)
-        .expect("first proc sample baseline");
-    assert_eq!(enforcer.status().unwrap().handles_active, 1);
+    let before = enforcer.status().expect("initial budget status");
+    println!("PROC_STAT_SUPPORTED_BEFORE {before:?}");
+    let handle = match enforcer.acquire(0.01, 0) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let unavailable = enforcer.status().expect("unavailable proc status");
+            println!("PROC_STAT_RUNTIME_UNAVAILABLE {unavailable:?} error={error}");
+            assert_eq!(error.code, CALYX_ANNEAL_BUDGET_EXHAUSTED);
+            assert_eq!(
+                unavailable.warning_code.as_deref(),
+                Some(CALYX_ANNEAL_BUDGET_CPU_UNAVAILABLE)
+            );
+            assert_eq!(unavailable.handles_active, 0);
+            assert!(unavailable.cpu_used_fraction >= 1.0);
+            return;
+        }
+    };
+    let acquired = enforcer.status().expect("acquired budget status");
+    println!("PROC_STAT_SUPPORTED_ACQUIRED {acquired:?}");
+    assert_eq!(before.handles_active, 0);
+    assert_eq!(acquired.handles_active, 1);
     drop(handle);
+    let released = enforcer.status().expect("released budget status");
+    println!("PROC_STAT_SUPPORTED_RELEASED {released:?}");
+    assert_eq!(released.handles_active, 0);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[test]
+fn proc_stat_probe_unsupported_platform_fails_loud_without_handle_mutation() {
+    let clock = FixedClock::new(TEST_TS);
+    let enforcer = BudgetEnforcer::with_probe(
+        config(0.01, MIB, 100),
+        &clock,
+        ProcStatBudgetProbe::default(),
+    )
+    .unwrap();
+    let before = enforcer.status().expect("initial budget status");
+    println!("PROC_STAT_UNSUPPORTED_BEFORE {before:?}");
+
+    let err = match enforcer.acquire(0.0, 0) {
+        Ok(_) => panic!("unsupported proc-stat platform must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(err.code, CALYX_ANNEAL_BUDGET_EXHAUSTED);
+
+    let after = enforcer.status().expect("post-failure budget status");
+    println!("PROC_STAT_UNSUPPORTED_AFTER {after:?} error={err}");
+    assert_eq!(
+        after.warning_code.as_deref(),
+        Some(CALYX_ANNEAL_BUDGET_CPU_UNAVAILABLE)
+    );
+    assert_eq!(after.handles_active, before.handles_active);
+    assert_eq!(after.handles_active, 0);
+    assert!(after.cpu_used_fraction >= 1.0);
 }
 
 #[test]

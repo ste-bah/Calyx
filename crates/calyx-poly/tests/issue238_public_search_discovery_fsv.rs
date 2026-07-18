@@ -2,8 +2,8 @@
 //!
 //! Source of truth: deterministic Gamma public-search response with nested market rows.
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use std::fs;
 use std::path::Path;

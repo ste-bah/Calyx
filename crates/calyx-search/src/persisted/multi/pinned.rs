@@ -5,8 +5,7 @@
 //! precomputed token norms is pinned. Queries score with the exact
 //! arithmetic of `MaxSimIndex::maxsim` / `cosine`, so results are bit-identical.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::BTreeSet;
 
 use rayon::prelude::*;
 
@@ -21,6 +20,17 @@ pub(super) use bounded::{
     BoundedSegmentFile, memoize_bounded_segment_files, memoized_bounded_segment_files,
     stat_check_segment_files,
 };
+#[path = "pinned/cache.rs"]
+mod cache;
+#[cfg(feature = "cuda")]
+pub(super) use cache::PinnedIndexAccess;
+pub(super) use cache::observe_generation;
+pub(super) use cache::pinned_index;
+#[path = "pinned/candidates.rs"]
+#[cfg(feature = "cuda")]
+mod candidates;
+#[cfg(feature = "cuda")]
+pub(super) use candidates::{PinnedCandidateRow, PinnedCandidateSelection};
 
 /// One verified binary segment to load: path plus the manifest-side
 /// expectations the file must match.
@@ -31,12 +41,16 @@ pub(super) struct PinnedSegmentSpec {
     pub(super) base_seq: u64,
     pub(super) row_count: u64,
     pub(super) token_count: u64,
+    #[cfg(feature = "cuda")]
+    pub(super) byte_len: u64,
 }
 
 #[derive(Debug)]
 pub(super) struct PinnedMultiIndex {
     token_dim: u32,
     rows: Vec<PinnedMultiRow>,
+    #[cfg(feature = "cuda")]
+    row_lookup: Vec<(CxId, usize)>,
     tokens: Vec<f32>,
     norms: Vec<f32>,
 }
@@ -48,76 +62,9 @@ struct PinnedMultiRow {
     token_count: usize,
 }
 
-struct PinnedGeneration {
-    entry_sha256: String,
-    index: Arc<PinnedMultiIndex>,
-}
-
-type PinCache = Mutex<BTreeMap<(String, u16), PinnedGeneration>>;
-
-fn cache() -> &'static PinCache {
-    static CACHE: OnceLock<PinCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-/// Return the pinned index for `entry`, loading and verifying it on first
-/// use per manifest generation. The cache key is the manifest entry sha256:
-/// any rebuild produces a new sha and forces a fresh verified load.
-pub(super) fn pinned_index(
-    vault_dir: &Path,
-    entry: &SearchIndexEntry,
-    slot: SlotId,
-    specs: Vec<PinnedSegmentSpec>,
-) -> CliResult<Arc<PinnedMultiIndex>> {
-    let entry_sha256 = entry.require_sha256(slot)?.to_string();
-    let cache_key = (pinned::canonical_vault_dir(vault_dir)?, slot.get());
-    {
-        let cache = cache().lock().expect("multi pin cache poisoned");
-        if let Some(generation) = cache.get(&cache_key)
-            && generation.entry_sha256 == entry_sha256
-        {
-            return Ok(Arc::clone(&generation.index));
-        }
-    }
-    let token_dim = entry.require_token_dim(slot)?;
-    let pin_key = PinKey::new(vault_dir, slot.get(), PIN_KIND)?;
-    let predicted_bytes = predicted_pin_bytes(entry, token_dim)?;
-    pinned::reserve(&pin_key, predicted_bytes)?;
-    let index = match load_verified(slot, token_dim, entry, &specs, &pin_key, predicted_bytes) {
-        Ok(index) => Arc::new(index),
-        Err(error) => {
-            pinned::release(&pin_key);
-            // The failed generation vouches for nothing; drop any stale
-            // cached generation for this key so its memory is not held
-            // without a matching budget reservation.
-            cache()
-                .lock()
-                .expect("multi pin cache poisoned")
-                .remove(&cache_key);
-            return Err(error);
-        }
-    };
-    // Replace the prediction with the exact footprint. On failure (another
-    // thread reserved in between) the prediction must be released too, or the
-    // key would hold phantom budget bytes with nothing pinned.
-    if let Err(error) = pinned::reserve(&pin_key, index.approx_bytes()) {
-        pinned::release(&pin_key);
-        return Err(error);
-    }
-    let mut cache = cache().lock().expect("multi pin cache poisoned");
-    cache.insert(
-        cache_key,
-        PinnedGeneration {
-            entry_sha256,
-            index: Arc::clone(&index),
-        },
-    );
-    Ok(index)
-}
-
-fn predicted_pin_bytes(entry: &SearchIndexEntry, token_dim: u32) -> CliResult<u64> {
+pub(super) fn predicted_pin_bytes(entry: &SearchIndexEntry, token_dim: u32) -> CliResult<u64> {
     let tokens = entry.token_count.unwrap_or_default() as u64;
-    tokens
+    let bytes = tokens
         .checked_mul(token_dim as u64)
         .and_then(|values| values.checked_mul(4))
         .and_then(|bytes| bytes.checked_add(tokens.checked_mul(4)?))
@@ -126,7 +73,18 @@ fn predicted_pin_bytes(entry: &SearchIndexEntry, token_dim: u32) -> CliResult<u6
                 (entry.len as u64).checked_mul(std::mem::size_of::<PinnedMultiRow>() as u64)?,
             )
         })
-        .ok_or_else(|| stale("persistent segmented multi sidecar pin byte count overflow"))
+        .ok_or_else(|| stale("persistent segmented multi sidecar pin byte count overflow"))?;
+    #[cfg(feature = "cuda")]
+    let bytes = bytes
+        .checked_add(
+            (entry.len as u64)
+                .checked_mul(std::mem::size_of::<(CxId, usize)>() as u64)
+                .ok_or_else(|| {
+                    stale("persistent segmented multi sidecar lookup byte count overflow")
+                })?,
+        )
+        .ok_or_else(|| stale("persistent segmented multi sidecar pin byte count overflow"))?;
+    Ok(bytes)
 }
 
 fn load_verified(
@@ -197,9 +155,19 @@ fn load_verified(
             norms.len()
         )));
     }
+    #[cfg(feature = "cuda")]
+    let mut row_lookup = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.cx_id, index))
+        .collect::<Vec<_>>();
+    #[cfg(feature = "cuda")]
+    row_lookup.sort_unstable_by_key(|(cx_id, _)| *cx_id);
     Ok(PinnedMultiIndex {
         token_dim,
         rows,
+        #[cfg(feature = "cuda")]
+        row_lookup,
         tokens,
         norms,
     })
@@ -343,8 +311,12 @@ fn parse_segment(
 
 impl PinnedMultiIndex {
     fn approx_bytes(&self) -> u64 {
-        (self.tokens.len() as u64 + self.norms.len() as u64) * 4
-            + self.rows.len() as u64 * std::mem::size_of::<PinnedMultiRow>() as u64
+        let bytes = (self.tokens.len() as u64 + self.norms.len() as u64) * 4
+            + self.rows.len() as u64 * std::mem::size_of::<PinnedMultiRow>() as u64;
+        #[cfg(feature = "cuda")]
+        let bytes =
+            bytes + self.row_lookup.len() as u64 * std::mem::size_of::<(CxId, usize)>() as u64;
+        bytes
     }
 
     pub(super) fn row_count(&self) -> usize {

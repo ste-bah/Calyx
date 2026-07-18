@@ -1,10 +1,8 @@
 //! PH68 T05 - Kernel-first 3-hop funnel tests (issue #549).
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
 
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::SlotId;
 use calyx_sextant::index::{
     DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams, FinalCxSearch, FunnelParams,
@@ -13,6 +11,8 @@ use calyx_sextant::index::{
 use proptest::prelude::*;
 use serde::Serialize;
 use sextant_support::cx_u32_be as cx;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir()

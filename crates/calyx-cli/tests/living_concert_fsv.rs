@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-mod support;
+// calyx-shared-module: path=support/mod.rs alias=__calyx_shared_support_mod_rs local=support visibility=private
+
+use crate::__calyx_shared_support_mod_rs as support;
 
 use support::living_concert::run_living_concert;
 use support::living_concert_data::CorpusSource;

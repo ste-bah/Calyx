@@ -1,3 +1,4 @@
+use super::batch_physical::{BatchPhysicalBaseState, visit_indexed_batch_base_rows};
 use super::batch_support::{
     BatchOrderRow, IdentityFields, append_idempotent_batch_ledger, append_missing_batch_anchors,
     append_oracle_events, current_anchor_kinds, existing_replay_incoming, identity_mismatch_reason,
@@ -5,13 +6,37 @@ use super::batch_support::{
 };
 use super::*;
 
+pub(crate) struct BatchExistingPreflight {
+    batch_ids: BTreeSet<CxId>,
+    expected: BTreeMap<CxId, Vec<ExistingPlainReplayRow>>,
+    materialized: BTreeSet<CxId>,
+    distinct_existing: usize,
+    exact_pointer_skipped: usize,
+    pointer_backfills: BTreeMap<CxId, InputRef>,
+    physical_base: BatchPhysicalBaseState,
+}
+
+impl BatchExistingPreflight {
+    pub(crate) fn batch_ids(&self) -> &BTreeSet<CxId> {
+        &self.batch_ids
+    }
+
+    pub(super) fn physical_base(&self) -> &BatchPhysicalBaseState {
+        &self.physical_base
+    }
+
+    fn is_materialized(&self, cx_id: CxId) -> bool {
+        self.materialized.contains(&cx_id)
+    }
+}
+
 pub(crate) fn preflight_batch_existing_identity(
     vault: &AsterVault,
     state: &VaultPanelState,
     vault_path: &std::path::Path,
     path: &std::path::Path,
     validated_row_count: usize,
-) -> CliResult<()> {
+) -> CliResult<BatchExistingPreflight> {
     use std::io::BufRead;
 
     let started = std::time::Instant::now();
@@ -22,8 +47,7 @@ pub(crate) fn preflight_batch_existing_identity(
         .map_err(|err| CliError::io(format!("open batch {}: {err}", path.display())))?;
     let reader = std::io::BufReader::new(file);
     let snapshot = vault.snapshot();
-    let mut checked_existing = 0_usize;
-    let mut not_existing_or_incomplete = 0_usize;
+    let mut expected = BTreeMap::<CxId, Vec<ExistingPlainReplayRow>>::new();
     for (index, line) in reader.lines().enumerate() {
         let line =
             line.map_err(|err| CliError::io(format!("read batch line {}: {err}", index + 1)))?;
@@ -46,63 +70,209 @@ pub(crate) fn preflight_batch_existing_identity(
             metadata,
             anchors,
         };
-        if verify_existing_base_replay_row(vault, snapshot, &row, true)? {
-            checked_existing += 1;
-        } else {
-            not_existing_or_incomplete += 1;
+        expected.entry(row.cx_id).or_default().push(row);
+    }
+    let batch_ids = expected.keys().copied().collect::<BTreeSet<_>>();
+    let keys = batch_ids
+        .iter()
+        .map(|cx_id| base_key(*cx_id))
+        .collect::<Vec<_>>();
+    let mut materialized = BTreeSet::new();
+    let mut distinct_existing = 0_usize;
+    let mut checked_existing = 0_usize;
+    let mut not_existing_or_incomplete = 0_usize;
+    let mut exact_pointer_skipped = 0_usize;
+    let mut pointer_backfills = BTreeMap::new();
+    let mut visible = BTreeSet::new();
+    let mut tombstoned = BTreeSet::new();
+    let mut required_anchor_rows = BTreeMap::<Vec<u8>, Anchor>::new();
+    let base_stats = visit_indexed_batch_base_rows(vault_path, &keys, |key, value| {
+        let key_bytes: [u8; 16] = key.try_into().map_err(|_| {
+            CliError::runtime(format!(
+                "batch identity preflight received a {}-byte Base key; expected 16",
+                key.len()
+            ))
+        })?;
+        let cx_id = CxId::from_bytes(key_bytes);
+        let rows = expected.get(&cx_id).ok_or_else(|| {
+            CliError::runtime(format!(
+                "batch identity preflight received unrequested Base cx_id {cx_id}"
+            ))
+        })?;
+        let Some(value) = value else {
+            not_existing_or_incomplete += rows.len();
+            return Ok(());
+        };
+        if calyx_aster::mvcc::is_tombstone_value(&value) {
+            tombstoned.insert(cx_id);
+            not_existing_or_incomplete += rows.len();
+            return Ok(());
+        }
+        let existing = decode_constellation_base(&value)?;
+        if existing.cx_id != cx_id {
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "batch identity preflight Base key {cx_id} decoded as {}",
+                existing.cx_id
+            ))
+            .into());
+        }
+        visible.insert(cx_id);
+        distinct_existing += 1;
+        let expected_input_ref = &rows[0].input_ref;
+        if existing.input_ref == *expected_input_ref {
+            exact_pointer_skipped += 1;
+        } else if retention::input_ref_matches_or_backfillable(
+            &existing.input_ref,
+            expected_input_ref,
+        ) {
+            pointer_backfills.insert(cx_id, expected_input_ref.clone());
+        }
+        let mut complete = true;
+        for row in rows {
+            if verify_existing_base_replay_value(&existing, row, true)? {
+                checked_existing += 1;
+            } else {
+                not_existing_or_incomplete += 1;
+                complete = false;
+            }
+        }
+        if complete {
+            for row in rows {
+                for anchor in &row.anchors {
+                    let anchor_key = anchor_key(cx_id, &anchor.kind);
+                    match required_anchor_rows.entry(anchor_key) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(anchor.clone());
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if entry.get().kind != anchor.kind
+                                || entry.get().value != anchor.value =>
+                        {
+                            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                                "batch repeats cx {cx_id} with conflicting {:?} anchor value",
+                                anchor.kind
+                            ))
+                            .into());
+                        }
+                        std::collections::btree_map::Entry::Occupied(_) => {}
+                    }
+                }
+            }
+            materialized.insert(cx_id);
+        }
+        Ok(())
+    })?;
+    let required_anchor_count = required_anchor_rows.len();
+    if required_anchor_count > 0 {
+        let mut found = BTreeSet::new();
+        vault.scan_cf_pages_at_renewing_latest(
+            snapshot,
+            ColumnFamily::Anchors,
+            4096,
+            |page| -> CliResult<()> {
+                for (key, value) in page {
+                    let Some(expected_anchor) = required_anchor_rows.get(&key) else {
+                        continue;
+                    };
+                    let indexed = encode::decode_anchor(&value)?;
+                    if indexed.kind != expected_anchor.kind
+                        || indexed.value != expected_anchor.value
+                    {
+                        let cx_id = key
+                            .get(..16)
+                            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                            .map(CxId::from_bytes)
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "<malformed-key>".to_string());
+                        return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                            "batch identity preflight Anchors CF value mismatch for cx {cx_id} key_len={}",
+                            key.len()
+                        ))
+                        .into());
+                    }
+                    found.insert(key);
+                }
+                Ok(())
+            },
+        )?;
+        if found.len() != required_anchor_count {
+            let missing = required_anchor_rows
+                .keys()
+                .find(|key| !found.contains(*key))
+                .expect("anchor count mismatch has a missing key");
+            let cx_id = missing
+                .get(..16)
+                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                .map(CxId::from_bytes)
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "<malformed-key>".to_string());
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "batch identity preflight Base CF anchor for cx {cx_id} is missing from Anchors CF"
+            ))
+            .into());
         }
     }
     ingest_runtime_log(format_args!(
-        "phase=batch_existing_identity_preflight_ok rows={} existing_checked={} not_existing_or_incomplete={} elapsed_ms={}",
+        "phase=batch_existing_identity_preflight_ok rows={} distinct_ids={} existing_checked={} not_existing_or_incomplete={} base_pages={} base_source_files={} anchors_required={} exact_pointer_skipped={} pointer_backfills={} elapsed_ms={}",
         validated_row_count,
+        batch_ids.len(),
         checked_existing,
         not_existing_or_incomplete,
+        base_stats.touched_pages,
+        base_stats.source_files,
+        required_anchor_count,
+        exact_pointer_skipped,
+        pointer_backfills.len(),
         started.elapsed().as_millis()
     ));
-    Ok(())
+    Ok(BatchExistingPreflight {
+        batch_ids,
+        expected,
+        materialized,
+        distinct_existing,
+        exact_pointer_skipped,
+        pointer_backfills,
+        physical_base: BatchPhysicalBaseState {
+            visible,
+            tombstoned,
+        },
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BatchInputPointerBackfillStats {
+    pub(crate) distinct_existing: usize,
+    pub(crate) exact_pointer_skipped: usize,
+    pub(crate) backfill_attempted: usize,
+    pub(crate) changed: usize,
 }
 
 pub(crate) fn backfill_batch_existing_input_pointers(
     vault: &AsterVault,
-    state: &VaultPanelState,
-    vault_path: &std::path::Path,
-    path: &std::path::Path,
-) -> CliResult<()> {
-    use std::io::BufRead;
-
-    let file = std::fs::File::open(path)
-        .map_err(|error| CliError::io(format!("open batch {}: {error}", path.display())))?;
-    let reader = std::io::BufReader::new(file);
-    let mut seen = BTreeSet::new();
-    let mut existing = 0_usize;
-    let mut changed = 0_usize;
-    for (index, line) in reader.lines().enumerate() {
-        let line =
-            line.map_err(|error| CliError::io(format!("read batch line {}: {error}", index + 1)))?;
-        let Some((text, _, _, _)) = parse_batch_line(index, &line)? else {
-            continue;
-        };
-        let input = retention::retained_text_input(vault_path, &text)?;
-        let cx_id = vault.cx_id_for_input(&input.bytes, state.panel.version);
-        if seen.insert(cx_id) && base_exists(vault, cx_id)? {
-            existing += 1;
-            let expected = InputRef {
-                hash: input_hash(&input.bytes),
-                pointer: input.pointer,
-                redacted: false,
-            };
-            if retention::apply_existing_input_pointer(vault, cx_id, &expected)? {
-                changed += 1;
-            }
+    preflight: &BatchExistingPreflight,
+) -> CliResult<BatchInputPointerBackfillStats> {
+    let mut stats = BatchInputPointerBackfillStats {
+        distinct_existing: preflight.distinct_existing,
+        exact_pointer_skipped: preflight.exact_pointer_skipped,
+        backfill_attempted: preflight.pointer_backfills.len(),
+        changed: 0,
+    };
+    for (cx_id, expected) in &preflight.pointer_backfills {
+        if retention::apply_existing_input_pointer(vault, *cx_id, expected)? {
+            stats.changed += 1;
         }
     }
     ingest_runtime_log(format_args!(
-        "phase=batch_retained_input_pointer_readback distinct_existing={} changed={changed}",
-        existing
+        "phase=batch_retained_input_pointer_outcomes distinct_existing={} exact_pointer_skipped={} backfill_attempted={} changed={}",
+        stats.distinct_existing,
+        stats.exact_pointer_skipped,
+        stats.backfill_attempted,
+        stats.changed,
     ));
-    Ok(())
+    Ok(stats)
 }
 
+#[derive(Clone)]
 pub(crate) struct ExistingPlainReplayRow {
     cx_id: CxId,
     panel_version: u32,
@@ -124,50 +294,46 @@ pub(crate) struct ExistingBatchReplayRow {
 pub(crate) fn existing_plain_batch_replay_rows(
     vault: &AsterVault,
     state: &VaultPanelState,
-    vault_path: &std::path::Path,
     rows: &[BatchRow],
+    preflight: &BatchExistingPreflight,
 ) -> CliResult<Option<Vec<ExistingPlainReplayRow>>> {
     let mut out = Vec::with_capacity(rows.len());
-    let snapshot = vault.snapshot();
-    let mut all_materialized = true;
-    let mut checked_existing = 0_usize;
     for (text, metadata, anchors, oracle) in rows {
-        let input = retention::retained_text_input(vault_path, text)?;
-        let cx_id = vault.cx_id_for_input(&input.bytes, state.panel.version);
-        let input_ref = InputRef {
-            hash: input_hash(&input.bytes),
-            pointer: input.pointer,
-            redacted: false,
-        };
+        let cx_id = vault.cx_id_for_input(text.as_bytes(), state.panel.version);
+        if !preflight.is_materialized(cx_id) {
+            ingest_runtime_log(format_args!(
+                "phase=batch_existing_replay_base_only_preflight_mixed rows={} missing_or_incomplete_cx={} measurement_required=true slot_decode_skipped=true",
+                rows.len(),
+                cx_id
+            ));
+            return Ok(None);
+        }
         let mut metadata = metadata.clone();
         if let Some(event) = oracle {
             event.apply_metadata(&mut metadata)?;
         }
-        let row = ExistingPlainReplayRow {
-            cx_id,
-            panel_version: state.panel.version,
-            input_ref,
-            modality: input.modality,
-            metadata,
-            anchors: anchors.clone(),
-        };
-        if !verify_existing_base_replay_row(vault, snapshot, &row, false)? {
-            all_materialized = false;
-            continue;
-        }
-        checked_existing += 1;
-        out.push(row);
+        let row = preflight
+            .expected
+            .get(&cx_id)
+            .and_then(|candidates| {
+                candidates.iter().find(|candidate| {
+                    candidate.metadata == metadata
+                        && candidate.anchors.len() == anchors.len()
+                        && candidate.anchors.iter().all(|expected| {
+                            anchors.iter().any(|actual| {
+                                actual.kind == expected.kind && actual.value == expected.value
+                            })
+                        })
+                })
+            })
+            .ok_or_else(|| {
+                CliError::runtime(format!(
+                    "batch replay row for preflighted cx {cx_id} no longer matches its preflight metadata/anchors"
+                ))
+            })?;
+        out.push(row.clone());
     }
-    if all_materialized {
-        Ok(Some(out))
-    } else {
-        ingest_runtime_log(format_args!(
-            "phase=batch_existing_replay_base_only_preflight_mixed rows={} existing_materialized={} measurement_required=true slot_decode_skipped=true",
-            rows.len(),
-            checked_existing
-        ));
-        Ok(None)
-    }
+    Ok(Some(out))
 }
 
 pub(crate) fn flush_plain_existing_batch_replay(
@@ -187,15 +353,7 @@ pub(crate) fn flush_plain_existing_batch_replay(
         )?;
         vault.flush()?;
         calyx_aster::base_page_index::advance_base_page_index_head_if_base_unchanged(vault_path)?;
-        let snapshot = vault.snapshot();
         for row in sub {
-            if !verify_existing_base_replay_row(vault, snapshot, row, false)? {
-                return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
-                    "idempotent batch replay base readback missing for cx {} after ledger append",
-                    row.cx_id
-                ))
-                .into());
-            }
             let report = IngestReport {
                 cx_id: row.cx_id.to_string(),
                 new: false,
@@ -210,16 +368,11 @@ pub(crate) fn flush_plain_existing_batch_replay(
     Ok(())
 }
 
-fn verify_existing_base_replay_row(
-    vault: &AsterVault,
-    snapshot: u64,
+fn verify_existing_base_replay_value(
+    existing: &Constellation,
     row: &ExistingPlainReplayRow,
     allow_pointerless: bool,
 ) -> CliResult<bool> {
-    let Some(bytes) = vault.read_cf_at(snapshot, ColumnFamily::Base, &base_key(row.cx_id))? else {
-        return Ok(false);
-    };
-    let existing = decode_constellation_base(&bytes)?;
     let input_ref_matches = existing.input_ref == row.input_ref
         || (allow_pointerless
             && retention::input_ref_matches_or_backfillable(&existing.input_ref, &row.input_ref));
@@ -247,16 +400,13 @@ fn verify_existing_base_replay_row(
             )
         )));
     }
-    if !incoming_anchors_already_materialized(vault, snapshot, row.cx_id, &row.anchors, &existing)?
-    {
+    if !incoming_anchors_already_materialized(row.cx_id, &row.anchors, existing)? {
         return Ok(false);
     }
     Ok(true)
 }
 
 fn incoming_anchors_already_materialized(
-    vault: &AsterVault,
-    snapshot: u64,
     cx_id: CxId,
     incoming_anchors: &[Anchor],
     existing_base: &Constellation,
@@ -283,26 +433,6 @@ fn incoming_anchors_already_materialized(
             .any(|existing| existing.kind == anchor.kind)
         {
             return Ok(false);
-        }
-        let Some(bytes) = vault.read_cf_at(
-            snapshot,
-            ColumnFamily::Anchors,
-            &anchor_key(cx_id, &anchor.kind),
-        )?
-        else {
-            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
-                "idempotent batch replay for cx {cx_id} found anchor {:?} in Base CF but missing from Anchors CF",
-                anchor.kind
-            ))
-            .into());
-        };
-        let indexed = encode::decode_anchor(&bytes)?;
-        if indexed.kind != anchor.kind || indexed.value != anchor.value {
-            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
-                "idempotent batch replay for cx {cx_id} found conflicting Anchors CF value for {:?}",
-                anchor.kind
-            ))
-            .into());
         }
     }
     Ok(true)

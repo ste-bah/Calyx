@@ -51,7 +51,7 @@ impl WeaveLoomProgressWriter {
             "args": {
                 "content_slot": self.args.content_slot,
                 "knn": self.args.knn,
-                "edge_cos_threshold": self.args.edge_cos_threshold,
+                "edge_score_threshold": self.args.edge_score_threshold,
                 "max_groundedness_distance": self.args.max_groundedness_distance,
                 "batch": self.args.batch,
                 "limit": self.args.limit,

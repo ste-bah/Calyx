@@ -5,10 +5,11 @@
 //! content hash, and a cold-tier flag. All rows live in the `cf/blob` column
 //! family under the `0x05` key-space discriminant.
 //!
-//! **Durability ordering.** Chunks are committed first (one group-commit WAL
-//! flush); the manifest is committed *last* in a second flush. The manifest is
-//! the commit point — a crash between the two leaves orphan chunks with no live
-//! manifest, so [`BlobLayer::blob_get`] sees no blob rather than partial data.
+//! **Durability ordering.** Chunks are committed first in WAL-size-bounded
+//! groups; the manifest is committed *last* in its own flush. The manifest is
+//! the commit point — a crash between any chunk group and the manifest leaves
+//! orphan chunks with no live manifest, so [`BlobLayer::blob_get`] sees no blob
+//! rather than partial data.
 //! Orphan chunks are reclaimed by the PH58 janitor. This is the content-
 //! addressed "write blobs, reference by manifest last" pattern used by Ollama,
 //! Docker, restic, and the AT Protocol.
@@ -17,7 +18,22 @@
 //! fails closed (`CALYX_ASTER_CORRUPT_SHARD`) on any mismatch, so silent
 //! corruption is impossible.
 
+mod codec;
+mod stream;
+
 use calyx_core::{CalyxError, Clock, Modality, Result, Seq};
+
+#[cfg(test)]
+use codec::hex_bytes;
+pub use codec::{blob_row_range, chunk_key, collection_id, manifest_key};
+use codec::{
+    blob_too_large, chunk_prefix, corrupt, decode_manifest, encode_manifest, hash_payload,
+    invalid_argument, ledger_payload, ledger_subject, require_blob_mode,
+};
+pub use stream::BlobChunkStream;
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use crate::cf::{ColumnFamily, KeyRange};
 use crate::collection::{
@@ -36,6 +52,11 @@ const KIND_CHUNK: u8 = 0x00;
 const KIND_MANIFEST: u8 = 0x01;
 const BLOB_ID_BYTES: usize = 16;
 const HASH_BYTES: usize = 32;
+/// Chunk-value budget for one durable group. Using half the WAL record ceiling
+/// leaves more than 32 MiB for keys, row framing, encryption envelopes, and the
+/// time-index row added by the commit layer. This is deliberately a byte bound,
+/// not just a row count, so future chunk-size changes remain safe.
+const BLOB_CHUNK_GROUP_VALUE_BYTES: usize = crate::wal::MAX_RECORD_BYTES / 2;
 
 /// Fixed chunk size (256 KiB). Immutable once a vault has written its first
 /// blob, so reads can address chunks by index without per-blob metadata.
@@ -46,6 +67,59 @@ pub const MAX_BLOB_BYTES: usize = 1 << 30;
 const MANIFEST_VALUE_BYTES_V1: usize = 8 + 4 + HASH_BYTES + 1;
 /// Current manifest appends `created_at_ms (8)` for retention decisions.
 const MANIFEST_VALUE_BYTES: usize = MANIFEST_VALUE_BYTES_V1 + 8;
+
+#[cfg(test)]
+thread_local! {
+    static HASH_CALLS: Cell<usize> = const { Cell::new(0) };
+    static HASHED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static SNAPSHOT_PINS: Cell<usize> = const { Cell::new(0) };
+    static MANIFEST_READS: Cell<usize> = const { Cell::new(0) };
+    static MANIFEST_DECODES: Cell<usize> = const { Cell::new(0) };
+    static CHUNK_READS: Cell<usize> = const { Cell::new(0) };
+    static CHUNK_GROUP_COMMITS: Cell<usize> = const { Cell::new(0) };
+    static CHUNK_ROWS_WRITTEN: Cell<usize> = const { Cell::new(0) };
+    static FAIL_CHUNK_GROUP: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BlobIoCounts {
+    hash_calls: usize,
+    hash_bytes: usize,
+    snapshot_pins: usize,
+    manifest_reads: usize,
+    manifest_decodes: usize,
+    chunk_reads: usize,
+    chunk_group_commits: usize,
+    chunk_rows_written: usize,
+}
+
+#[cfg(test)]
+fn reset_blob_io_counts() {
+    HASH_CALLS.set(0);
+    HASHED_BYTES.set(0);
+    SNAPSHOT_PINS.set(0);
+    MANIFEST_READS.set(0);
+    MANIFEST_DECODES.set(0);
+    CHUNK_READS.set(0);
+    CHUNK_GROUP_COMMITS.set(0);
+    CHUNK_ROWS_WRITTEN.set(0);
+    FAIL_CHUNK_GROUP.set(None);
+}
+
+#[cfg(test)]
+fn blob_io_counts() -> BlobIoCounts {
+    BlobIoCounts {
+        hash_calls: HASH_CALLS.get(),
+        hash_bytes: HASHED_BYTES.get(),
+        snapshot_pins: SNAPSHOT_PINS.get(),
+        manifest_reads: MANIFEST_READS.get(),
+        manifest_decodes: MANIFEST_DECODES.get(),
+        chunk_reads: CHUNK_READS.get(),
+        chunk_group_commits: CHUNK_GROUP_COMMITS.get(),
+        chunk_rows_written: CHUNK_ROWS_WRITTEN.get(),
+    }
+}
 
 /// 16-byte content-or-caller-assigned blob identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -90,6 +164,25 @@ pub struct BlobManifest {
     pub created_at_ms: Option<u64>,
 }
 
+/// Trusted result of a content-addressed blob write.
+///
+/// The identifier and manifest hash are derived by Aster from the same single
+/// digest that was committed. Callers must consume this result instead of
+/// hashing the payload or rereading the manifest independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobPutResult {
+    pub seq: Seq,
+    pub blob_id: BlobId,
+    pub manifest: BlobManifest,
+}
+
+/// Coherent manifest and verified payload read from one pinned MVCC snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobReadResult {
+    pub manifest: BlobManifest,
+    pub data: Vec<u8>,
+}
+
 /// `(blob_id) -> chunked payload + manifest` layer over a `Blob` collection.
 pub struct BlobLayer<'a, C: Clock> {
     vault: &'a AsterVault<C>,
@@ -104,52 +197,53 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
     /// manifest in a separate commit, so a partial failure never leaves a live
     /// manifest pointing at missing chunks. Returns the manifest commit seq.
     pub fn blob_put(&self, col: &Collection, blob_id: BlobId, data: &[u8]) -> Result<Seq> {
-        if collection_has_lens(col) {
-            if data.len() > MAX_BLOB_BYTES {
-                return Err(blob_too_large(data.len()));
-            }
-            let len = (data.len() as u64).to_be_bytes();
-            let content_hash = blake3::hash(data);
-            let parts = [
-                ("blob_id", blob_id.as_bytes().as_slice()),
-                ("total_bytes", len.as_slice()),
-                ("content_hash", content_hash.as_bytes().as_slice()),
-                ("payload", data),
-            ];
-            return ingest_collection_constellation(
-                self.vault,
-                col,
-                "blob",
-                &parts,
-                Modality::Mixed,
-            );
+        self.validate_put(col, data)?;
+        let content_hash = hash_payload(data);
+        self.blob_put_prepared(col, blob_id, data, content_hash)
+            .map(|result| result.seq)
+    }
+
+    /// Stores a content-addressed blob and returns the exact committed outcome.
+    ///
+    /// Aster owns the only full-payload hash pass, derives `BlobId` from the
+    /// first 16 digest bytes, uses the full digest in the manifest, and returns
+    /// all three values without a post-commit point read.
+    pub fn blob_put_content_addressed(
+        &self,
+        col: &Collection,
+        data: &[u8],
+    ) -> Result<BlobPutResult> {
+        self.validate_put(col, data)?;
+        let content_hash = hash_payload(data);
+        let mut id = [0_u8; BLOB_ID_BYTES];
+        id.copy_from_slice(&content_hash[..BLOB_ID_BYTES]);
+        self.blob_put_prepared(col, BlobId::from_bytes(id), data, content_hash)
+    }
+
+    fn validate_put(&self, col: &Collection, data: &[u8]) -> Result<()> {
+        if !collection_has_lens(col) {
+            require_blob_mode(col)?;
         }
-        require_blob_mode(col)?;
         if data.len() > MAX_BLOB_BYTES {
             return Err(blob_too_large(data.len()));
         }
-        let chunks: Vec<&[u8]> = if data.is_empty() {
-            Vec::new()
+        Ok(())
+    }
+
+    fn blob_put_prepared(
+        &self,
+        col: &Collection,
+        blob_id: BlobId,
+        data: &[u8],
+        content_hash: [u8; HASH_BYTES],
+    ) -> Result<BlobPutResult> {
+        let chunk_count = if data.is_empty() {
+            0
         } else {
-            data.chunks(BLOB_CHUNK_SIZE).collect()
+            data.len().div_ceil(BLOB_CHUNK_SIZE)
         };
-        let chunk_count = u32::try_from(chunks.len())
+        let chunk_count = u32::try_from(chunk_count)
             .map_err(|_| invalid_argument("blob chunk count overflowed u32"))?;
-
-        // Phase 1: all chunk rows, durable before the manifest exists.
-        if !chunks.is_empty() {
-            let chunk_rows = chunks.iter().enumerate().map(|(idx, bytes)| {
-                (
-                    ColumnFamily::Blob,
-                    chunk_key(col, blob_id, idx as u32),
-                    bytes.to_vec(),
-                )
-            });
-            self.vault.write_cf_batch(chunk_rows)?;
-        }
-
-        // Phase 2: the manifest is the commit point, with the Ledger entry.
-        let content_hash = *blake3::hash(data).as_bytes();
         let manifest = BlobManifest {
             total_bytes: data.len() as u64,
             chunk_count,
@@ -157,45 +251,148 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
             cold_tier: false,
             created_at_ms: Some(self.vault.clock_now()),
         };
+
+        if collection_has_lens(col) {
+            let len = (data.len() as u64).to_be_bytes();
+            let parts = [
+                ("blob_id", blob_id.as_bytes().as_slice()),
+                ("total_bytes", len.as_slice()),
+                ("content_hash", content_hash.as_slice()),
+                ("payload", data),
+            ];
+            let seq =
+                ingest_collection_constellation(self.vault, col, "blob", &parts, Modality::Mixed)?;
+            return Ok(BlobPutResult {
+                seq,
+                blob_id,
+                manifest,
+            });
+        }
+        let chunks: Vec<&[u8]> = if data.is_empty() {
+            Vec::new()
+        } else {
+            data.chunks(BLOB_CHUNK_SIZE).collect()
+        };
+        debug_assert_eq!(chunks.len(), manifest.chunk_count as usize);
+
+        // Phase 1: chunk rows in WAL-size-bounded groups, each durable before
+        // the manifest exists. At 256 KiB chunks the value budget yields 128
+        // rows/group, leaving half of the WAL record for framing/headroom.
+        if !chunks.is_empty() {
+            let chunks_per_group = BLOB_CHUNK_GROUP_VALUE_BYTES
+                .checked_div(BLOB_CHUNK_SIZE)
+                .filter(|count| *count > 0)
+                .ok_or_else(|| invalid_argument("blob chunk size exceeds WAL group budget"))?;
+            for (group_index, group) in chunks.chunks(chunks_per_group).enumerate() {
+                #[cfg(test)]
+                if FAIL_CHUNK_GROUP.get() == Some(group_index) {
+                    self.vault.fail_next_wal_append_for_test();
+                }
+                let first_chunk = group_index * chunks_per_group;
+                let value_bytes = group.iter().map(|bytes| bytes.len()).sum::<usize>();
+                let chunk_rows = group.iter().enumerate().map(|(offset, bytes)| {
+                    (
+                        ColumnFamily::Blob,
+                        chunk_key(col, blob_id, (first_chunk + offset) as u32),
+                        bytes.to_vec(),
+                    )
+                });
+                self.vault.write_cf_batch(chunk_rows).map_err(|error| CalyxError {
+                    code: error.code,
+                    message: format!(
+                        "blob chunk group {group_index} failed: first_chunk={first_chunk} rows={} value_bytes={value_bytes}: {}",
+                        group.len(), error.message
+                    ),
+                    remediation: error.remediation,
+                })?;
+                #[cfg(test)]
+                {
+                    CHUNK_GROUP_COMMITS.set(CHUNK_GROUP_COMMITS.get() + 1);
+                    CHUNK_ROWS_WRITTEN.set(CHUNK_ROWS_WRITTEN.get() + group.len());
+                }
+            }
+        }
+
+        // Phase 2: the manifest is the commit point, with the Ledger entry.
         let key = manifest_key(col, blob_id);
         let value = encode_manifest(&manifest);
         let subject = ledger_subject(&key);
         let payload = ledger_payload(col, blob_id, &manifest);
-        self.vault.write_cf_batch_with_ledger_entry(
+        let seq = self.vault.write_cf_batch_with_ledger_entry(
             [(ColumnFamily::Blob, key, value)],
             EntryKind::Ingest,
             subject,
             payload,
             ActorId::Service("calyx-aster-blob".to_string()),
-        )
+        )?;
+        Ok(BlobPutResult {
+            seq,
+            blob_id,
+            manifest,
+        })
     }
 
     /// Reads the manifest only, without reassembling the payload.
     pub fn blob_manifest(&self, col: &Collection, blob_id: BlobId) -> Result<Option<BlobManifest>> {
         require_blob_mode(col)?;
-        self.vault
-            .read_cf_at(
-                self.vault.latest_seq(),
-                ColumnFamily::Blob,
-                &manifest_key(col, blob_id),
-            )?
-            .map(|bytes| decode_manifest(&bytes))
-            .transpose()
+        let snapshot = self.vault.snapshot_handle(self.vault.latest_seq());
+        #[cfg(test)]
+        SNAPSHOT_PINS.set(SNAPSHOT_PINS.get() + 1);
+        #[cfg(test)]
+        MANIFEST_READS.set(MANIFEST_READS.get() + 1);
+        let Some(bytes) = self.vault.read_cf_snapshot(
+            snapshot.snapshot(),
+            ColumnFamily::Blob,
+            &manifest_key(col, blob_id),
+        )?
+        else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        MANIFEST_DECODES.set(MANIFEST_DECODES.get() + 1);
+        decode_manifest(&bytes).map(Some)
     }
 
     /// Reassembles and returns the full payload, or `None` if there is no live
     /// manifest. Fails closed if a chunk is missing or the content hash does
     /// not match.
     pub fn blob_get(&self, col: &Collection, blob_id: BlobId) -> Result<Option<Vec<u8>>> {
-        let Some(manifest) = self.blob_manifest(col, blob_id)? else {
+        Ok(self.blob_read(col, blob_id)?.map(|result| result.data))
+    }
+
+    /// Reads the manifest and all chunks from one pinned snapshot, verifies
+    /// length and content hash, and returns both without rereading the manifest.
+    pub fn blob_read(&self, col: &Collection, blob_id: BlobId) -> Result<Option<BlobReadResult>> {
+        require_blob_mode(col)?;
+        let snapshot = self.vault.snapshot_handle(self.vault.latest_seq());
+        #[cfg(test)]
+        SNAPSHOT_PINS.set(SNAPSHOT_PINS.get() + 1);
+        #[cfg(test)]
+        MANIFEST_READS.set(MANIFEST_READS.get() + 1);
+        let Some(manifest_bytes) = self.vault.read_cf_snapshot(
+            snapshot.snapshot(),
+            ColumnFamily::Blob,
+            &manifest_key(col, blob_id),
+        )?
+        else {
             return Ok(None);
         };
-        let mut data = Vec::with_capacity(manifest.total_bytes as usize);
-        let snapshot = self.vault.latest_seq();
+        #[cfg(test)]
+        MANIFEST_DECODES.set(MANIFEST_DECODES.get() + 1);
+        let manifest = decode_manifest(&manifest_bytes)?;
+        let capacity = usize::try_from(manifest.total_bytes)
+            .map_err(|_| corrupt("blob manifest total_bytes does not fit this platform"))?;
+        let mut data = Vec::with_capacity(capacity);
         for idx in 0..manifest.chunk_count {
+            #[cfg(test)]
+            CHUNK_READS.set(CHUNK_READS.get() + 1);
             let chunk = self
                 .vault
-                .read_cf_at(snapshot, ColumnFamily::Blob, &chunk_key(col, blob_id, idx))?
+                .read_cf_snapshot(
+                    snapshot.snapshot(),
+                    ColumnFamily::Blob,
+                    &chunk_key(col, blob_id, idx),
+                )?
                 .ok_or_else(|| {
                     corrupt(format!(
                         "blob manifest claims {} chunks but chunk {idx} is missing",
@@ -211,12 +408,12 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
                 manifest.total_bytes
             )));
         }
-        if blake3::hash(&data).as_bytes() != &manifest.content_hash {
+        if hash_payload(&data) != manifest.content_hash {
             return Err(corrupt(
                 "blob content hash mismatch on read — payload is corrupt",
             ));
         }
-        Ok(Some(data))
+        Ok(Some(BlobReadResult { manifest, data }))
     }
 
     /// Tombstones every chunk row and the manifest in one batch. A subsequent
@@ -272,186 +469,10 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
 }
 
 /// Lazy per-chunk iterator returned by [`BlobLayer::blob_stream_chunks`].
-pub struct BlobChunkStream<'a, C: Clock> {
-    vault: &'a AsterVault<C>,
-    chunk_prefix: Vec<u8>,
-    chunk_count: u32,
-    next_idx: u32,
-}
-
-impl<C: Clock> Iterator for BlobChunkStream<'_, C> {
-    type Item = Result<Vec<u8>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next_idx >= self.chunk_count {
-            return None;
-        }
-        let idx = self.next_idx;
-        self.next_idx += 1;
-        let mut key = self.chunk_prefix.clone();
-        key.extend_from_slice(&idx.to_be_bytes());
-        match self
-            .vault
-            .read_cf_at(self.vault.latest_seq(), ColumnFamily::Blob, &key)
-        {
-            Ok(Some(bytes)) => Some(Ok(bytes)),
-            Ok(None) => Some(Err(corrupt(format!(
-                "blob manifest claims {} chunks but chunk {idx} is missing",
-                self.chunk_count
-            )))),
-            Err(error) => Some(Err(error)),
-        }
-    }
-}
-
 /// Stable per-collection id scoping blob rows. Distinct hash domain from the
 /// other layers so cross-mode collisions are impossible.
-pub fn collection_id(col: &Collection) -> u64 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"calyx:blob:collection:v1");
-    hasher.update(&col.tenant.0.to_be_bytes());
-    hasher.update(&(col.name.len() as u16).to_be_bytes());
-    hasher.update(col.name.as_bytes());
-    u64::from_be_bytes(hasher.finalize().as_bytes()[0..8].try_into().unwrap())
-}
-
-/// `0x05 | 0x00 | cid | blob_id | chunk_idx`.
-pub fn chunk_key(col: &Collection, blob_id: BlobId, idx: u32) -> Vec<u8> {
-    let mut key = chunk_prefix(col, blob_id);
-    key.extend_from_slice(&idx.to_be_bytes());
-    key
-}
-
-/// `0x05 | 0x01 | cid | blob_id`.
-pub fn manifest_key(col: &Collection, blob_id: BlobId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 + 8 + BLOB_ID_BYTES);
-    key.push(DISC_BLOB);
-    key.push(KIND_MANIFEST);
-    key.extend_from_slice(&collection_id(col).to_be_bytes());
-    key.extend_from_slice(blob_id.as_bytes());
-    key
-}
-
-fn chunk_prefix(col: &Collection, blob_id: BlobId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 + 8 + BLOB_ID_BYTES + 4);
-    key.push(DISC_BLOB);
-    key.push(KIND_CHUNK);
-    key.extend_from_slice(&collection_id(col).to_be_bytes());
-    key.extend_from_slice(blob_id.as_bytes());
-    key
-}
-
-fn encode_manifest(manifest: &BlobManifest) -> Vec<u8> {
-    let mut out = Vec::with_capacity(MANIFEST_VALUE_BYTES);
-    out.extend_from_slice(&manifest.total_bytes.to_be_bytes());
-    out.extend_from_slice(&manifest.chunk_count.to_be_bytes());
-    out.extend_from_slice(&manifest.content_hash);
-    out.push(u8::from(manifest.cold_tier));
-    out.extend_from_slice(&manifest.created_at_ms.unwrap_or(0).to_be_bytes());
-    out
-}
-
-fn decode_manifest(bytes: &[u8]) -> Result<BlobManifest> {
-    if !matches!(bytes.len(), MANIFEST_VALUE_BYTES_V1 | MANIFEST_VALUE_BYTES) {
-        return Err(corrupt(format!(
-            "blob manifest must be {MANIFEST_VALUE_BYTES_V1} or {MANIFEST_VALUE_BYTES} bytes, got {}",
-            bytes.len()
-        )));
-    }
-    let total_bytes = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let chunk_count = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
-    let mut content_hash = [0_u8; HASH_BYTES];
-    content_hash.copy_from_slice(&bytes[12..44]);
-    let cold_tier = match bytes[44] {
-        0 => false,
-        1 => true,
-        other => {
-            return Err(corrupt(format!(
-                "blob manifest cold_tier byte {other} is not 0/1"
-            )));
-        }
-    };
-    let created_at_ms = if bytes.len() == MANIFEST_VALUE_BYTES {
-        Some(u64::from_be_bytes(bytes[45..53].try_into().unwrap()))
-    } else {
-        None
-    };
-    Ok(BlobManifest {
-        total_bytes,
-        chunk_count,
-        content_hash,
-        cold_tier,
-        created_at_ms,
-    })
-}
-
-/// Half-open range covering every row (chunks + manifest) of one blob. Used by
-/// callers that need to scan a blob's physical footprint.
-pub fn blob_row_range(col: &Collection, blob_id: BlobId) -> KeyRange {
-    crate::cf::prefix_range(&{
-        let mut prefix = Vec::with_capacity(1 + 8 + BLOB_ID_BYTES);
-        prefix.push(DISC_BLOB);
-        // Spans both KIND_CHUNK (0x00) and KIND_MANIFEST (0x01) for this blob.
-        prefix.push(KIND_CHUNK);
-        prefix.extend_from_slice(&collection_id(col).to_be_bytes());
-        prefix.extend_from_slice(blob_id.as_bytes());
-        prefix
-    })
-}
-
-fn require_blob_mode(col: &Collection) -> Result<()> {
-    if col.mode == CollectionMode::Blob {
-        Ok(())
-    } else {
-        Err(invalid_argument(format!(
-            "blob layer requires a Blob collection, got {:?}",
-            col.mode
-        )))
-    }
-}
-
-fn ledger_subject(manifest_key: &[u8]) -> SubjectId {
-    SubjectId::Query(blake3::hash(manifest_key).as_bytes().to_vec())
-}
-
-fn ledger_payload(col: &Collection, blob_id: BlobId, manifest: &BlobManifest) -> Vec<u8> {
-    let mut payload = PayloadBuilder::default();
-    payload
-        .insert_str("collection_id", format!("{:016x}", collection_id(col)))
-        .insert_str("blob_id", hex_bytes(blob_id.as_bytes()))
-        .insert_str("total_bytes", manifest.total_bytes.to_string())
-        .insert_str("chunk_count", manifest.chunk_count.to_string())
-        .insert_str("content_hash", hex_bytes(&manifest.content_hash));
-    RedactionPolicy::default().apply_to_payload(&payload)
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
-fn blob_too_large(len: usize) -> CalyxError {
-    CalyxError {
-        code: CALYX_BLOB_TOO_LARGE,
-        message: format!("blob of {len} bytes exceeds the {MAX_BLOB_BYTES}-byte ceiling"),
-        remediation: "split the payload or raise MAX_BLOB_BYTES",
-    }
-}
-
-fn invalid_argument(message: impl Into<String>) -> CalyxError {
-    CalyxError {
-        code: CALYX_INVALID_ARGUMENT,
-        message: message.into(),
-        remediation: "fix the blob input",
-    }
-}
-
-fn corrupt(message: impl Into<String>) -> CalyxError {
-    CalyxError::aster_corrupt_shard(message)
-}
-
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod issue1549_tests;

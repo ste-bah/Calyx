@@ -13,6 +13,8 @@ use crate::lens::ensure_input_modality;
 pub const DEFAULT_TEI_ENDPOINT: &str = "http://127.0.0.1:18190/embed";
 pub const LEGACY_TEI_8088_ENDPOINT: &str = "http://127.0.0.1:8088/embed";
 pub const DEFAULT_TEI_MAX_BATCH: usize = 64;
+const RERANK_QUERY_FRAGMENT: &str = "rerank_query=";
+const RERANK_PROJECTION_DIM: u32 = 2;
 
 /// Blocking HTTP TEI lens runtime.
 #[derive(Clone, Debug)]
@@ -99,11 +101,23 @@ impl Lens for TeiHttpLens {
             texts.push(text_from_input(input)?);
         }
 
+        if let Some(rerank) = RerankEndpoint::parse(&self.endpoint)? {
+            return self.measure_rerank_batch(&texts, &rerank);
+        }
+
         let mut vectors = Vec::with_capacity(inputs.len());
         for chunk in texts.chunks(self.max_batch) {
-            let body = serde_json::to_vec(&json!({ "inputs": chunk })).map_err(|err| {
-                CalyxError::lens_unreachable(format!("TEI request encode failed: {err}"))
-            })?;
+            // `truncate: true` = head truncation at the router's model max
+            // tokens, matching every local lens runtime (their tokenizers
+            // truncate at model max_len). Without it TEI fail-closes with
+            // HTTP 422 on inputs over the router limit (observed: 8192
+            // tokens on the :8088/:8090 lanes), which killed long-document
+            // ingest (#1468 Cuyahoga opinions). Request-level truncate is
+            // honored by TEI even without server-side --auto-truncate
+            // (verified by curl on both lanes, 2026-07-13).
+            let body = serde_json::to_vec(&json!({ "inputs": chunk, "truncate": true })).map_err(
+                |err| CalyxError::lens_unreachable(format!("TEI request encode failed: {err}")),
+            )?;
             let raw = post_json(&self.endpoint, &body, self.timeout)?;
             vectors.extend(parse_embedding_response(&raw)?);
         }
@@ -118,6 +132,51 @@ impl Lens for TeiHttpLens {
             .into_iter()
             .map(|data| self.slot_from_row(data))
             .collect()
+    }
+}
+
+impl TeiHttpLens {
+    fn measure_rerank_batch(
+        &self,
+        texts: &[&str],
+        rerank: &RerankEndpoint,
+    ) -> Result<Vec<SlotVector>> {
+        if self.dim != RERANK_PROJECTION_DIM {
+            return Err(CalyxError::lens_dim_mismatch(format!(
+                "TEI reranker projection dim {} != required {RERANK_PROJECTION_DIM}",
+                self.dim
+            )));
+        }
+        let mut vectors = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(self.max_batch) {
+            let body = serde_json::to_vec(&json!({
+                "query": rerank.query,
+                "texts": chunk,
+                "truncate": true,
+                "raw_scores": true,
+                "return_text": false
+            }))
+            .map_err(|err| {
+                CalyxError::lens_unreachable(format!("TEI rerank request encode failed: {err}"))
+            })?;
+            let raw = post_json(&rerank.endpoint, &body, self.timeout)?;
+            for score in parse_rerank_response(&raw, chunk.len())? {
+                // A one-dimensional vector is destroyed by normalized-on-read
+                // storage (every non-zero value becomes only its sign).  The
+                // frozen unit score-plus-bias direction preserves the learned
+                // cross-encoder score as an angle and remains deterministic.
+                let norm = score.hypot(1.0);
+                vectors.push(self.slot_from_row(vec![score / norm, 1.0 / norm])?);
+            }
+        }
+        if vectors.len() != texts.len() {
+            return Err(CalyxError::lens_dim_mismatch(format!(
+                "TEI reranker returned {} vectors for {} inputs",
+                vectors.len(),
+                texts.len()
+            )));
+        }
+        Ok(vectors)
     }
 }
 
@@ -220,6 +279,55 @@ fn parse_embedding_response(body: &[u8]) -> Result<Vec<Vec<f32>>> {
     })
 }
 
+fn parse_rerank_response(body: &[u8], expected: usize) -> Result<Vec<f32>> {
+    let value: Value = serde_json::from_slice(body).map_err(|err| {
+        CalyxError::lens_unreachable(format!("TEI rerank JSON parse failed: {err}"))
+    })?;
+    let rows = value.as_array().ok_or_else(|| {
+        CalyxError::lens_dim_mismatch("TEI rerank response is not a result array")
+    })?;
+    if rows.len() != expected {
+        return Err(CalyxError::lens_dim_mismatch(format!(
+            "TEI reranker returned {} scores for {expected} inputs",
+            rows.len()
+        )));
+    }
+    let mut scores = vec![None; expected];
+    for row in rows {
+        let index = row
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| CalyxError::lens_dim_mismatch("TEI rerank row has no valid index"))?;
+        if index >= expected || scores[index].is_some() {
+            return Err(CalyxError::lens_dim_mismatch(format!(
+                "TEI rerank row index {index} is out of range or duplicated"
+            )));
+        }
+        let score = row
+            .get("score")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| CalyxError::lens_dim_mismatch("TEI rerank row has no numeric score"))?;
+        if !score.is_finite() || score < f32::MIN as f64 || score > f32::MAX as f64 {
+            return Err(CalyxError::lens_numerical_invariant(
+                "TEI rerank score is NaN, Inf, or outside f32",
+            ));
+        }
+        scores[index] = Some(score as f32);
+    }
+    scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, score)| {
+            score.ok_or_else(|| {
+                CalyxError::lens_dim_mismatch(format!(
+                    "TEI rerank response omitted score index {index}"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn parse_vectors(value: &Value) -> Option<Vec<Vec<f32>>> {
     if let Some(values) = value.as_array() {
         if values.is_empty() {
@@ -287,6 +395,90 @@ struct HttpEndpoint {
     host: String,
     port: u16,
     path: String,
+}
+
+struct RerankEndpoint {
+    endpoint: String,
+    query: String,
+}
+
+impl RerankEndpoint {
+    fn parse(endpoint: &str) -> Result<Option<Self>> {
+        let Some((base, fragment)) = endpoint.split_once('#') else {
+            return Ok(None);
+        };
+        let encoded = fragment.strip_prefix(RERANK_QUERY_FRAGMENT).ok_or_else(|| {
+            CalyxError::lens_unreachable(format!(
+                "unsupported TEI endpoint fragment #{fragment}; expected #{RERANK_QUERY_FRAGMENT}<query>"
+            ))
+        })?;
+        if !base.ends_with("/rerank") {
+            return Err(CalyxError::lens_unreachable(
+                "TEI rerank query fragment requires an endpoint ending in /rerank",
+            ));
+        }
+        let query = decode_query_fragment(encoded)?;
+        if query.trim().is_empty() {
+            return Err(CalyxError::lens_unreachable(
+                "TEI rerank query fragment decoded to an empty query",
+            ));
+        }
+        Ok(Some(Self {
+            endpoint: base.to_string(),
+            query,
+        }))
+    }
+}
+
+fn decode_query_fragment(encoded: &str) -> Result<String> {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err(CalyxError::lens_unreachable(
+                        "TEI rerank query fragment has a truncated percent escape",
+                    ));
+                }
+                let high = hex_nibble(bytes[index + 1]).ok_or_else(|| {
+                    CalyxError::lens_unreachable(
+                        "TEI rerank query fragment has an invalid percent escape",
+                    )
+                })?;
+                let low = hex_nibble(bytes[index + 2]).ok_or_else(|| {
+                    CalyxError::lens_unreachable(
+                        "TEI rerank query fragment has an invalid percent escape",
+                    )
+                })?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|err| {
+        CalyxError::lens_unreachable(format!(
+            "TEI rerank query fragment is not valid UTF-8: {err}"
+        ))
+    })
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl HttpEndpoint {

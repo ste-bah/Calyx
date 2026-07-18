@@ -1,0 +1,50 @@
+{
+  "documents": [
+    {
+      "cluster_id": 10760946,
+      "download_url": "https://www.supremecourt.ohio.gov/rod/docs/pdf/8/2025/2025-Ohio-5634.pdf",
+      "expected_normalized_chars": 11767,
+      "expected_normalized_text_sha256": "c03766131139e67c0e40157699b515c5c7a430ef392dad370e096d242503ffbf",
+      "expected_pages": 8,
+      "expected_raw_chars": 12064,
+      "expected_raw_text_sha256": "28730c87fc4b25c5946271fe6e11b07196f4c21d66352f2206171ce5e58e8275",
+      "local_path": "pdf/2025/12/18/lakewood_v._m.t.s..pdf",
+      "max_pdf_bytes": 1048576,
+      "opinion_id": 11227531,
+      "pdf_sha1": "cfd7667292e33b2e00a9fb49d6c0ba66bdbc1ae7",
+      "pdf_sha256": "8bae0003b4864f015adb4873bf7dc0266bbd55e7e2fb878ebe9800eb63d6ba36",
+      "sha1": "cfd7667292e33b2e00a9fb49d6c0ba66bdbc1ae7",
+      "source_row_sha256": "9210d9dfce555d8ad5c9c525ef52d97a6f6419b2004df799ba70195ea193813f",
+      "storage_url": "https://storage.courtlistener.com/pdf/2025/12/18/lakewood_v._m.t.s..pdf"
+    },
+    {
+      "cluster_id": 10790698,
+      "download_url": "https://www.supremecourt.ohio.gov/rod/docs/pdf/8/2026/2026-Ohio-453.pdf",
+      "expected_normalized_chars": 41373,
+      "expected_normalized_text_sha256": "b4803c90f013a02f68dc4cbf922a878737041cd30e665a08dcbb95db8944454f",
+      "expected_pages": 26,
+      "expected_raw_chars": 42279,
+      "expected_raw_text_sha256": "1ad2bd5cb111976851da54d6621c2de30c297d5553fcb7c0618c1a65784f29f9",
+      "local_path": "pdf/2026/02/12/state_v._al-shami.pdf",
+      "max_pdf_bytes": 1048576,
+      "opinion_id": 11257339,
+      "pdf_sha1": "b4138e30b26775589562efa3f666e149ab4a5abd",
+      "pdf_sha256": "85bf041443f7666d458883c72704ddfb7e2743b9652662ccba6ad0064f148311",
+      "sha1": "b4138e30b26775589562efa3f666e149ab4a5abd",
+      "source_row_sha256": "755a65a915df139d50c20854e520f120ad738ca781edab5a5f040898a554ab09",
+      "storage_url": "https://storage.courtlistener.com/pdf/2026/02/12/state_v._al-shami.pdf"
+    }
+  ],
+  "extractor": {
+    "join_pages": "two-newlines",
+    "name": "pypdf",
+    "strict": true,
+    "text_method": "PageObject.extract_text-default",
+    "version": "6.14.2"
+  },
+  "format": "calyx-cuyahoga-authoritative-document-sources-v1",
+  "source_binding": {
+    "opinions_archive_sha256": "65db4902a4ae42c48ef9958f52600dedca5401c194d3611d0b2672cfc6dd4d9c",
+    "snapshot_date": "2026-06-30"
+  }
+}

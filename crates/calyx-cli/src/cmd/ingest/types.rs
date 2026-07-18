@@ -38,6 +38,8 @@ pub(super) struct BatchIngestSummary {
     pub(super) last_ledger_seq: Option<u64>,
     #[serde(skip)]
     pub(super) batch_cx_ids: BTreeSet<CxId>,
+    #[serde(skip)]
+    pub(super) physical_reconciled: bool,
 }
 
 impl BatchIngestSummary {
@@ -62,6 +64,7 @@ impl BatchIngestSummary {
             first_ledger_seq: None,
             last_ledger_seq: None,
             batch_cx_ids: BTreeSet::new(),
+            physical_reconciled: false,
         }
     }
 

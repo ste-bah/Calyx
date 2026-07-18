@@ -13,6 +13,13 @@ use calyx_core::AuthN;
 use calyx_mcp::jsonrpc::{JsonRpcId, decode_jsonrpc_request};
 use calyx_mcp::server::McpServer;
 
+const CAPABILITIES: &[(&str, bool)] = &[
+    ("forge-cuda", calyx_forge::CUDA_COMPILED),
+    ("registry-candle-cuda", calyx_registry::CANDLE_CUDA_COMPILED),
+    ("search-cuda", calyx_search::CUDA_COMPILED),
+    ("sextant-cuvs", calyx_sextant::CUVS_COMPILED),
+];
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--build-info") {
@@ -91,16 +98,14 @@ fn print_build_info(args: &[String]) -> ExitCode {
         eprintln!("calyx-mcp: --build-info takes no other arguments");
         return ExitCode::from(2);
     }
-    // calyx-mcp has no compile-time capability surface (#1130): no cargo
-    // features, no GPU dependencies. The empty map is still explicit so a
-    // future capability cannot be forgotten silently.
-    let mut report = match serde_json::to_value(calyx_buildinfo::build_info!(capabilities: &[])) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("calyx-mcp: CALYX_BUILD_INFO_INVALID: serialize build info: {error}");
-            return ExitCode::from(2);
-        }
-    };
+    let mut report =
+        match serde_json::to_value(calyx_buildinfo::build_info!(capabilities: CAPABILITIES)) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("calyx-mcp: CALYX_BUILD_INFO_INVALID: serialize build info: {error}");
+                return ExitCode::from(2);
+            }
+        };
     report["binary"] = serde_json::Value::from("calyx-mcp");
     report["executable"] = serde_json::Value::from(
         std::env::current_exe()
@@ -116,5 +121,25 @@ fn print_build_info(args: &[String]) -> ExitCode {
             eprintln!("calyx-mcp: response serialize error: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_capabilities_are_all_or_nothing() {
+        assert_eq!(CAPABILITIES.len(), 3);
+        let actual = CAPABILITIES
+            .iter()
+            .map(|(_, enabled)| *enabled)
+            .collect::<Vec<_>>();
+        let expected = if cfg!(feature = "cuda") {
+            vec![true, true, cfg!(target_os = "linux")]
+        } else {
+            vec![false; CAPABILITIES.len()]
+        };
+        assert_eq!(actual, expected);
     }
 }

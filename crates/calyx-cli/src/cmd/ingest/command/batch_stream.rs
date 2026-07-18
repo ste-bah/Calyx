@@ -1,7 +1,6 @@
 use super::super::session::BatchIngestSession;
 use super::batch_physical::{
-    collect_batch_cx_ids, physical_batch_base_state, reconcile_summary_with_physical_base,
-    reject_tombstoned_batch_ids,
+    physical_batch_base_state, reconcile_summary_with_physical_base, reject_tombstoned_batch_ids,
 };
 use super::batch_support::{
     BatchOrderRow, append_idempotent_batch_ledger, append_missing_batch_anchors,
@@ -131,11 +130,6 @@ pub(crate) fn ingest_validated_batch_streaming_with_output(
     let mut seen = BTreeSet::new();
     let runtime_batch_limit = measure_batch_size();
     let measure_window = measure_window_size(runtime_batch_limit);
-    let flush_options = BatchFlushOptions {
-        output,
-        runtime_batch_limit,
-        gpu_route,
-    };
     ingest_runtime_log(format_args!(
         "phase=batch_ingest_plan rows={} runtime_batch_limit={} measure_window={} put_chunk={} output={:?} resident_addr={:?} allow_cold_gpu_workers={}",
         validated_row_count,
@@ -146,10 +140,16 @@ pub(crate) fn ingest_validated_batch_streaming_with_output(
         gpu_route.resident_addr,
         gpu_route.allow_cold_gpu_workers
     ));
-    preflight_batch_existing_identity(&vault, &state, &resolved.path, path, validated_row_count)?;
-    let batch_cx_ids = collect_batch_cx_ids(&vault, &state, path)?;
-    let physical_before = physical_batch_base_state(&resolved.path, &batch_cx_ids)?;
-    reject_tombstoned_batch_ids(&physical_before)?;
+    let preflight = preflight_batch_existing_identity(
+        &vault,
+        &state,
+        &resolved.path,
+        path,
+        validated_row_count,
+    )?;
+    let batch_cx_ids = preflight.batch_ids().clone();
+    let physical_before = preflight.physical_base();
+    reject_tombstoned_batch_ids(physical_before)?;
     ingest_runtime_log(format_args!(
         "phase=batch_physical_base_readback_before distinct_cx={} visible={} tombstoned={}",
         batch_cx_ids.len(),
@@ -170,7 +170,13 @@ pub(crate) fn ingest_validated_batch_streaming_with_output(
         session.as_deref().map(|session| session.session_id()),
         Some(path),
     )?;
-    backfill_batch_existing_input_pointers(&vault, &state, &resolved.path, path)?;
+    backfill_batch_existing_input_pointers(&vault, &preflight)?;
+    let flush_options = BatchFlushOptions {
+        output,
+        runtime_batch_limit,
+        gpu_route,
+        preflight: &preflight,
+    };
     let mut chunk: Vec<BatchRow> = Vec::with_capacity(measure_window);
     let mut summary = BatchIngestSummary::empty();
     for (index, line) in reader.lines().enumerate() {
@@ -218,12 +224,12 @@ pub(crate) fn ingest_validated_batch_streaming_with_output(
         }
     }
     let physical_after = physical_batch_base_state(&resolved.path, &batch_cx_ids)?;
-    reconcile_summary_with_physical_base(&mut summary, &physical_before, &physical_after)?;
+    reconcile_summary_with_physical_base(&mut summary, physical_before, &physical_after)?;
     if let Some(session) = session.as_deref_mut() {
         session.record_summary_progress(&summary, "batch_physical_base_readback_after")?;
     }
     let summary_emit_error = emit_batch_summary_if_requested(&mut summary_emitter, &summary)?;
-    batch_rebuild::run_post_commit_index_rebuild(resolved, &vault, &summary, &mut session)?;
+    batch_rebuild::run_post_commit_index_rebuild(resolved, &vault, &state, &summary, &mut session)?;
     if let Some(session) = session {
         session.complete(&summary, vault.snapshot())?;
     }
@@ -272,12 +278,12 @@ fn flush_measure_batch(
     chunk: &mut Vec<BatchRow>,
     seen: &mut BTreeSet<CxId>,
     summary: &mut BatchIngestSummary,
-    options: BatchFlushOptions,
+    options: BatchFlushOptions<'_>,
 ) -> CliResult<()> {
     let rows: Vec<BatchRow> = std::mem::take(chunk);
     if rows.iter().all(|(_, _, _, oracle)| oracle.is_none())
         && let Some(existing_rows) =
-            existing_plain_batch_replay_rows(vault, state, vault_path, &rows)?
+            existing_plain_batch_replay_rows(vault, state, &rows, options.preflight)?
     {
         ingest_runtime_log(format_args!(
             "phase=batch_existing_replay_base_only_fast_path rows={} runtime_batch_limit={} measurement_skipped=true slot_decode_skipped=true",

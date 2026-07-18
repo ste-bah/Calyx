@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "calyx-web-api"
 version.workspace = true
 edition.workspace = true
@@ -33,3 +34,11 @@ serde = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+# BEGIN generated integration harnesses (issue #1546)
+
+[[test]]
+name = "__calyx_integration_process_0"
+path = "tests/__calyx_integration_process_0.rs"
+
+# END generated integration harnesses (issue #1546)

@@ -16,8 +16,8 @@ use calyx_sextant::{
 };
 use serde_json::{Value, json};
 
-#[path = "../sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 pub use sextant_support::digest_hex;
 use sextant_support::{cx_usize_be as cx, dense};
 

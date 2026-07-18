@@ -15,7 +15,9 @@ use calyx_core::{
 };
 use serde_json::json;
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::{ManifestPathStyle, vault_id, write_json, write_tree_manifest};
 
 const MAIN_SEED: u8 = 0x39;

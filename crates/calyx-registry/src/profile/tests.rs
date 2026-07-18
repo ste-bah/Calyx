@@ -32,6 +32,42 @@ fn profiles_algorithmic_lens_with_real_numbers() {
     assert_eq!(card.differentiation_source, MetricSource::AssayPending);
     assert!(card.proxy_differentiation.is_finite());
     assert!(card.cost.ms_per_input >= 0.0);
+    assert_eq!(card.execution.measurement_passes, 1);
+    assert_eq!(card.execution.batch_measure_calls, 1);
+    assert_eq!(card.execution.scalar_measure_calls, 0);
+}
+
+#[test]
+fn offline_dense_vectors_report_zero_runtime_execution_calls() {
+    let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+    let labels = vec![Some("a".to_string()), Some("b".to_string())];
+    let card = profile_dense_vectors(DenseProfileRequest {
+        lens_id: LensId::from_bytes([0x57; 16]),
+        probe_count: vectors.len(),
+        vectors: &vectors,
+        labels: &labels,
+        cost: CostMetrics {
+            total_ms: 0.0,
+            ms_per_input: 0.0,
+            vram_bytes: 0,
+            vram_observed: false,
+            ram_bytes: 16,
+            batch_ceiling: u32::MAX,
+        },
+        signal: None,
+        signal_kind: CapabilitySignalKind::DeterministicContentFeature,
+        health: LensHealth::Loaded,
+        execution: ProfileExecutionStats::default(),
+    })
+    .unwrap();
+
+    assert_eq!(card.execution.measurement_passes, 0);
+    assert_eq!(card.execution.batch_measure_calls, 0);
+    assert_eq!(card.execution.scalar_measure_calls, 0);
+    assert_eq!(card.execution.pairwise_distance_matrices, 1);
+    assert_eq!(card.execution.pairwise_distance_values, 4);
+    assert_eq!(card.execution.measured_rows, 2);
+    assert_eq!(card.execution.vector_dim, 2);
 }
 
 #[test]

@@ -181,6 +181,7 @@ fn evaluation(lens_id: LensId, decision: CapabilityGateDecision) -> CapabilityGa
             },
             health: LensHealth::Loaded,
             low_spread: false,
+            execution: Default::default(),
         },
     }
 }

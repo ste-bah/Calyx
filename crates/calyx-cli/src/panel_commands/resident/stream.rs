@@ -17,7 +17,13 @@ use super::server::ResidentService;
 use super::*;
 
 pub(super) const MEASURE_WINDOW_ENV: &str = "CALYX_PANEL_RESIDENT_MEASURE_WINDOW";
-const DEFAULT_MEASURE_WINDOW_MULTIPLIER: usize = 32;
+pub(super) const DEFAULT_MEASURE_WINDOW_MULTIPLIER: usize = 32;
+
+pub(super) const RUNTIME_BATCH_LIMIT_EXCEEDED: &str =
+    "CALYX_PANEL_RESIDENT_RUNTIME_BATCH_LIMIT_EXCEEDED";
+pub(super) const RUNTIME_BATCH_LIMIT_REMEDIATION: &str = "send a positive runtime_batch_limit no larger than the resident readiness max_runtime_batch, or restart the resident with a larger --max-runtime-batch and pass its real capacity probe";
+pub(super) const EMPTY_INPUT: &str = "CALYX_PANEL_RESIDENT_EMPTY_INPUT";
+pub(super) const EMPTY_INPUT_REMEDIATION: &str = "send non-empty input bytes; validate and report the source row before calling resident measurement";
 
 /// Measure a batch chunk-major, handing each chunk's assembled rows to
 /// `emit_rows` as soon as they exist. Returns elapsed milliseconds.
@@ -28,12 +34,11 @@ pub(super) fn measure_batch_chunked(
     runtime_batch_limit: Option<usize>,
     emit_rows: &mut dyn FnMut(Vec<ResidentMeasuredInput>) -> CliResult,
 ) -> CliResult<u128> {
-    if matches!(runtime_batch_limit, Some(0)) {
-        return Err(CalyxError::lens_unreachable(
-            "resident measure_batch runtime_batch_limit must be > 0 when supplied",
-        )
-        .into());
-    }
+    validate_measure_inputs(modality, &input_bytes)?;
+    let runtime_batch_limit = Some(admit_runtime_batch_limit(
+        service.max_runtime_batch,
+        runtime_batch_limit,
+    )?);
     let started = Instant::now();
     let input_count = input_bytes.len();
     eprintln!(
@@ -78,6 +83,40 @@ pub(super) fn measure_batch_chunked(
         modality
     );
     Ok(elapsed_ms)
+}
+
+pub(super) fn validate_measure_inputs(modality: Modality, inputs: &[Vec<u8>]) -> CliResult {
+    if let Some((input_index, _)) = inputs
+        .iter()
+        .enumerate()
+        .find(|(_, bytes)| bytes.is_empty())
+    {
+        return Err(CliError::from(CalyxError {
+            code: EMPTY_INPUT,
+            message: format!(
+                "resident measure input {input_index} for modality {modality:?} is empty"
+            ),
+            remediation: EMPTY_INPUT_REMEDIATION,
+        }));
+    }
+    Ok(())
+}
+
+pub(super) fn admit_runtime_batch_limit(
+    maximum: usize,
+    requested: Option<usize>,
+) -> CliResult<usize> {
+    let requested = requested.unwrap_or(maximum);
+    if requested == 0 || requested > maximum {
+        return Err(CliError::from(CalyxError {
+            code: RUNTIME_BATCH_LIMIT_EXCEEDED,
+            message: format!(
+                "resident measure_batch runtime_batch_limit={requested} exceeds the capacity-probed maximum {maximum}"
+            ),
+            remediation: RUNTIME_BATCH_LIMIT_REMEDIATION,
+        }));
+    }
+    Ok(requested)
 }
 
 pub(super) fn resident_measure_chunk_size(
@@ -200,6 +239,30 @@ pub(super) fn serve_binary_measure_batch(
         request.protocol_version,
         request.inputs.len()
     );
+    if let Err(error) = validate_measure_inputs(request.modality, &request.inputs) {
+        return write_stream_frame(
+            writer,
+            &ResidentMeasureBatchStreamFrame::Err {
+                code: error.code().to_string(),
+                message: error.message().to_string(),
+                remediation: error.remediation().to_string(),
+            },
+        );
+    }
+    let runtime_batch_limit =
+        match admit_runtime_batch_limit(service.max_runtime_batch, request.runtime_batch_limit) {
+            Ok(limit) => Some(limit),
+            Err(error) => {
+                return write_stream_frame(
+                    writer,
+                    &ResidentMeasureBatchStreamFrame::Err {
+                        code: error.code().to_string(),
+                        message: error.message().to_string(),
+                        remediation: error.remediation().to_string(),
+                    },
+                );
+            }
+        };
     write_stream_frame(
         writer,
         &ResidentMeasureBatchStreamFrame::Header(ResidentMeasureBatchStreamHeader {
@@ -210,7 +273,7 @@ pub(super) fn serve_binary_measure_batch(
             template_source: service.state.template_source.clone(),
             modality: request.modality,
             input_count: request.inputs.len(),
-            runtime_batch_limit: request.runtime_batch_limit,
+            runtime_batch_limit,
         }),
     )?;
     let mut row_count = 0usize;
@@ -219,7 +282,7 @@ pub(super) fn serve_binary_measure_batch(
         service,
         request.modality,
         request.inputs,
-        request.runtime_batch_limit,
+        runtime_batch_limit,
         &mut |rows| {
             for row in rows {
                 write_stream_frame(writer, &ResidentMeasureBatchStreamFrame::Row(Box::new(row)))?;

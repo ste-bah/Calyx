@@ -91,7 +91,10 @@ impl DurableVault {
         // handle must never regress it, or a genuinely stale index would pass
         // freshness (#1100 review finding).
         let mut derived_content_seq = self.derived_content_seq_for_manifest(durable_seq);
-        if let Some(current) = current.as_ref() {
+        if let Some(current) = current
+            .as_ref()
+            .filter(|manifest| manifest.uses_persistent_search_content_model())
+        {
             derived_content_seq =
                 derived_content_seq.max(current.effective_derived_content_seq().min(durable_seq));
         }

@@ -5,7 +5,9 @@ use calyx_core::Result;
 use super::helpers::{distance_to_node, sorted};
 use super::{DiskAnnSearch, DiskAnnSearchParams, SearchBuildSidecars};
 use crate::index::diskann::build::{DiskAnnBuildBackend, DiskAnnBuildParams};
-use crate::index::diskann::pq::{DiskAnnPqBuildParams, DiskAnnPqIndex, default_pq_sidecar};
+use crate::index::diskann::pq::{
+    DiskAnnPqBuildExecution, DiskAnnPqBuildParams, DiskAnnPqIndex, default_pq_sidecar,
+};
 use crate::index::distance::l2_normalize;
 use calyx_core::{CxId, SlotId};
 
@@ -92,6 +94,12 @@ impl DiskAnnSearch {
             .map(|pq| (pq.node_count(), pq.subvectors(), pq.centroids()))
     }
 
+    pub fn pq_build_diagnostics(
+        &self,
+    ) -> Option<&crate::index::diskann::pq::DiskAnnPqBuildDiagnostics> {
+        self.pq.as_ref().map(DiskAnnPqIndex::build_diagnostics)
+    }
+
     fn rescore_from_graph(
         &self,
         graph_query: &[f32],
@@ -118,12 +126,17 @@ pub(super) fn write_pq_sidecar(
     graph_path: &Path,
     dense_rows: &[(u32, Vec<f32>)],
     pq_params: DiskAnnPqBuildParams,
+    graph_backend: DiskAnnBuildBackend,
 ) -> Result<DiskAnnPqIndex> {
     let graph_rows: Vec<_> = dense_rows
         .iter()
         .map(|(id, vector)| (*id, l2_normalize(vector)))
         .collect();
-    let pq = DiskAnnPqIndex::build(&graph_rows, pq_params)?;
+    let execution = match graph_backend {
+        DiskAnnBuildBackend::CuvsCagra => DiskAnnPqBuildExecution::CudaRequired,
+        DiskAnnBuildBackend::CpuVamana => DiskAnnPqBuildExecution::Auto,
+    };
+    let pq = DiskAnnPqIndex::build_with_execution(&graph_rows, pq_params, execution)?;
     pq.write_atomic(&default_pq_sidecar(graph_path))?;
     Ok(pq)
 }

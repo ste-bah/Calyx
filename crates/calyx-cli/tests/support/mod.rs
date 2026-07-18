@@ -1,5 +1,6 @@
-#[allow(dead_code)]
-pub mod fsv_io;
+#[allow(unused_imports, reason = "shared support API is used selectively")]
+// calyx-shared-module: path=support/fsv_io.rs alias=__calyx_shared_support_fsv_io_rs local=fsv_io visibility=crate
+pub(crate) use crate::__calyx_shared_support_fsv_io_rs as fsv_io;
 #[allow(dead_code)]
 pub mod living_concert;
 #[allow(dead_code)]

@@ -1,8 +1,7 @@
 //! Issue #51 - temporal lead/lag, TE, periodicity, and hazard edges into Graph CF.
 
-#[path = "fsv_support.rs"]
-#[allow(dead_code)]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -355,10 +354,11 @@ fn splitmix(mut x: u64) -> f64 {
 }
 
 fn issue51_root() -> PathBuf {
-    if let Some(path) = std::env::var_os("POLY_ISSUE51_FSV_ROOT") {
-        return PathBuf::from(path);
-    }
-    repo_root().join("target/fsv/issue51_temporal_graph_edges_20260707")
+    calyx_fsv::fsv_root_or_target(
+        "POLY_ISSUE51_FSV_ROOT",
+        "issue51-temporal-graph-edges",
+        || repo_root().join("target/fsv/issue51_temporal_graph_edges_20260707"),
+    )
 }
 
 fn repo_root() -> PathBuf {

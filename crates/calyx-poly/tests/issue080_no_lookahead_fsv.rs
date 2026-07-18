@@ -28,10 +28,10 @@ use calyx_poly::pipeline::{ground_market, ingest_snapshot};
 use calyx_poly::resolved_market_corpus::{ResolvedMarketInput, build_resolved_market_corpus};
 use serde_json::{Value, json};
 
-#[path = "fsv_support.rs"]
-mod support;
-#[path = "synthetic_panels.rs"]
-mod synthetic;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
+// calyx-shared-module: path=synthetic_panels.rs alias=__calyx_shared_synthetic_panels_rs local=synthetic visibility=private
+use crate::__calyx_shared_synthetic_panels_rs as synthetic;
 
 use support::{collect_files, named_fsv_root, reset_dir, write_blake3sums, write_json};
 use synthetic::{SyntheticPanel, independent, proxy_up24h, resolved_anchor};

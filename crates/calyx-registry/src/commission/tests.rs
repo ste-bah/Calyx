@@ -48,6 +48,7 @@ fn lensforge_manifest_round_trips_to_stable_lens_spec() {
         truncate_dim: None,
         recall_delta: crate::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
     let manifest_path = root.join("manifest.json");
@@ -133,6 +134,7 @@ fn model2vec_manifest_maps_to_static_lookup_runtime() {
         truncate_dim: None,
         recall_delta: crate::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
     let manifest_path = root.join("manifest.json");
@@ -193,6 +195,7 @@ fn candle_fp16_manifest_preserves_runtime_dtype_and_pooling() {
         truncate_dim: None,
         recall_delta: crate::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
     let manifest_path = root.join("manifest.json");
@@ -247,6 +250,7 @@ fn tei_manifest_maps_descriptor_to_http_runtime() {
         truncate_dim: None,
         recall_delta: crate::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
     let manifest_path = root.join("manifest.json");
@@ -304,6 +308,7 @@ fn adapter_manifest_maps_to_multimodal_runtime() {
         truncate_dim: Some(8),
         recall_delta: 0.03,
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
 
@@ -341,6 +346,7 @@ fn algorithmic_manifest_supports_sparse_code_lenses_without_artifacts() {
         truncate_dim: None,
         recall_delta: crate::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
     let ast = LensForgeManifest {
@@ -363,6 +369,7 @@ fn algorithmic_manifest_supports_sparse_code_lenses_without_artifacts() {
         truncate_dim: None,
         recall_delta: crate::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
 
@@ -417,6 +424,7 @@ fn noncommercial_manifest_requires_explicit_allow_flag() {
         truncate_dim: None,
         recall_delta: crate::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
 
@@ -430,6 +438,8 @@ fn noncommercial_manifest_requires_explicit_allow_flag() {
         LensRuntime::MultimodalAdapter { ref axis, .. } if axis == "dna"
     ));
 }
+
+mod qwen3;
 
 fn temp_root(label: &str) -> PathBuf {
     let nanos = SystemTime::now()

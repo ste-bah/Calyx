@@ -1,6 +1,21 @@
-use calyx_sextant::Hit;
+use calyx_search::SearchRerankReport;
+use calyx_sextant::{Hit, HitRerankEvidence};
 use serde::Serialize;
 
+use super::roster::SlotRosterOut;
+
+/// `--explain` response envelope: the vault-level serving roster (which slots
+/// contributed via the resident, which were measured locally, and which are
+/// parked/excluded from serving) plus the ranked hits (#1490).
+#[derive(Serialize)]
+pub(super) struct SearchExplainOut {
+    pub slots: SlotRosterOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<SearchRerankReport>,
+    pub hits: Vec<SearchHitOut>,
+}
+
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 pub(super) struct KernelAnswerOut {
     pub answer: String,
@@ -9,11 +24,100 @@ pub(super) struct KernelAnswerOut {
     pub gaps: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub(super) struct GroundedKernelAnswerOut {
+    pub status: &'static str,
+    pub traversal_mode: &'static str,
+    pub answer_id: String,
+    pub query_cx_id: String,
+    pub kernel_id: String,
+    pub kernel_manifest_sha256: String,
+    pub embedding_slots: Vec<u16>,
+    pub fusion: &'static str,
+    pub rrf_k: u32,
+    pub nearest_score: f32,
+    pub nearest_lanes: Vec<calyx_lodestar::PanelFusionLane>,
+    pub admission_threshold: f32,
+    pub anchor_kernel_node_id: String,
+    pub hops: Vec<GroundedKernelAnswerHopOut>,
+    pub total_score: f32,
+    pub ledger_refs: Vec<GroundedKernelLedgerRefOut>,
+    pub retained_query_pointer: String,
+    pub source_support: calyx_lodestar::KernelAnswerSourceSupport,
+    pub physical_readback: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct GroundedKernelAnswerHopOut {
+    pub edge_kind: &'static str,
+    pub from_cx_id: String,
+    pub to_cx_id: String,
+    pub edge_weight: f32,
+    pub hop_index: u32,
+    pub hop_score: f32,
+    pub ledger_ref: GroundedKernelLedgerRefOut,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct GroundedKernelLedgerRefOut {
+    pub seq: u64,
+    pub hash: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct GroundedKernelRefusalOut {
+    pub status: &'static str,
+    pub code: &'static str,
+    pub reason: &'static str,
+    pub nearest_cx_id: String,
+    pub nearest_score: f32,
+    pub nearest_lanes: Vec<calyx_lodestar::PanelFusionLane>,
+    pub admission_threshold: f32,
+    pub kernel_id: String,
+    pub kernel_manifest_sha256: String,
+    pub embedding_slots: Vec<u16>,
+    pub fusion: &'static str,
+    pub rrf_k: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct GroundedKernelScopeRefusalOut {
+    pub status: &'static str,
+    pub code: &'static str,
+    pub reason: &'static str,
+    pub detected_kind: &'static str,
+    pub detected_scope: String,
+    pub allowed_court_system: String,
+    pub allowed_state: String,
+    pub allowed_county: String,
+    pub kernel_id: String,
+    pub kernel_manifest_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct GroundedKernelSourceRefusalOut {
+    pub status: &'static str,
+    pub code: &'static str,
+    pub reason: &'static str,
+    pub nearest_cx_id: String,
+    pub nearest_score: f32,
+    pub nearest_lanes: Vec<calyx_lodestar::PanelFusionLane>,
+    pub admission_threshold: f32,
+    pub kernel_id: String,
+    pub kernel_manifest_sha256: String,
+    pub embedding_slots: Vec<u16>,
+    pub fusion: &'static str,
+    pub rrf_k: u32,
+    pub source_support: calyx_lodestar::KernelAnswerSourceSupport,
+}
+
 #[derive(Serialize)]
 pub(super) struct SearchHitOut {
     rank: usize,
     cx_id: String,
     score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank: Option<HitRerankEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     per_lens: Option<Vec<PerLensOut>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,6 +185,10 @@ pub(super) fn render_hits(
             rank: hit.rank,
             cx_id: hit.cx_id.to_string(),
             score: hit.score,
+            rerank: hit
+                .explain
+                .as_ref()
+                .and_then(|explain| explain.rerank.clone()),
             per_lens: explain.then(|| {
                 hit.per_lens
                     .iter()

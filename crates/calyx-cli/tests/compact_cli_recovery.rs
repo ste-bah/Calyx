@@ -11,7 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-mod support;
+// calyx-shared-module: path=support/mod.rs alias=__calyx_shared_support_mod_rs local=support visibility=private
+
+use crate::__calyx_shared_support_mod_rs as support;
 use support::fsv_io::{
     case_fsv_root, reset_dir, write_blake3_sums_by_path as write_blake3_sums, write_json,
     write_text,

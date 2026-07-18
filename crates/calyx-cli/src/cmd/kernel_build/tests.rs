@@ -1,11 +1,13 @@
 use super::*;
 use calyx_aster::plain_graph::PlainGraph;
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{AnchorKind, CxId, VaultId};
+use calyx_core::{AnchorKind, CxId, SlotShape, SlotState, VaultId, VaultStore};
 use calyx_lodestar::{
-    AsterAssocNodeProps, DEFAULT_ASTER_ASSOC_COLLECTION, FsKernelStore, RecallPassMode,
-    encode_assoc_node_props, kernel_health, load_kernel_index, read_kernel_artifact,
+    AsterAssocMetadata, AsterAssocNodeProps, DEFAULT_ASTER_ASSOC_COLLECTION, FsKernelStore,
+    RecallPassMode, encode_assoc_node_props, kernel_health, load_kernel_index,
+    read_kernel_artifact, write_assoc_metadata,
 };
+use calyx_registry::{code_default, materialize_panel_template, persist_vault_panel_state};
 use serde_json::json;
 
 fn toks(parts: &[&str]) -> Vec<String> {
@@ -38,11 +40,43 @@ fn all_flags_parse() {
         "5",
         "--min-recall",
         "0.9",
+        "--admission-queries",
+        "tools/lawdemo/cuyahoga_admission_queries.v1.jsonl",
+        "--resident-addr",
+        "127.0.0.1:18460",
     ])
     .unwrap();
     assert!((args.held_out_fraction - 0.01).abs() < 1e-6);
     assert_eq!(args.top_k, 5);
     assert!((args.min_recall - 0.9).abs() < 1e-6);
+    assert_eq!(
+        args.admission_queries.as_deref(),
+        Some(std::path::Path::new(
+            "tools/lawdemo/cuyahoga_admission_queries.v1.jsonl"
+        ))
+    );
+    assert_eq!(args.resident_addr, Some("127.0.0.1:18460".parse().unwrap()));
+}
+
+#[test]
+fn admission_flags_are_atomic_and_loopback_only() {
+    let missing_resident = parse(&[
+        "corpus",
+        "--admission-queries",
+        "tools/lawdemo/cuyahoga_admission_queries.v1.jsonl",
+    ])
+    .unwrap_err();
+    assert!(missing_resident.message().contains("supplied together"));
+
+    let non_loopback = parse(&[
+        "corpus",
+        "--admission-queries",
+        "tools/lawdemo/cuyahoga_admission_queries.v1.jsonl",
+        "--resident-addr",
+        "10.0.0.1:18460",
+    ])
+    .unwrap_err();
+    assert!(non_loopback.message().contains("not loopback"));
 }
 
 #[test]
@@ -91,6 +125,7 @@ fn run_persists_kernel_and_index_then_reads_back_source_of_truth() {
             held_out_fraction: 1.0,
             top_k: 1,
             min_recall: 0.0,
+            ..KernelBuildArgs::default()
         },
     )
     .unwrap();
@@ -121,6 +156,7 @@ fn strict_gate_refines_members_before_persisting_artifacts() {
             held_out_fraction: 1.0,
             top_k: 1,
             min_recall: 1.0,
+            ..KernelBuildArgs::default()
         },
     )
     .unwrap();
@@ -154,12 +190,13 @@ fn zero_held_out_fraction_fails_closed_without_persisting_artifacts() {
             held_out_fraction: 0.0,
             top_k: 1,
             min_recall: 1.0,
+            ..KernelBuildArgs::default()
         },
     )
     .unwrap_err();
 
     assert_eq!(err.code(), "CALYX_RECALL_EMPTY_CORPUS");
-    assert!(!vault_dir.join("idx").exists());
+    assert!(!vault_dir.join("idx/kernel/CURRENT").exists());
 }
 
 #[test]
@@ -173,13 +210,14 @@ fn empty_graph_fails_closed_before_artifacts() {
             held_out_fraction: 1.0,
             top_k: 1,
             min_recall: 0.0,
+            ..KernelBuildArgs::default()
         },
     )
     .unwrap_err();
 
     assert_eq!(err.code(), "CALYX_CLI_USAGE_ERROR");
     assert!(err.message().contains("woven association graph"));
-    assert!(!vault_dir.join("idx").exists());
+    assert!(!vault_dir.join("idx/kernel/CURRENT").exists());
 }
 
 #[test]
@@ -193,13 +231,14 @@ fn unanchored_graph_fails_closed_before_artifacts() {
             held_out_fraction: 1.0,
             top_k: 1,
             min_recall: 0.0,
+            ..KernelBuildArgs::default()
         },
     )
     .unwrap_err();
 
     assert_eq!(err.code(), "CALYX_CLI_USAGE_ERROR");
     assert!(err.message().contains("no anchored nodes"));
-    assert!(!vault_dir.join("idx").exists());
+    assert!(!vault_dir.join("idx/kernel/CURRENT").exists());
 }
 
 #[test]
@@ -213,12 +252,13 @@ fn acyclic_selected_graph_fails_closed_without_member_substitution() {
             held_out_fraction: 1.0,
             top_k: 1,
             min_recall: 0.0,
+            ..KernelBuildArgs::default()
         },
     )
     .unwrap_err();
 
     assert_eq!(err.code(), "CALYX_KERNEL_EMPTY_RESULT");
-    assert!(!vault_dir.join("idx").exists());
+    assert!(!vault_dir.join("idx/kernel/CURRENT").exists());
 }
 
 #[derive(Clone, Copy)]
@@ -253,13 +293,29 @@ fn seed_home(
     )
     .unwrap();
 
+    let materialized = materialize_panel_template(&code_default(), 1).unwrap();
     let vault = AsterVault::new_durable(
         &vault_dir,
         vault_id,
         vault_salt(vault_id, name),
-        VaultOptions::default(),
+        VaultOptions {
+            panel: Some(materialized.panel.clone()),
+            ..VaultOptions::default()
+        },
     )
     .unwrap();
+    persist_vault_panel_state(&vault_dir, &materialized.panel, &materialized.registry).unwrap();
+    let embedding_slot = materialized
+        .panel
+        .slots
+        .iter()
+        .find(|slot| {
+            slot.state == SlotState::Active
+                && !slot.retrieval_only
+                && matches!(slot.shape, SlotShape::Dense(_))
+        })
+        .unwrap()
+        .slot_id;
     let graph = PlainGraph::new(&vault, DEFAULT_ASTER_ASSOC_COLLECTION).unwrap();
     if !matches!(shape, GraphShape::Empty) {
         for seed in 1..=30u8 {
@@ -288,6 +344,21 @@ fn seed_home(
             graph.put_edge(cx(2), "assoc", cx(3), b"1").unwrap();
         }
     }
+    let graph_source_seq = vault.latest_seq();
+    write_assoc_metadata(
+        &vault,
+        DEFAULT_ASTER_ASSOC_COLLECTION,
+        &AsterAssocMetadata {
+            retention_horizon: None,
+            embedding_slot: Some(embedding_slot),
+            panel_version: Some(u64::from(materialized.panel.version)),
+            graph_source_seq: Some(graph_source_seq),
+            knn: Some(16),
+            edge_cos_threshold: Some(0.5),
+        },
+    )
+    .unwrap();
+    graph.rebuild_csr(vault.snapshot()).unwrap();
     vault.flush().unwrap();
     (home, vault_dir)
 }
@@ -301,11 +372,8 @@ fn vault_id() -> VaultId {
 }
 
 fn only_kernel_id(vault_dir: &std::path::Path) -> CxId {
-    let kernel_root = vault_dir.join("idx").join("kernel");
-    let dirs = std::fs::read_dir(&kernel_root)
+    super::super::kernel_generation::load_current_generation(vault_dir)
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(dirs.len(), 1);
-    dirs[0].file_name().to_str().unwrap().parse().unwrap()
+        .manifest
+        .kernel_id
 }

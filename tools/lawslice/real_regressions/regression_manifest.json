@@ -1,0 +1,38 @@
+{
+  "case_count": 11,
+  "files": {
+    "opinion_regressions.json": {
+      "bytes": 241435,
+      "sha256": "ab8e66132ee5ba357297b2a5c9207e20e65737b52d1d41cfe86298609a3a511e"
+    }
+  },
+  "format": "calyx-courtlistener-real-regressions-v1",
+  "opinion_ids": [
+    2748659,
+    3713167,
+    3713168,
+    4636687,
+    4678958,
+    6227032,
+    8621357,
+    11171895,
+    11173418,
+    11227531,
+    11257339
+  ],
+  "source_archive": {
+    "name": "opinions-2026-06-30.csv.bz2",
+    "sha256": "65db4902a4ae42c48ef9958f52600dedca5401c194d3611d0b2672cfc6dd4d9c",
+    "snapshot_date": "2026-06-30"
+  },
+  "source_capture_manifest_sha256": "29b00999788ec867d9eea4b72c6a11e15b1f226aef0f976be7b245d4f58f6cbe",
+  "source_cluster_map": {
+    "name": "clusters_map.jsonl",
+    "sha256": "eb2d0a2bc0e12939d4ce9241a0d8ea131386a73f09b83eeafdd56ebd5b33f2e0"
+  },
+  "source_current_raw": {
+    "name": "opinions_cuyahoga.raw.jsonl",
+    "sha256": "f5fb5d26d6c4a7fcd7353f5c96033106af7a404df99e6d18a6cf5a3f6098d73e"
+  },
+  "source_of_truth": "regression_manifest.json"
+}

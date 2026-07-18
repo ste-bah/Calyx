@@ -87,7 +87,7 @@ pub fn constellation(
         cx_id,
         vault_id,
         panel_version: panel,
-        created_at: crate::support::living_concert::START_TS,
+        created_at: super::living_concert::START_TS,
         input_ref: InputRef {
             hash: *blake3::hash(&input.bytes).as_bytes(),
             pointer: input.pointer.clone(),

@@ -16,7 +16,11 @@ use calyx_core::CalyxError;
 use crate::error::{CliError, CliResult};
 
 pub(super) const PIN_BUDGET_ENV: &str = "CALYX_SEARCH_PIN_BUDGET_BYTES";
-const DEFAULT_PIN_BUDGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+// The accepted production law panel includes one verified 26.2 GB MaxSim
+// generation plus its dense and sparse siblings. Keep the default above that
+// physically derivable footprint so the supported ten-lens panel does not
+// require an undocumented process override.
+const DEFAULT_PIN_BUDGET_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const PIN_BUDGET_CODE: &str = "CALYX_SEARCH_PIN_BUDGET_EXCEEDED";
 const PIN_BUDGET_REMEDIATION: &str = "raise CALYX_SEARCH_PIN_BUDGET_BYTES for this process or retire/re-segment the oversized lens; pinned verified search indexes must fit the configured budget";
 
@@ -39,6 +43,13 @@ impl PinKey {
 
 type PinLedger = Mutex<BTreeMap<PinKey, u64>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PinBudgetPreflight {
+    pub(crate) required_bytes: u64,
+    pub(crate) projected_process_bytes: u64,
+    pub(crate) configured_bytes: u64,
+}
+
 fn ledger() -> &'static PinLedger {
     static LEDGER: OnceLock<PinLedger> = OnceLock::new();
     LEDGER.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -49,6 +60,51 @@ fn ledger() -> &'static PinLedger {
 /// process-wide budget would be exceeded.
 pub(super) fn reserve(key: &PinKey, bytes: u64) -> CliResult {
     reserve_in_ledger(ledger(), key, bytes, configured_pin_budget_bytes()?)
+}
+
+/// Fail before hashing or loading any sidecar when the selected immutable
+/// generation cannot fit the configured process pin budget. Requirements
+/// replace reservations for the same `(vault, slot, kind)` keys, matching the
+/// later `reserve` contract exactly.
+pub(super) fn preflight(
+    vault_dir: &Path,
+    requirements: &[(u16, &'static str, u64)],
+) -> CliResult<PinBudgetPreflight> {
+    let canonical = canonical_vault_dir(vault_dir)?;
+    let configured_bytes = configured_pin_budget_bytes()?;
+    let mut projected = ledger().lock().expect("pin ledger poisoned").clone();
+    let mut required_bytes = 0u64;
+    for &(slot, kind, bytes) in requirements {
+        required_bytes = required_bytes.checked_add(bytes).ok_or_else(|| {
+            pin_budget_error(format!(
+                "search pin preflight byte accounting overflowed for selected slot {slot} kind {kind}"
+            ))
+        })?;
+        projected.insert(
+            PinKey {
+                vault_dir: canonical.clone(),
+                slot,
+                kind,
+            },
+            bytes,
+        );
+    }
+    let projected_process_bytes = projected.values().try_fold(0u64, |total, bytes| {
+        total.checked_add(*bytes).ok_or_else(|| {
+            pin_budget_error("search pin preflight projected process byte accounting overflowed")
+        })
+    })?;
+    if projected_process_bytes > configured_bytes {
+        return Err(pin_budget_error(format!(
+            "search pin preflight for {} requires {required_bytes} bytes for the selected generation; projected process pinned total is {projected_process_bytes} bytes, exceeding configured budget {configured_bytes} bytes",
+            canonical
+        )));
+    }
+    Ok(PinBudgetPreflight {
+        required_bytes,
+        projected_process_bytes,
+        configured_bytes,
+    })
 }
 
 fn reserve_in_ledger(ledger: &PinLedger, key: &PinKey, bytes: u64, budget: u64) -> CliResult {

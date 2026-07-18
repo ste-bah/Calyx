@@ -12,7 +12,7 @@ use serde_json::json;
 use super::artifact::{Artifact, artifact};
 use super::fastembed::{FastembedCommission, cache_dir, common_root, copy_artifacts};
 use super::log::ConversionLog;
-use super::options::{CommissionFlags, CommissionRuntime};
+use super::options::{CommissionFlags, CommissionRuntime, qwen3_max_tokens_for_manifest};
 use crate::error::{CliError, CliResult};
 use crate::lens_commands::support::validate_vector_contract;
 
@@ -132,12 +132,13 @@ fn commission_qwen3(
     out: &Path,
     log: &mut ConversionLog,
 ) -> CliResult<FastembedCommission> {
-    let lens = FastembedQwen3Lens::from_model_id_with_policy(
+    let lens = FastembedQwen3Lens::from_model_id_with_policy_and_max_tokens(
         flags.lens_name(),
         &flags.hf,
         cache_dir(flags)?,
         CandleDevicePolicy::CudaFailLoud { ordinal: 0 },
         CandlePrecision::F16,
+        qwen3_max_tokens_for_manifest(flags).expect("qwen3 max_tokens is always resolved"),
     )?;
     let probe = Input::new(Modality::Text, b"Calyx Qwen3 commission probe".to_vec());
     let vector = lens.measure(&probe)?;

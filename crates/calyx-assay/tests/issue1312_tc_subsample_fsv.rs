@@ -10,7 +10,8 @@ use calyx_aster::cf::{CfRouter, ColumnFamily};
 use calyx_core::FixedClock;
 use serde_json::json;
 
-mod ph52_signal_support;
+// calyx-shared-module: path=ph52_signal_support/mod.rs alias=__calyx_shared_ph52_signal_support_mod_rs local=ph52_signal_support visibility=private
+use crate::__calyx_shared_ph52_signal_support_mod_rs as ph52_signal_support;
 
 use ph52_signal_support::noise;
 

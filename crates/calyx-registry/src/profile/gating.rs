@@ -5,6 +5,7 @@ use calyx_core::{CalyxError, Clock, LedgerRef, LensId, Panel, Result, SlotId, Sl
 use calyx_ledger::{ActorId, EntryKind, LedgerAppender, LedgerCfStore, SubjectId};
 use serde::{Deserialize, Serialize};
 
+use super::dense_matrix::DenseObservationMatrix;
 use super::reliability::signal_floor;
 use super::{CapabilityCard, CapabilitySignalKind, ProfileProbe, dense_projection};
 use crate::Registry;
@@ -205,10 +206,14 @@ fn lens_signature(
             "capability correlation requires at least three probes",
         ));
     }
+    let inputs = probes
+        .iter()
+        .map(|probe| probe.input.clone())
+        .collect::<Vec<_>>();
+    let measured = registry.measure_batch(lens_id, &inputs)?;
     let mut vectors = Vec::new();
-    for probe in probes {
-        let measured = registry.measure(lens_id, &probe.input)?;
-        if let Some(vector) = dense_projection(&measured)? {
+    for vector in measured {
+        if let Some(vector) = dense_projection(&vector)? {
             vectors.push(vector);
         }
     }
@@ -217,24 +222,8 @@ fn lens_signature(
             "capability correlation produced fewer than three vectors",
         ));
     }
-    ensure_same_dim(&vectors)?;
-    let mut signature = Vec::new();
-    for left in 0..vectors.len() {
-        for right in (left + 1)..vectors.len() {
-            signature.push(euclidean(&vectors[left], &vectors[right]));
-        }
-    }
-    Ok(signature)
-}
-
-fn ensure_same_dim(vectors: &[Vec<f32>]) -> Result<()> {
-    let dim = vectors[0].len();
-    if dim == 0 || vectors.iter().any(|vector| vector.len() != dim) {
-        return Err(CalyxError::lens_dim_mismatch(
-            "capability correlation vectors have inconsistent dimensions",
-        ));
-    }
-    Ok(())
+    let matrix = DenseObservationMatrix::from_vectors(vectors, Vec::new())?;
+    Ok(matrix.pairwise_distances()?.upper_triangle_signature())
 }
 
 fn pearson_abs(left: &[f32], right: &[f32]) -> Result<f32> {
@@ -269,17 +258,6 @@ fn pearson_abs(left: &[f32], right: &[f32]) -> Result<f32> {
 
 fn mean(values: &[f32]) -> f32 {
     values.iter().sum::<f32>() / values.len() as f32
-}
-
-fn euclidean(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| {
-            let delta = *left - *right;
-            delta * delta
-        })
-        .sum::<f32>()
-        .sqrt()
 }
 
 fn env_f32(name: &str, default: f32) -> Result<f32> {
@@ -458,6 +436,7 @@ mod tests {
             },
             health: crate::LensHealth::Loaded,
             low_spread,
+            execution: Default::default(),
         }
     }
 

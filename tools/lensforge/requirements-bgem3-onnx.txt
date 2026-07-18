@@ -1,0 +1,6 @@
+# Pinned build-only environment for tools/lensforge/bgem3_onnx_cuda.py.
+# Runtime inference is Rust/ONNX Runtime CUDA and does not import these packages.
+numpy==2.4.6
+onnx==1.22.0
+onnxconverter-common==1.16.0
+torch==2.12.0

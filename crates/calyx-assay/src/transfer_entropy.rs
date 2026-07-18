@@ -5,14 +5,19 @@
 //! returning provisional, code-tagged readbacks below quorum instead of
 //! silently treating underpowered streams as causal evidence.
 
+mod cuda;
+
 use rand::{SeedableRng, seq::SliceRandom};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
 use calyx_core::{CalyxError, Clock, Result, Ts};
 
+use crate::cuda_strict::strict_cuda_requested;
 use crate::estimate::TrustTag;
 use crate::ksg::{MIN_ASSAY_SAMPLES, ksg_mi_continuous_point};
+
+use self::cuda::transfer_entropy_with_config_cuda_strict_impl;
 
 pub type Timestamp = Ts;
 pub type RecurrenceStream = [(Timestamp, f32)];
@@ -92,6 +97,9 @@ pub fn transfer_entropy_with_config(
     clock: &dyn Clock,
     config: &TransferEntropyConfig,
 ) -> Result<TEResult> {
+    if strict_cuda_requested() {
+        return transfer_entropy_with_config_cuda_strict(stream_a, stream_b, lag, clock, config);
+    }
     validate_config(config)?;
     let forward = lagged_samples(stream_a, stream_b, lag, config.window_size)?;
     let reverse = lagged_samples(stream_b, stream_a, lag, config.window_size)?;
@@ -138,6 +146,16 @@ pub fn transfer_entropy_with_config(
         trust: TrustTag::Provisional,
         computed_at: clock.now(),
     })
+}
+
+pub fn transfer_entropy_with_config_cuda_strict(
+    stream_a: &RecurrenceStream,
+    stream_b: &RecurrenceStream,
+    lag: usize,
+    clock: &dyn Clock,
+    config: &TransferEntropyConfig,
+) -> Result<TEResult> {
+    transfer_entropy_with_config_cuda_strict_impl(stream_a, stream_b, lag, clock, config)
 }
 
 pub fn transfer_entropy_sweep(
@@ -384,18 +402,4 @@ fn insufficient(message: impl Into<String>) -> CalyxError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lagged_samples_condition_on_target_immediate_past_for_lag_gt_one() {
-        let source = (0..8).map(|t| (t, t as f32)).collect::<Vec<_>>();
-        let target = (0..8).map(|t| (t, 100.0 + t as f32)).collect::<Vec<_>>();
-
-        let samples = lagged_samples(&source, &target, 2, 1).unwrap();
-
-        assert_eq!(samples[1].future, vec![103.0]);
-        assert_eq!(samples[1].joint_past, vec![1.0, 102.0]);
-        assert_eq!(samples[1].own_past, vec![102.0]);
-    }
-}
+mod tests;

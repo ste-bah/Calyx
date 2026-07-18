@@ -14,10 +14,8 @@ use calyx_core::{Constellation, CxFlags, CxId, FixedClock, InputRef, LedgerRef, 
 use calyx_ledger::{ActorId, EntryKind, LedgerAppender, decode as decode_ledger};
 use calyx_registry::{AlgorithmicLens, Registry};
 use serde_json::{Value, json};
-
-#[allow(clippy::duplicate_mod)]
-#[path = "../fsv_support/mod.rs"]
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 
 pub const TEST_TS: u64 = 1_785_500_412;
 

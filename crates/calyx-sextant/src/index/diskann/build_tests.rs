@@ -72,6 +72,34 @@ fn build_with_progress_emits_vamana_batches_and_writes_physical_graph() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn cpu_rebuild_invalidates_prior_cagra_serving_asset() {
+    let root = temp_root("diskann-cagra-invalidation");
+    let path = root.join("graph.cda");
+    let asset = cagra_sidecar_path(&path);
+    let dataset_asset = cagra_dataset_sidecar_path(&path);
+    fs::write(&asset, b"stale-device-generation").expect("seed stale CAGRA asset");
+    fs::write(&dataset_asset, b"stale-dataset-generation").expect("seed stale CAGRA dataset asset");
+    let rows = vec![(0_u32, vec![0.0_f32, 1.0]), (1, vec![1.0, 0.0])];
+    let params = DiskAnnBuildParams {
+        dim: 2,
+        m_max: 1,
+        ef_construction: 4,
+        alpha: 1.2,
+    };
+
+    build_diskann_graph_with_backend(&path, &rows, params, DiskAnnBuildBackend::CpuVamana)
+        .expect("CPU rebuild");
+
+    assert!(path.is_file());
+    assert!(
+        !asset.exists(),
+        "CPU graph generation must make the stale CUDA asset unavailable"
+    );
+    assert!(!dataset_asset.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
 /// #1130 fail-closed contract: when the cuVS path is compiled out, selecting
 /// the cuvs-cagra backend must error BEFORE touching the filesystem, and the
 /// message must say exactly why it is absent — feature off vs an OS where

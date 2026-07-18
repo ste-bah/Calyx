@@ -1,12 +1,11 @@
-use std::collections::BTreeMap;
-
 use calyx_core::{CalyxError, LensId, Result};
 
 use crate::spec::LensHealth;
 
+use super::dense_matrix::{DenseObservationMatrix, PairwiseDistanceMatrix};
 use super::{
     CapabilityCard, CapabilitySignalKind, CostMetrics, CoverageMetrics, MetricSource,
-    ProfileOptions, SeparationMetrics, SpreadMetrics,
+    ProfileExecutionStats, ProfileOptions, SeparationMetrics, SpreadMetrics,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +24,7 @@ pub struct DenseProfileRequest<'a> {
     pub signal: Option<f32>,
     pub signal_kind: CapabilitySignalKind,
     pub health: LensHealth,
+    pub execution: ProfileExecutionStats,
 }
 
 pub(super) struct DenseCapabilityRequest {
@@ -36,6 +36,7 @@ pub(super) struct DenseCapabilityRequest {
     pub(super) signal_kind: CapabilitySignalKind,
     pub(super) health: LensHealth,
     pub(super) options: ProfileOptions,
+    pub(super) execution: super::ProfileExecutionStats,
 }
 
 pub fn profile_dense_vectors(request: DenseProfileRequest<'_>) -> Result<CapabilityCard> {
@@ -57,6 +58,7 @@ pub fn profile_dense_vectors(request: DenseProfileRequest<'_>) -> Result<Capabil
         signal_kind: request.signal_kind,
         health: request.health,
         options: ProfileOptions::default(),
+        execution: request.execution,
     })
 }
 
@@ -70,16 +72,19 @@ pub(super) fn dense_capability_card(request: DenseCapabilityRequest) -> Result<C
         signal_kind,
         health,
         options,
+        mut execution,
     } = request;
     if probe_count == 0 || observations.is_empty() {
         return Err(CalyxError::assay_insufficient_samples(
             "profile requires at least one measurable vector",
         ));
     }
-    ensure_same_dim(&observations)?;
-    let spread = spread_metrics(&observations);
-    let separation = separation_metrics(&observations);
-    let measured = observations.len();
+    let matrix = DenseObservationMatrix::from_observations(observations)?;
+    let distances = matrix.pairwise_distances()?;
+    execution = merge_execution(execution, distances.stats());
+    let spread = spread_metrics(&matrix, &distances);
+    let separation = separation_metrics(&matrix, &distances);
+    let measured = matrix.rows();
     let coverage = CoverageMetrics {
         requested: probe_count,
         measured,
@@ -116,35 +121,24 @@ pub(super) fn dense_capability_card(request: DenseCapabilityRequest) -> Result<C
         health,
         low_spread: spread.normalized_participation_ratio < options.low_spread_threshold
             || spread.mean_pairwise_distance < options.low_distance_threshold,
+        execution,
     })
 }
 
-fn ensure_same_dim(observations: &[Observation]) -> Result<()> {
-    let dim = observations[0].data.len();
-    if dim == 0 {
-        return Err(CalyxError::lens_dim_mismatch(
-            "profile vectors must have non-zero dimension",
-        ));
-    }
-    if observations.iter().all(|obs| obs.data.len() == dim) {
-        return Ok(());
-    }
-    Err(CalyxError::lens_dim_mismatch(
-        "profile vectors have inconsistent dimensions",
-    ))
-}
-
-fn spread_metrics(observations: &[Observation]) -> SpreadMetrics {
-    let dim = observations[0].data.len();
-    let mean = mean_vector(observations, dim);
+fn spread_metrics(
+    matrix: &DenseObservationMatrix,
+    distances: &PairwiseDistanceMatrix,
+) -> SpreadMetrics {
+    let dim = matrix.dim();
+    let mean = mean_vector(matrix);
     let mut variances = vec![0.0_f32; dim];
-    for obs in observations {
-        for (idx, value) in obs.data.iter().enumerate() {
+    for row in 0..matrix.rows() {
+        for (idx, value) in matrix.row(row).iter().enumerate() {
             let delta = *value - mean[idx];
             variances[idx] += delta * delta;
         }
     }
-    let inv_n = 1.0 / observations.len() as f32;
+    let inv_n = 1.0 / matrix.rows() as f32;
     for value in &mut variances {
         *value *= inv_n;
     }
@@ -162,7 +156,7 @@ fn spread_metrics(observations: &[Observation]) -> SpreadMetrics {
     } else {
         total_variance / max_variance
     };
-    let mean_pairwise_distance = mean_pairwise_distance(observations);
+    let mean_pairwise_distance = distances.mean_upper_triangle();
 
     SpreadMetrics {
         participation_ratio,
@@ -173,12 +167,15 @@ fn spread_metrics(observations: &[Observation]) -> SpreadMetrics {
     }
 }
 
-fn separation_metrics(observations: &[Observation]) -> SeparationMetrics {
-    let mean_pairwise_distance = mean_pairwise_distance(observations);
-    let groups = label_groups(observations);
+fn separation_metrics(
+    matrix: &DenseObservationMatrix,
+    distances: &PairwiseDistanceMatrix,
+) -> SeparationMetrics {
+    let mean_pairwise_distance = distances.mean_upper_triangle();
+    let groups = matrix.label_groups();
     let used_labels = groups.len() >= 2;
     let silhouette = if used_labels {
-        silhouette_score(observations, &groups)
+        silhouette_score(matrix, distances, &groups)
     } else {
         0.0
     };
@@ -197,65 +194,41 @@ fn separation_metrics(observations: &[Observation]) -> SeparationMetrics {
     }
 }
 
-fn mean_vector(observations: &[Observation], dim: usize) -> Vec<f32> {
-    let mut mean = vec![0.0_f32; dim];
-    for obs in observations {
-        for (dst, src) in mean.iter_mut().zip(&obs.data) {
+fn mean_vector(matrix: &DenseObservationMatrix) -> Vec<f32> {
+    let mut mean = vec![0.0_f32; matrix.dim()];
+    for row in 0..matrix.rows() {
+        for (dst, src) in mean.iter_mut().zip(matrix.row(row)) {
             *dst += *src;
         }
     }
-    let inv_n = 1.0 / observations.len() as f32;
+    let inv_n = 1.0 / matrix.rows() as f32;
     for value in &mut mean {
         *value *= inv_n;
     }
     mean
 }
 
-fn mean_pairwise_distance(observations: &[Observation]) -> f32 {
-    if observations.len() < 2 {
-        return 0.0;
-    }
+fn silhouette_score(
+    matrix: &DenseObservationMatrix,
+    distances: &PairwiseDistanceMatrix,
+    groups: &std::collections::BTreeMap<String, Vec<usize>>,
+) -> f32 {
     let mut sum = 0.0_f32;
     let mut count = 0_usize;
-    for left in 0..observations.len() {
-        for right in (left + 1)..observations.len() {
-            sum += euclidean(&observations[left].data, &observations[right].data);
-            count += 1;
-        }
-    }
-    sum / count as f32
-}
-
-fn label_groups(observations: &[Observation]) -> BTreeMap<String, Vec<usize>> {
-    let mut groups = BTreeMap::new();
-    for (idx, obs) in observations.iter().enumerate() {
-        if let Some(label) = &obs.label {
-            groups
-                .entry(label.clone())
-                .or_insert_with(Vec::new)
-                .push(idx);
-        }
-    }
-    groups
-}
-
-fn silhouette_score(observations: &[Observation], groups: &BTreeMap<String, Vec<usize>>) -> f32 {
-    let mut sum = 0.0_f32;
-    let mut count = 0_usize;
-    for (idx, obs) in observations.iter().enumerate() {
-        let Some(label) = &obs.label else {
+    for (idx, label) in matrix.labels().iter().enumerate() {
+        let Some(label) = label else {
             continue;
         };
         let Some(same) = groups.get(label) else {
             continue;
         };
-        let a = mean_distance_to_group(idx, observations, same, true);
+        let a = mean_distance_to_group(idx, distances, same, true);
         let mut b = f32::INFINITY;
         for (other_label, group) in groups {
             if other_label == label {
                 continue;
             }
-            b = b.min(mean_distance_to_group(idx, observations, group, false));
+            b = b.min(mean_distance_to_group(idx, distances, group, false));
         }
         let denom = a.max(b);
         let score = if denom <= f32::EPSILON {
@@ -271,7 +244,7 @@ fn silhouette_score(observations: &[Observation], groups: &BTreeMap<String, Vec<
 
 fn mean_distance_to_group(
     idx: usize,
-    observations: &[Observation],
+    distances: &PairwiseDistanceMatrix,
     group: &[usize],
     skip_self: bool,
 ) -> f32 {
@@ -281,21 +254,25 @@ fn mean_distance_to_group(
         if skip_self && other == idx {
             continue;
         }
-        sum += euclidean(&observations[idx].data, &observations[other].data);
+        sum += distances.get(idx, other);
         count += 1;
     }
     if count == 0 { 0.0 } else { sum / count as f32 }
 }
 
-fn euclidean(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(a, b)| {
-            let delta = *a - *b;
-            delta * delta
-        })
-        .sum::<f32>()
-        .sqrt()
+fn merge_execution(
+    mut base: ProfileExecutionStats,
+    pairwise: ProfileExecutionStats,
+) -> ProfileExecutionStats {
+    base.resident_matrices = pairwise.resident_matrices;
+    base.pairwise_distance_matrices = pairwise.pairwise_distance_matrices;
+    base.pairwise_distance_values = pairwise.pairwise_distance_values;
+    base.pairwise_distance_backend = pairwise.pairwise_distance_backend;
+    base.pairwise_tile_rows = pairwise.pairwise_tile_rows;
+    base.pairwise_tiles = pairwise.pairwise_tiles;
+    base.measured_rows = pairwise.measured_rows;
+    base.vector_dim = pairwise.vector_dim;
+    base
 }
 
 fn clamp01(value: f32) -> f32 {

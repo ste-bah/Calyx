@@ -2,8 +2,14 @@
 
 pub mod arrow;
 mod bloom;
+#[path = "io.rs"]
+mod io_helpers;
 pub mod level;
 mod page;
+mod point_read;
+mod reader_cache;
+
+pub use reader_cache::{invalidate_reader, shared_reader};
 
 use crate::mmap_col::MmapColumn;
 use bloom::BloomFilter;
@@ -13,6 +19,9 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use io_helpers::{record_crc, section_crc, storage_error, sync_parent};
+pub(crate) use point_read::{SstPointReader, SstStreamingReader};
 
 const MAGIC: &[u8; 4] = b"CXS1";
 const LEGACY_VERSION: u32 = 1;
@@ -58,6 +67,20 @@ pub(crate) struct SstLookupMetadata {
     pub(crate) first_key: Vec<u8>,
     pub(crate) last_key: Vec<u8>,
     bloom: BloomFilter,
+    index: Vec<IndexEntry>,
+}
+
+impl SstLookupMetadata {
+    pub(crate) fn record_offset(&self, key: &[u8]) -> Option<u64> {
+        self.index
+            .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+            .ok()
+            .map(|position| self.index[position].offset)
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.index.iter().map(|entry| entry.key.as_slice())
+    }
 }
 
 /// Memory-mapped SSTable reader.
@@ -229,6 +252,32 @@ impl SstReader {
         Ok(rows)
     }
 
+    /// Reads at most one record: the greatest key in the requested bound.
+    pub(crate) fn predecessor(
+        &self,
+        start: &[u8],
+        upper: &[u8],
+        inclusive: bool,
+    ) -> Result<Option<SstEntry>> {
+        let position = self.index.partition_point(|entry| {
+            if inclusive {
+                entry.key.as_slice() <= upper
+            } else {
+                entry.key.as_slice() < upper
+            }
+        });
+        let Some(entry) = position
+            .checked_sub(1)
+            .and_then(|index| self.index.get(index))
+        else {
+            return Ok(None);
+        };
+        if entry.key.as_slice() < start {
+            return Ok(None);
+        }
+        read_record(self.column.as_bytes(), entry.offset).map(Some)
+    }
+
     pub fn range_key_states(&self, start: &[u8], end: &[u8]) -> Result<Vec<SstKeyState>> {
         self.range_key_states_until(start, Some(end))
     }
@@ -262,6 +311,18 @@ impl SstReader {
             .collect()
     }
 
+    pub(crate) fn iter_with_offsets(&self) -> Result<Vec<(u64, SstEntry)>> {
+        self.index
+            .iter()
+            .map(|entry| {
+                Ok((
+                    entry.offset,
+                    read_record(self.column.as_bytes(), entry.offset)?,
+                ))
+            })
+            .collect()
+    }
+
     pub fn bloom_may_contain(&self, key: &[u8]) -> bool {
         self.bloom.may_contain(key)
     }
@@ -281,6 +342,7 @@ impl SstReader {
             first_key,
             last_key,
             bloom: self.bloom.clone(),
+            index: self.index.clone(),
         })
     }
 }
@@ -458,27 +520,6 @@ fn read_header(bytes: &[u8]) -> Result<Header> {
         index_offset,
         bloom_offset,
     })
-}
-
-fn section_crc(bytes: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(bytes);
-    hasher.finalize()
-}
-
-fn record_crc(key: &[u8], value: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(key);
-    hasher.update(value);
-    hasher.finalize()
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    crate::fsync::sync_parent(path, "SST")
-}
-
-fn storage_error(context: &str, error: io::Error) -> CalyxError {
-    CalyxError::disk_pressure(format!("{context}: {error}"))
 }
 
 #[cfg(test)]

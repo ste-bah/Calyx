@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "calyx-leapable"
 version.workspace = true
 edition.workspace = true
@@ -24,3 +25,19 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ulid = { workspace = true }
+
+# BEGIN generated integration harnesses (issue #1546)
+
+[[test]]
+name = "__calyx_integration_isolated_cx"
+path = "tests/__calyx_integration_isolated_cx.rs"
+
+[[test]]
+name = "__calyx_integration_isolated_stdio"
+path = "tests/__calyx_integration_isolated_stdio.rs"
+
+[[test]]
+name = "__calyx_integration_suite_0"
+path = "tests/__calyx_integration_suite_0.rs"
+
+# END generated integration harnesses (issue #1546)

@@ -20,6 +20,7 @@ use std::path::Path;
 use std::process::Command;
 
 use calyx_aster::cf::ColumnFamily;
+use calyx_aster::timetravel::read_all;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
     Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, SlotVector,
@@ -246,7 +247,7 @@ fn timetravel_readback_cli_fsv() {
         "must fail closed with CALYX_TIMETRAVEL_NO_DATA, got: {stderr}"
     );
 
-    // ==================== edge: corrupt time_index fails closed =============
+    // ============ edge: raw time_index corruption is rejected ==============
     {
         let vault = AsterVault::open(
             &vault_dir,
@@ -254,27 +255,35 @@ fn timetravel_readback_cli_fsv() {
             b"calyx-timetravel-readback".to_vec(),
             VaultOptions::default(),
         )
-        .expect("reopen vault to inject corrupt time_index row");
-        vault
+        .expect("reopen vault to attempt corrupt time_index row");
+        let before = read_all(&vault).expect("read valid time-index before rejected write");
+        let error = vault
             .write_cf(ColumnFamily::TimeIndex, vec![0_u8; 17], vec![0])
-            .expect("inject corrupt time_index key");
-        vault.flush().expect("flush corrupt key");
+            .expect_err("reserved time_index mutation must fail closed");
+        assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
+        let after = read_all(&vault).expect("read valid time-index after rejected write");
+        assert_eq!(
+            after, before,
+            "rejected write must not mutate source of truth"
+        );
+        println!(
+            "[edge] rejected raw time_index write: code={} rows_before={} rows_after={}",
+            error.code,
+            before.len(),
+            after.len()
+        );
     }
-    let corrupt_index = calyx()
+    let valid_index = calyx()
         .args(["readback", "time-index", "--vault", vault_arg])
         .output()
         .expect("spawn calyx");
     assert!(
-        !corrupt_index.status.success(),
-        "corrupt time-index readback must fail"
-    );
-    let corrupt_index_stderr = String::from_utf8_lossy(&corrupt_index.stderr);
-    assert!(
-        corrupt_index_stderr.contains("CALYX_ASTER_CORRUPT_SHARD"),
-        "time-index readback must expose corrupt shard, got: {corrupt_index_stderr}"
+        valid_index.status.success(),
+        "rejected mutation must leave time-index readable: {}",
+        String::from_utf8_lossy(&valid_index.stderr)
     );
 
-    let corrupt_asof = calyx()
+    let valid_asof = calyx()
         .args([
             "readback",
             "as-of",
@@ -286,13 +295,9 @@ fn timetravel_readback_cli_fsv() {
         .output()
         .expect("spawn calyx");
     assert!(
-        !corrupt_asof.status.success(),
-        "corrupt as-of readback must fail"
-    );
-    let corrupt_asof_stderr = String::from_utf8_lossy(&corrupt_asof.stderr);
-    assert!(
-        corrupt_asof_stderr.contains("CALYX_ASTER_CORRUPT_SHARD"),
-        "as-of readback must expose corrupt shard, got: {corrupt_asof_stderr}"
+        valid_asof.status.success(),
+        "rejected mutation must leave as-of readable: {}",
+        String::from_utf8_lossy(&valid_asof.stderr)
     );
 
     let _ = std::fs::remove_dir_all(&root);

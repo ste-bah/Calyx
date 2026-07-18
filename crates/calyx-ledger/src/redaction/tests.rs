@@ -72,6 +72,31 @@ fn check_payload_edges_are_fail_closed() {
 }
 
 #[test]
+fn public_identifier_check_matches_json_payload_policy() {
+    let generic_max = "generic-session-".to_string()
+        + &"a".repeat(MAX_UNCLASSIFIED_TOKEN_LEN - "generic-session-".len());
+    assert!(RedactionPolicy::check_public_identifier("session_id", &generic_max).is_ok());
+
+    let generic_over = "a".repeat(MAX_UNCLASSIFIED_TOKEN_LEN - 1) + "-x";
+    let direct = RedactionPolicy::check_public_identifier("session_id", &generic_over)
+        .expect_err("generic token at the secret boundary must fail");
+    let payload = serde_json::to_vec(&json!({"session_id": generic_over})).unwrap();
+    let encoded = RedactionPolicy::check_payload(&payload)
+        .expect_err("the same identifier in JSON must fail identically");
+    assert_eq!(direct.code, encoded.code);
+    assert_eq!(direct.message, encoded.message);
+
+    let recognized_hex = "a".repeat(64);
+    assert!(RedactionPolicy::check_public_identifier("session_id", &recognized_hex).is_ok());
+    assert!(
+        RedactionPolicy::check_payload(
+            &serde_json::to_vec(&json!({"session_id": recognized_hex})).unwrap()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn check_payload_allows_quant_slot_hex_metadata() {
     let bytes = serde_json::to_vec(
         &json!({"restore":{"candidate":{"metadata":{"quant_slot_0":"ab".repeat(128)}}}}),

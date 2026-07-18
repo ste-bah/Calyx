@@ -18,10 +18,8 @@ use calyx_ledger::{
     ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerRow, decode as decode_ledger,
 };
 use serde_json::{Value, json};
-
-#[allow(clippy::duplicate_mod)]
-#[path = "../fsv_support/mod.rs"]
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 #[allow(unused_imports)]
 pub use fsv_support::write_json;
 

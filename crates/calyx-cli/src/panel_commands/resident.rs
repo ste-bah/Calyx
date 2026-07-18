@@ -42,12 +42,14 @@ const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_MAX_RESIDENT_VRAM_MIB: u64 = 22 * 1024;
 const DEFAULT_RESIDENT_OVERHEAD_MULTIPLIER_MILLI: u64 = 2100;
 const DEFAULT_MAX_LOAD_SECS: u64 = 60;
+const DEFAULT_MAX_RUNTIME_BATCH: usize = 4;
 const CLIENT_TIMEOUT_SECS: u64 = 30;
 const CLIENT_TIMEOUT_REMEDIATION: &str =
     "start `calyx panel resident serve` on the requested loopback address";
 const RESIDENT_BINARY_MAGIC: &[u8] = b"CALYX_PANEL_RESIDENT_BIN1\n";
 const MAX_RESIDENT_SERVICE_FRAME_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+mod capacity;
 mod client;
 mod codec;
 mod dispatch;

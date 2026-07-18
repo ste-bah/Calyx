@@ -10,7 +10,7 @@
 //! and fail closed instead of writing to a cwd-dependent location.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// The workspace-wide FSV evidence root variable.
 pub const FSV_ROOT_ENV: &str = "CALYX_FSV_ROOT";
@@ -90,6 +90,45 @@ pub fn fsv_root(var: &str) -> Option<PathBuf> {
 /// [`fsv_root`] with a caller-owned fallback for when `var` is unset.
 pub fn fsv_root_or_else(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
     fsv_root(var).unwrap_or_else(fallback)
+}
+
+/// Resolves a per-test FSV root without writing below a read-only source tree.
+///
+/// An explicit `var` remains authoritative. Otherwise an absolute
+/// `CARGO_TARGET_DIR` receives a unique `fsv/<namespace>` child; when Cargo
+/// supplies no target override, the caller-owned local fallback is retained.
+pub fn fsv_root_or_target(
+    var: &str,
+    namespace: &str,
+    fallback: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    if let Some(root) = fsv_root(var) {
+        return root;
+    }
+    cargo_target_fsv_root_from(std::env::var_os("CARGO_TARGET_DIR"), namespace)
+        .unwrap_or_else(fallback)
+}
+
+fn cargo_target_fsv_root_from(target: Option<OsString>, namespace: &str) -> Option<PathBuf> {
+    let mut components = Path::new(namespace).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        panic!(
+            "CALYX_FSV_NAMESPACE_INVALID namespace={namespace:?} remediation=\"use one stable path component\""
+        );
+    }
+    let target = target?;
+    if target.is_empty() {
+        panic!(
+            "CALYX_CARGO_TARGET_DIR_EMPTY remediation=\"unset CARGO_TARGET_DIR or set it to an absolute path\""
+        );
+    }
+    let target = PathBuf::from(target);
+    if !target.is_absolute() {
+        panic!(
+            "CALYX_CARGO_TARGET_DIR_NOT_ABSOLUTE value={target:?} remediation=\"set CARGO_TARGET_DIR to an absolute path\""
+        );
+    }
+    Some(target.join("fsv").join(namespace))
 }
 
 /// [`fsv_root`] for manual-FSV tests that cannot run without an operator
@@ -176,6 +215,35 @@ mod tests {
             panic!("fallback must not run when the variable is set")
         });
         assert_eq!(resolved, root);
+    }
+
+    #[test]
+    fn absolute_cargo_target_gets_unique_fsv_namespace() {
+        let target = std::env::temp_dir().join("calyx-fsv-target");
+        let resolved =
+            cargo_target_fsv_root_from(Some(target.clone().into_os_string()), "issue1686-proof");
+        assert_eq!(resolved, Some(target.join("fsv/issue1686-proof")));
+    }
+
+    #[test]
+    fn absent_cargo_target_uses_caller_fallback() {
+        assert_eq!(cargo_target_fsv_root_from(None, "issue1686-fallback"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "CALYX_FSV_NAMESPACE_INVALID")]
+    fn cargo_target_namespace_rejects_parent_traversal() {
+        let target = std::env::temp_dir().into_os_string();
+        let _ = cargo_target_fsv_root_from(Some(target), "../escape");
+    }
+
+    #[test]
+    #[should_panic(expected = "CALYX_CARGO_TARGET_DIR_NOT_ABSOLUTE")]
+    fn relative_cargo_target_fails_closed() {
+        let _ = cargo_target_fsv_root_from(
+            Some(OsString::from("relative-target")),
+            "issue1686-relative",
+        );
     }
 
     #[cfg(windows)]

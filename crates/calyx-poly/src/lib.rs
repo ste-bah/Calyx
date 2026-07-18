@@ -103,6 +103,7 @@ pub mod edge_audit;
 pub mod encode;
 pub mod entity_graph_edges;
 pub mod error;
+pub mod exact_knn;
 pub mod external_kalshi_feed;
 mod external_kalshi_feed_parse;
 mod external_kalshi_feed_types;

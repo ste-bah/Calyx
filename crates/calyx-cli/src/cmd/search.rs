@@ -1,11 +1,20 @@
 mod engine;
+mod kernel_answer;
+mod kernel_citation_answer;
+mod kernel_reproduce;
+mod kernel_source_support;
 mod output;
 mod parse;
+mod roster;
 
 pub(crate) use calyx_search::{PersistedSearchIndexes, load_docs};
-pub(crate) use parse::{KernelAnswerArgs, SearchArgs, parse_resident_addr};
+pub(crate) use kernel_citation_answer::rederive_kernel_citation_answer_hash;
+pub(crate) use kernel_reproduce::rederive_kernel_answer_hash;
 #[cfg(test)]
-pub(crate) use parse::{SearchFreshnessArg, SearchFusionArg, SearchGuardArg};
+pub(crate) use parse::{
+    DEFAULT_KERNEL_MAX_HOPS, SearchFreshnessArg, SearchFusionArg, SearchGuardArg,
+};
+pub(crate) use parse::{KernelAnswerArgs, SearchArgs, parse_resident_addr};
 
 use super::vault::{home_dir, resolve_vault_info, vault_salt};
 use super::{Subcommand, VaultRefArgs};
@@ -13,11 +22,53 @@ use crate::bounded_progress::ProgressSink;
 use crate::error::{CliError, CliResult};
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
+use calyx_core::SlotId;
 use calyx_registry::{load_vault_panel_state, require_vault_registry_contracts};
 use serde_json::json;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) fn measure_kernel_calibration_query(
+    state: &calyx_registry::VaultPanelState,
+    resolved: &super::vault::ResolvedVault,
+    query: &str,
+    resident_addr: SocketAddr,
+    embedding_slots: &[SlotId],
+) -> CliResult<calyx_lodestar::PanelVectors> {
+    let roster = roster::SearchTextRoster::derive(state);
+    let vectors = kernel_answer::measure_kernel_query_vectors(
+        state,
+        &roster,
+        resolved,
+        query,
+        Some(resident_addr),
+    )?;
+    let measured = vectors
+        .into_iter()
+        .filter(|(slot, _)| embedding_slots.contains(slot))
+        .map(|(slot, vector)| {
+            let dense = vector.as_dense().map(ToOwned::to_owned).ok_or_else(|| {
+                CliError::runtime(format!(
+                    "kernel admission graph slot {slot} returned a non-dense vector"
+                ))
+            })?;
+            Ok((slot, dense))
+        })
+        .collect::<CliResult<calyx_lodestar::PanelVectors>>()?;
+    if measured.keys().copied().ne(embedding_slots.iter().copied()) {
+        return Err(CliError::runtime(format!(
+            "kernel admission measured slots {:?}, expected sealed graph slots {:?}",
+            measured.keys().map(|slot| slot.get()).collect::<Vec<_>>(),
+            embedding_slots
+                .iter()
+                .map(|slot| slot.get())
+                .collect::<Vec<_>>()
+        )));
+    }
+    Ok(measured)
+}
 
 pub(crate) fn run(command: Subcommand) -> CliResult {
     match command {
@@ -52,10 +103,12 @@ fn run_rebuild_search_index(args: VaultRefArgs) -> CliResult {
             "progress_artifact": progress_path.display().to_string(),
         }),
     )?;
-    let rebuild =
-        calyx_search::rebuild_for_vault_with_fallible_progress(&resolved.path, &vault, |event| {
-            emit_rebuild_progress(&mut progress, event).map_err(search_progress_error)
-        });
+    let rebuild = calyx_search::rebuild_for_vault_with_panel_state_fallible_progress(
+        &resolved.path,
+        &vault,
+        &state,
+        |event| emit_rebuild_progress(&mut progress, event).map_err(search_progress_error),
+    );
     if let Err(error) = rebuild {
         let cli_error = CliError::from(error);
         let _ = emit_rebuild_progress_record(
@@ -97,7 +150,10 @@ fn run_rebuild_search_index(args: VaultRefArgs) -> CliResult {
 }
 
 pub(crate) fn rebuild_persistent_indexes(vault_dir: &Path, vault: &AsterVault) -> CliResult {
-    Ok(calyx_search::rebuild_for_vault(vault_dir, vault)?)
+    let state = load_vault_panel_state(vault_dir)?;
+    Ok(calyx_search::rebuild_for_vault_with_panel_state(
+        vault_dir, vault, &state,
+    )?)
 }
 
 fn rebuild_progress_path(vault_dir: &Path) -> CliResult<PathBuf> {
@@ -154,17 +210,30 @@ fn emit_rebuild_progress_record(
     progress.emit(value)
 }
 
-pub(crate) fn rebuild_persistent_indexes_with_progress<F>(
+pub(crate) fn rebuild_persistent_indexes_with_fallible_progress<F>(
     vault_dir: &Path,
     vault: &AsterVault,
-    progress: F,
+    state: &calyx_registry::VaultPanelState,
+    mut progress: F,
 ) -> CliResult
 where
-    F: FnMut(calyx_search::RebuildProgress<'_>) + Send,
+    F: FnMut(calyx_search::RebuildProgress<'_>) -> CliResult + Send,
 {
-    Ok(calyx_search::rebuild_for_vault_with_progress(
-        vault_dir, vault, progress,
-    )?)
+    Ok(
+        calyx_search::rebuild_for_vault_with_panel_state_fallible_progress(
+            vault_dir,
+            vault,
+            state,
+            |event| {
+                progress(event).map_err(|error| calyx_core::CalyxError {
+                    code: error.code(),
+                    message: error.message().to_string(),
+                    remediation: error.remediation(),
+                })?;
+                Ok(())
+            },
+        )?,
+    )
 }
 
 pub(super) fn latest_read_vault_options_for_cfs(

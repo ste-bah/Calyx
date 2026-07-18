@@ -1,8 +1,8 @@
 #![cfg(feature = "fsv")]
 
 #[allow(dead_code)]
-#[path = "support/real_corpora.rs"]
-mod real_corpora;
+// calyx-shared-module: path=support/real_corpora.rs alias=__calyx_shared_support_real_corpora_rs local=real_corpora visibility=private
+use crate::__calyx_shared_support_real_corpora_rs as real_corpora;
 
 use std::fs;
 use std::path::{Path, PathBuf};

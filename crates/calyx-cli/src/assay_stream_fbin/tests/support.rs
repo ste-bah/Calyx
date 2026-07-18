@@ -349,6 +349,7 @@ fn learned_manifest(root: &Path, idx: usize, matrix: &[u8], tokenizer: &[u8]) ->
         truncate_dim: None,
         recall_delta: calyx_registry::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
     fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
@@ -380,6 +381,7 @@ fn write_algorithmic_manifests(root: &Path, count: usize) -> Vec<PathBuf> {
                 truncate_dim: None,
                 recall_delta: calyx_registry::spec::default_recall_delta(),
                 max_batch: None,
+                max_tokens: None,
                 batch_policy: None,
             };
             fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();

@@ -4,7 +4,7 @@ use std::fs;
 use std::io::BufRead;
 use std::path::Path;
 
-use calyx_core::Anchor;
+use calyx_core::{Anchor, CalyxError};
 use serde::Deserialize;
 
 use super::super::vault::now_ms;
@@ -17,6 +17,8 @@ use crate::error::{CliError, CliResult};
 /// JSONL line does not name its own `source`. Distinguishes ingest-time grounding
 /// from a post-hoc `calyx anchor` seal (`calyx-cli`).
 const DEFAULT_INGEST_ANCHOR_SOURCE: &str = "calyx-ingest";
+const CALYX_INGEST_BATCH_INVALID: &str = "CALYX_INGEST_BATCH_INVALID";
+const INVALID_BATCH_REMEDIATION: &str = "repair the JSON object at the named JSONL line and parser column, preserving exactly one complete UTF-8 JSON object per line, then rerun ingest";
 
 /// One typed anchor on a batch JSONL line. The feeder/corpus-builder decides what
 /// to attach (e.g. the QA correct-answer as `label:answer`, the source domain as
@@ -81,8 +83,8 @@ pub(super) fn parse_batch_line(index: usize, line: &str) -> CliResult<Option<Bat
     if line.trim().is_empty() {
         return Ok(None);
     }
-    let parsed: BatchLine = serde_json::from_str(line)
-        .map_err(|err| CliError::io(format!("batch JSONL line {} is invalid: {err}", index + 1)))?;
+    let parsed: BatchLine =
+        serde_json::from_str(line).map_err(|error| invalid_batch(index + 1, error.to_string()))?;
     validate_text(&parsed.text)?;
     let metadata = validate_provenance(index, parsed.metadata)?;
     let mut anchors = Vec::with_capacity(parsed.anchors.len());
@@ -111,13 +113,26 @@ pub(super) fn validate_batch_file(path: &Path) -> CliResult<BatchValidation> {
     };
     for (index, line) in reader.lines().enumerate() {
         validation.line_count = index + 1;
-        let line =
-            line.map_err(|err| CliError::io(format!("read batch line {}: {err}", index + 1)))?;
+        let line = line.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                invalid_batch(index + 1, format!("line is not valid UTF-8: {error}"))
+            } else {
+                CliError::io(format!("read batch line {}: {error}", index + 1))
+            }
+        })?;
         if parse_batch_line(index, &line)?.is_some() {
             validation.row_count += 1;
         }
     }
     Ok(validation)
+}
+
+fn invalid_batch(line: usize, detail: impl std::fmt::Display) -> CliError {
+    CliError::from(CalyxError {
+        code: CALYX_INGEST_BATCH_INVALID,
+        message: format!("batch JSONL line {line} is invalid: {detail}"),
+        remediation: INVALID_BATCH_REMEDIATION,
+    })
 }
 
 fn validate_provenance(

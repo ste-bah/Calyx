@@ -3,10 +3,10 @@
 //! Source of truth: one persisted CalyxNative forecast artifact, one pending ledger row, and the
 //! crypto capture state JSON that carries the artifact hash forward for later first-light audit.
 
-#[path = "live_calyx_native_evidence_support.rs"]
-mod evidence_support;
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=live_calyx_native_evidence_support.rs alias=__calyx_shared_live_calyx_native_evidence_support_rs local=evidence_support visibility=private
+use crate::__calyx_shared_live_calyx_native_evidence_support_rs as evidence_support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use std::fs;
 use std::path::Path;

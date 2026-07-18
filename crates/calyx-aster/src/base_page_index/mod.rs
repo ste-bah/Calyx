@@ -15,31 +15,35 @@ mod types;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use calyx_core::{CalyxError, Result};
 
 use crate::cf::ColumnFamily;
 use crate::ledger_head::read_head_anchor;
+use crate::manifest::ManifestStore;
 use crate::mvcc::is_tombstone_value;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::storage_names::sst_order_key;
-use crate::vault::encode::decode_write_batch;
-use crate::wal::stream_records;
+use crate::vault::encode::decode_write_batch_refs;
+use crate::wal::stream_records_after;
 
 use format::{
     corrupt, decode_hex, hex_bytes, missing, now_ms, relative_path, remove_path, sha256_hex, stale,
-    sync_parent, write_bytes_file, write_json_file,
+    sync_parent, write_bytes_file, write_json_file, write_json_file_atomic,
 };
-use readback::{read_page, read_source_value, validate_entry_value};
+use readback::{read_page, visit_source_values};
 use sst_scan::list_base_sst_files;
 pub use types::{
-    BASE_PAGE_INDEX_DIR, BASE_PAGE_INDEX_MANIFEST, BasePageIndexBuildProgress, BasePageIndexEntry,
-    BasePageIndexManifest, BasePageIndexPage, BasePageIndexPageRef, BasePageIndexSource,
-    DEFAULT_BASE_PAGE_INDEX_PAGE_SIZE,
+    BASE_PAGE_INDEX_DIR, BASE_PAGE_INDEX_GENERATIONS_DIR, BASE_PAGE_INDEX_MANIFEST,
+    BasePageIndexBuildProgress, BasePageIndexEntry, BasePageIndexManifest, BasePageIndexPage,
+    BasePageIndexPageRef, BasePageIndexSource, DEFAULT_BASE_PAGE_INDEX_PAGE_SIZE,
 };
 #[cfg(test)]
 use types::{CORRUPT_CODE, MISSING_CODE, STALE_CODE};
-use types::{INDEX_MAGIC, INDEX_VERSION};
+use types::{GENERATION_INDEX_VERSION, INDEX_MAGIC, INDEX_VERSION, LEGACY_INDEX_VERSION};
+
+static GENERATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 struct IndexedValue {
@@ -53,6 +57,13 @@ struct BuildSnapshot {
     ledger_head_tip_hash_hex: String,
     base_sst_files: usize,
     wal_records: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationBoundary {
+    GenerationManifestSynced,
+    GenerationPublished,
+    CommitPointPublished,
 }
 
 pub fn build_base_page_index(
@@ -79,21 +90,22 @@ pub fn build_base_page_index(
                 file.display()
             ))
         })?;
-        let source = BasePageIndexSource::Sst {
-            path: relative_path(vault, file),
-            order_epoch: order.epoch,
-            order_seq: order.seq,
-            order_class_rank: order.class_rank,
-            order_index: order.index,
-        };
-        for entry in SstReader::open(file)?.iter()? {
+        let path = relative_path(vault, file);
+        for (record_offset, entry) in shared_reader(file)?.iter_with_offsets()? {
             let tombstoned = is_tombstone_value(&entry.value);
             rows.insert(
                 entry.key,
                 IndexedValue {
                     value_sha256_hex: sha256_hex(&entry.value),
                     tombstoned,
-                    source: source.clone(),
+                    source: BasePageIndexSource::Sst {
+                        path: path.clone(),
+                        order_epoch: order.epoch,
+                        order_seq: order.seq,
+                        order_class_rank: order.class_rank,
+                        order_index: order.index,
+                        record_offset: Some(record_offset),
+                    },
                 },
             );
         }
@@ -107,22 +119,32 @@ pub fn build_base_page_index(
         }
     }
 
-    let wal_records = stream_records(vault.join("wal"), |record| {
-        for row in decode_write_batch(&record.payload)? {
+    let durable_seq = ManifestStore::open(vault).load_current()?.durable_seq;
+    let wal_records = stream_records_after(vault.join("wal"), durable_seq, |record| {
+        for row in decode_write_batch_refs(&record.payload)? {
             if row.cf != ColumnFamily::Base {
                 continue;
             }
-            let tombstoned = is_tombstone_value(&row.value);
+            let tombstoned = is_tombstone_value(row.value);
+            let encoded_offset = u64::try_from(row.encoded_offset).map_err(|_| {
+                corrupt("encoded WAL write-row offset exceeds u64 during Base index build")
+            })?;
+            let row_offset = record
+                .start_offset
+                .checked_add(crate::wal::RECORD_HEADER_BYTES)
+                .and_then(|offset| offset.checked_add(encoded_offset))
+                .ok_or_else(|| corrupt("physical WAL Base row offset overflow"))?;
             rows.insert(
-                row.key,
+                row.key.to_vec(),
                 IndexedValue {
-                    value_sha256_hex: sha256_hex(&row.value),
+                    value_sha256_hex: sha256_hex(row.value),
                     tombstoned,
                     source: BasePageIndexSource::Wal {
                         path: relative_path(vault, &record.segment_path),
                         seq: record.seq,
                         start_offset: record.start_offset,
                         end_offset: record.end_offset,
+                        row_offset: Some(row_offset),
                     },
                 },
             );
@@ -160,6 +182,7 @@ pub fn read_indexed_base_rows(vault: &Path, limit: usize) -> Result<BTreeMap<Vec
     let _guard = crate::file_lock::FileLockGuard::acquire(&durable_commit_lock_path(vault))?;
     let manifest = read_manifest_file(&manifest_path(vault))?;
     validate_current_head(vault, &manifest)?;
+    validate_current_read_format(&manifest)?;
     let mut rows = BTreeMap::new();
     for page_ref in &manifest.pages {
         for (key, value) in read_live_page_rows(vault, page_ref)? {
@@ -178,30 +201,77 @@ pub fn read_indexed_base_rows_for_keys(
     vault: &Path,
     keys: &[Vec<u8>],
 ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+    let mut rows = BTreeMap::new();
+    visit_indexed_base_rows_for_keys(vault, keys, |key, value| {
+        rows.insert(key.to_vec(), value);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectedBaseRowsVisit {
+    pub unique_keys: usize,
+    pub touched_pages: usize,
+    pub source_files: usize,
+    pub live_rows: usize,
+    pub missing_rows: usize,
+}
+
+/// Visit selected Base rows without retaining their complete values.
+///
+/// Requested keys are sorted and deduplicated, each touched page is decoded
+/// once, and backing files are opened once in physical-offset order. Visitor
+/// order is therefore physical rather than key order. Every source value is
+/// hash-validated before the visitor receives ownership, and is dropped before
+/// the next row unless the visitor deliberately retains it.
+pub fn visit_indexed_base_rows_for_keys<E>(
+    vault: &Path,
+    keys: &[Vec<u8>],
+    mut visitor: impl FnMut(&[u8], Option<Vec<u8>>) -> std::result::Result<(), E>,
+) -> std::result::Result<SelectedBaseRowsVisit, E>
+where
+    E: From<CalyxError>,
+{
     let _guard = crate::file_lock::FileLockGuard::acquire(&durable_commit_lock_path(vault))?;
     let manifest = read_manifest_file(&manifest_path(vault))?;
     validate_current_head(vault, &manifest)?;
-    let mut rows = keys
-        .iter()
-        .map(|key| (key.clone(), None))
-        .collect::<BTreeMap<_, _>>();
-    for key in keys {
+    validate_current_read_format(&manifest)?;
+    let unique_keys = keys.iter().collect::<std::collections::BTreeSet<_>>();
+    let mut stats = SelectedBaseRowsVisit {
+        unique_keys: unique_keys.len(),
+        ..SelectedBaseRowsVisit::default()
+    };
+    let mut cached_page = None::<(usize, BasePageIndexPage)>;
+    let mut selected = Vec::new();
+    for key in unique_keys {
         let key_hex = hex_bytes(key);
-        let Some(page_ref) = manifest.pages.iter().find(|page| {
+        let Some(page_index) = manifest.pages.iter().position(|page| {
             page.first_key_hex.as_str() <= key_hex.as_str()
                 && key_hex.as_str() <= page.last_key_hex.as_str()
         }) else {
+            stats.missing_rows += 1;
+            visitor(key, None)?;
             continue;
         };
-        let page = read_page(vault, page_ref)?;
+        if cached_page.as_ref().map(|(index, _)| *index) != Some(page_index) {
+            cached_page = Some((page_index, read_page(vault, &manifest.pages[page_index])?));
+            stats.touched_pages += 1;
+        }
+        let page = &cached_page.as_ref().expect("selected page is cached").1;
         let Some(entry) = page.entries.iter().find(|entry| entry.key_hex == key_hex) else {
+            stats.missing_rows += 1;
+            visitor(key, None)?;
             continue;
         };
-        let value = read_source_value(vault, key, &entry.source)?;
-        validate_entry_value(entry, &value)?;
-        rows.insert(key.clone(), Some(value));
+        selected.push((key.clone(), entry.clone()));
     }
-    Ok(rows)
+    let source_stats = visit_source_values(vault, selected, |key, value| {
+        stats.live_rows += 1;
+        visitor(key, Some(value))
+    })?;
+    stats.source_files = source_stats.source_files;
+    Ok(stats)
 }
 
 pub fn visit_indexed_base_row_pages<E>(
@@ -214,6 +284,7 @@ where
     let _guard = crate::file_lock::FileLockGuard::acquire(&durable_commit_lock_path(vault))?;
     let manifest = read_manifest_file(&manifest_path(vault))?;
     validate_current_head(vault, &manifest)?;
+    validate_current_read_format(&manifest)?;
     let mut live_rows = 0usize;
     for page_ref in &manifest.pages {
         let rows = read_live_page_rows(vault, page_ref)?;
@@ -236,6 +307,12 @@ pub fn advance_base_page_index_head_if_base_unchanged(vault: &Path) -> Result<bo
     }
     let _guard = crate::file_lock::FileLockGuard::acquire(&durable_commit_lock_path(vault))?;
     let mut manifest = read_manifest_file(&path)?;
+    if manifest.version != INDEX_VERSION {
+        return Err(stale(format!(
+            "Base page index version {} cannot advance to a new ledger head; rebuild current version {INDEX_VERSION} first",
+            manifest.version
+        )));
+    }
     let current_base_sst_files = list_base_sst_files(vault)?.len();
     if current_base_sst_files != manifest.base_sst_files {
         return Err(stale(format!(
@@ -255,8 +332,13 @@ pub fn advance_base_page_index_head_if_base_unchanged(vault: &Path) -> Result<bo
     }
     manifest.ledger_head_height = height;
     manifest.ledger_head_tip_hash_hex = tip_hash_hex;
-    write_json_file(&path, &manifest)?;
-    sync_parent(&path)?;
+    write_json_file_atomic(&path, &manifest)?;
+    let published = read_manifest_file(&path)?;
+    if published != manifest {
+        return Err(corrupt(
+            "Base page index head advance commit point did not read back byte-equivalent state",
+        ));
+    }
     Ok(true)
 }
 
@@ -265,14 +347,45 @@ fn write_index(
     page_size: usize,
     rows: BTreeMap<Vec<u8>, IndexedValue>,
     snapshot: BuildSnapshot,
-    mut progress: impl FnMut(BasePageIndexBuildProgress) -> Result<()>,
+    progress: impl FnMut(BasePageIndexBuildProgress) -> Result<()>,
 ) -> Result<BasePageIndexManifest> {
-    let tmp = vault.join(format!(".{BASE_PAGE_INDEX_DIR}.{}.tmp", std::process::id()));
-    if tmp.exists() {
-        remove_path(&tmp)?;
-    }
-    fs::create_dir_all(&tmp)
-        .map_err(|error| CalyxError::disk_pressure(format!("create Base page index: {error}")))?;
+    write_index_with_hook(vault, page_size, rows, snapshot, progress, |_| Ok(()))
+}
+
+fn write_index_with_hook(
+    vault: &Path,
+    page_size: usize,
+    rows: BTreeMap<Vec<u8>, IndexedValue>,
+    snapshot: BuildSnapshot,
+    mut progress: impl FnMut(BasePageIndexBuildProgress) -> Result<()>,
+    mut publication_hook: impl FnMut(PublicationBoundary) -> Result<()>,
+) -> Result<BasePageIndexManifest> {
+    let built_at_unix_ms = now_ms()?;
+    let generation = format!(
+        "generation-{:020}-{:032}-{:010}-{:020}",
+        snapshot.ledger_head_height,
+        built_at_unix_ms,
+        std::process::id(),
+        GENERATION_NONCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let index_root = vault.join(BASE_PAGE_INDEX_DIR);
+    let generations_root = index_root.join(BASE_PAGE_INDEX_GENERATIONS_DIR);
+    fs::create_dir_all(&generations_root).map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "create Base page index generations directory {}: {error}",
+            generations_root.display()
+        ))
+    })?;
+    sync_parent(&index_root)?;
+    sync_parent(&generations_root)?;
+    let staging = generations_root.join(format!(".{generation}.tmp"));
+    fs::create_dir(&staging).map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "create-new Base page index generation staging directory {}: {error}",
+            staging.display()
+        ))
+    })?;
+    let published_prefix = format!("{BASE_PAGE_INDEX_GENERATIONS_DIR}/{generation}");
     let mut pages = Vec::new();
     let mut chunk = Vec::with_capacity(page_size);
     let mut page_index = 0;
@@ -290,7 +403,13 @@ fn write_index(
             source: indexed.source,
         });
         if chunk.len() == page_size {
-            write_page(&tmp, page_index, std::mem::take(&mut chunk), &mut pages)?;
+            write_page(
+                &staging,
+                &published_prefix,
+                page_index,
+                std::mem::take(&mut chunk),
+                &mut pages,
+            )?;
             emit_page_progress(
                 &mut progress,
                 page_index,
@@ -300,7 +419,7 @@ fn write_index(
         }
     }
     if !chunk.is_empty() {
-        write_page(&tmp, page_index, chunk, &mut pages)?;
+        write_page(&staging, &published_prefix, page_index, chunk, &mut pages)?;
         emit_page_progress(
             &mut progress,
             page_index,
@@ -310,6 +429,7 @@ fn write_index(
     let manifest = BasePageIndexManifest {
         magic: INDEX_MAGIC.to_string(),
         version: INDEX_VERSION,
+        generation: Some(generation.clone()),
         ledger_head_height: snapshot.ledger_head_height,
         ledger_head_tip_hash_hex: snapshot.ledger_head_tip_hash_hex,
         page_size,
@@ -318,21 +438,29 @@ fn write_index(
         tombstone_entries: total_entries.saturating_sub(live_entries),
         base_sst_files: snapshot.base_sst_files,
         wal_records: snapshot.wal_records,
-        built_at_unix_ms: now_ms()?,
+        built_at_unix_ms,
         pages,
     };
-    write_json_file(&tmp.join(BASE_PAGE_INDEX_MANIFEST), &manifest)?;
-    let final_dir = vault.join(BASE_PAGE_INDEX_DIR);
-    if final_dir.exists() {
-        remove_path(&final_dir)?;
-    }
-    fs::rename(&tmp, &final_dir).map_err(|error| {
+    let generation_manifest = staging.join(BASE_PAGE_INDEX_MANIFEST);
+    write_json_file(&generation_manifest, &manifest)?;
+    sync_parent(&generation_manifest)?;
+    publication_hook(PublicationBoundary::GenerationManifestSynced)?;
+    let published_generation = generations_root.join(&generation);
+    fs::rename(&staging, &published_generation).map_err(|error| {
         CalyxError::disk_pressure(format!(
-            "replace Base page index {}: {error}",
-            final_dir.display()
+            "publish immutable Base page index generation {} -> {}: {error}",
+            staging.display(),
+            published_generation.display()
         ))
     })?;
-    sync_parent(&final_dir)?;
+    sync_parent(&published_generation)?;
+    publication_hook(PublicationBoundary::GenerationPublished)?;
+    validate_immutable_generation(vault, &published_generation, &manifest)?;
+    let commit_point = index_root.join(BASE_PAGE_INDEX_MANIFEST);
+    write_json_file_atomic(&commit_point, &manifest)?;
+    publication_hook(PublicationBoundary::CommitPointPublished)?;
+    validate_published_generation(vault, &manifest)?;
+    prune_obsolete_generations(&index_root, &generation)?;
     progress(BasePageIndexBuildProgress::Complete {
         total_entries: manifest.total_entries,
         live_entries: manifest.live_entries,
@@ -346,15 +474,22 @@ fn read_live_page_rows(
     page_ref: &BasePageIndexPageRef,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let page = read_page(vault, page_ref)?;
+    let entries = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let key = decode_hex(&entry.key_hex, "Base page index key")?;
+            Ok((key, entry))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut rows = Vec::with_capacity(page_ref.live_entry_count);
-    for entry in &page.entries {
-        let key = decode_hex(&entry.key_hex, "Base page index key")?;
-        let value = read_source_value(vault, &key, &entry.source)?;
-        validate_entry_value(entry, &value)?;
-        if !entry.tombstoned {
-            rows.push((key, value));
+    visit_source_values(vault, entries, |key, value| {
+        if !is_tombstone_value(&value) {
+            rows.push((key.to_vec(), value));
         }
-    }
+        Ok::<_, CalyxError>(())
+    })?;
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
     if rows.len() != page_ref.live_entry_count {
         return Err(corrupt(format!(
             "Base page index page {} expected {} live entries, got {}",
@@ -368,6 +503,7 @@ fn read_live_page_rows(
 
 fn write_page(
     dir: &Path,
+    published_prefix: &str,
     page_index: usize,
     entries: Vec<BasePageIndexEntry>,
     pages: &mut Vec<BasePageIndexPageRef>,
@@ -387,7 +523,7 @@ fn write_page(
     let file_name = format!("page-{page_index:08}.json");
     write_bytes_file(&dir.join(&file_name), &bytes)?;
     pages.push(BasePageIndexPageRef {
-        path: file_name,
+        path: format!("{published_prefix}/{file_name}"),
         first_key_hex,
         last_key_hex,
         entry_count: page.entries.len(),
@@ -432,11 +568,28 @@ fn validate_manifest(manifest: &BasePageIndexManifest) -> Result<()> {
             manifest.magic
         )));
     }
-    if manifest.version != INDEX_VERSION {
-        return Err(corrupt(format!(
-            "Base page index version {} is not {INDEX_VERSION}",
-            manifest.version
-        )));
+    match manifest.version {
+        LEGACY_INDEX_VERSION => {
+            if manifest.generation.is_some() {
+                return Err(corrupt(
+                    "legacy Base page index manifest unexpectedly names a generation",
+                ));
+            }
+            for page in &manifest.pages {
+                if page.path.contains('/') || page.path.contains('\\') {
+                    return Err(corrupt(format!(
+                        "legacy Base page index has non-canonical page path {}",
+                        page.path
+                    )));
+                }
+            }
+        }
+        GENERATION_INDEX_VERSION | INDEX_VERSION => validate_generation_manifest(manifest)?,
+        other => {
+            return Err(corrupt(format!(
+                "Base page index version {other} is not supported (legacy={LEGACY_INDEX_VERSION}, generation={GENERATION_INDEX_VERSION}, current={INDEX_VERSION})",
+            )));
+        }
     }
     if manifest.page_size == 0 {
         return Err(corrupt("Base page index manifest page_size is zero"));
@@ -453,6 +606,153 @@ fn validate_manifest(manifest: &BasePageIndexManifest) -> Result<()> {
     {
         return Err(corrupt("Base page index page counts do not add up"));
     }
+    let mut previous_last = None;
+    for page in &manifest.pages {
+        if page.live_entry_count > page.entry_count {
+            return Err(corrupt(format!(
+                "Base page index page {} has {} live entries but only {} total entries",
+                page.path, page.live_entry_count, page.entry_count
+            )));
+        }
+        if page.entry_count == 0 || page.first_key_hex > page.last_key_hex {
+            return Err(corrupt(format!(
+                "Base page index page {} has an empty or reversed key range",
+                page.path
+            )));
+        }
+        if let Some(last) = previous_last
+            && last >= page.first_key_hex.as_str()
+        {
+            return Err(corrupt(format!(
+                "Base page index page {} overlaps or is out of order after key {last}",
+                page.path
+            )));
+        }
+        if page.sha256_hex.len() != 64
+            || !page.sha256_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(corrupt(format!(
+                "Base page index page {} has invalid sha256 {}",
+                page.path, page.sha256_hex
+            )));
+        }
+        previous_last = Some(page.last_key_hex.as_str());
+    }
+    Ok(())
+}
+
+fn validate_generation_manifest(manifest: &BasePageIndexManifest) -> Result<()> {
+    let generation = manifest.generation.as_deref().ok_or_else(|| {
+        corrupt("current Base page index manifest does not name an immutable generation")
+    })?;
+    if !generation.starts_with("generation-")
+        || !generation
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(corrupt(format!(
+            "Base page index generation {generation:?} is not a canonical generation identifier"
+        )));
+    }
+    let prefix = format!("{BASE_PAGE_INDEX_GENERATIONS_DIR}/{generation}/");
+    for page in &manifest.pages {
+        let Some(file_name) = page.path.strip_prefix(&prefix) else {
+            return Err(corrupt(format!(
+                "Base page index generation {generation} references page outside itself: {}",
+                page.path
+            )));
+        };
+        if file_name.contains('/')
+            || file_name.contains('\\')
+            || !file_name.starts_with("page-")
+            || !file_name.ends_with(".json")
+        {
+            return Err(corrupt(format!(
+                "Base page index generation {generation} has non-canonical page path {}",
+                page.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_published_generation(vault: &Path, expected: &BasePageIndexManifest) -> Result<()> {
+    let published = read_manifest_file(&manifest_path(vault))?;
+    if &published != expected {
+        return Err(corrupt(
+            "published Base page index commit point differs from the completed generation manifest",
+        ));
+    }
+    for page_ref in &published.pages {
+        let page = read_page(vault, page_ref)?;
+        if page.entries.len() != page_ref.entry_count {
+            return Err(corrupt(format!(
+                "published Base page index page {} failed independent entry-count readback",
+                page_ref.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_immutable_generation(
+    vault: &Path,
+    generation_dir: &Path,
+    expected: &BasePageIndexManifest,
+) -> Result<()> {
+    let generation_manifest = read_manifest_file(&generation_dir.join(BASE_PAGE_INDEX_MANIFEST))?;
+    if &generation_manifest != expected {
+        return Err(corrupt(format!(
+            "immutable Base page index generation {} does not match its completed in-memory manifest",
+            generation_dir.display()
+        )));
+    }
+    for page_ref in &generation_manifest.pages {
+        read_page(vault, page_ref)?;
+    }
+    Ok(())
+}
+
+fn prune_obsolete_generations(index_root: &Path, current_generation: &str) -> Result<()> {
+    let generations = index_root.join(BASE_PAGE_INDEX_GENERATIONS_DIR);
+    for entry in fs::read_dir(&generations).map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "list Base page index generations {}: {error}",
+            generations.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            CalyxError::disk_pressure(format!("read Base page index generation entry: {error}"))
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == current_generation {
+            continue;
+        }
+        if !(name.starts_with("generation-")
+            || (name.starts_with(".generation-") && name.ends_with(".tmp")))
+        {
+            return Err(corrupt(format!(
+                "refusing to prune unexpected Base page index generation entry {}",
+                entry.path().display()
+            )));
+        }
+        remove_path(&entry.path())?;
+    }
+    for entry in fs::read_dir(index_root).map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "list Base page index root {}: {error}",
+            index_root.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            CalyxError::disk_pressure(format!("read Base page index root entry: {error}"))
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("page-") && name.ends_with(".json") {
+            remove_path(&entry.path())?;
+        }
+    }
+    sync_parent(&generations.join(".prune-sync"))?;
     Ok(())
 }
 
@@ -462,6 +762,16 @@ fn validate_current_head(vault: &Path, manifest: &BasePageIndexManifest) -> Resu
         return Err(stale(format!(
             "Base page index was built at ledger head {}:{} but current head is {}:{}",
             manifest.ledger_head_height, manifest.ledger_head_tip_hash_hex, height, tip_hash_hex
+        )));
+    }
+    Ok(())
+}
+
+fn validate_current_read_format(manifest: &BasePageIndexManifest) -> Result<()> {
+    if manifest.version != INDEX_VERSION {
+        return Err(stale(format!(
+            "Base page index version {} lacks the exact physical offsets required by current version {INDEX_VERSION}; rebuild the index before readback",
+            manifest.version
         )));
     }
     Ok(())

@@ -73,10 +73,16 @@ fn ph62_cli_workflow_readback_healthcheck_and_idempotency() {
         ],
     );
     assert_success(&search);
-    let hits = json(&search);
-    let hit = hits
+    let explain = json(&search);
+    let slots = explain["slots"]
+        .as_object()
+        .expect("search --explain must return the serving-slot roster");
+    assert!(slots.contains_key("resident_gpu"));
+    assert!(slots.contains_key("local_cpu"));
+    assert!(slots.contains_key("parked_excluded"));
+    let hit = explain["hits"]
         .as_array()
-        .unwrap()
+        .expect("search --explain must return ranked hits")
         .iter()
         .find(|hit| hit["cx_id"] == cx_id)
         .expect("search should return ingested cx_id");

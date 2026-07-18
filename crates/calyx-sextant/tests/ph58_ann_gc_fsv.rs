@@ -1,9 +1,9 @@
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_aster::gc::{
     AnnGcReclaimer, AnnGcTarget, AnnIndexGraph, AnnTombstoneStats, CALYX_IO_ERROR, SharedAnnIndex,
     ann_io_error,
 };
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
 use calyx_core::{Result, SlotId};
 use calyx_sextant::{HnswIndex, SextantIndex};
 use serde_json::json;

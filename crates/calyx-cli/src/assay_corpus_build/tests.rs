@@ -431,6 +431,7 @@ fn write_manifest_for_modality(
         truncate_dim: None,
         recall_delta: calyx_registry::spec::default_recall_delta(),
         max_batch: None,
+        max_tokens: None,
         batch_policy: None,
     };
     let path = root.join(file_name);

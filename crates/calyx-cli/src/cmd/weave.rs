@@ -9,19 +9,16 @@
 
 mod coverage;
 mod csr;
+mod fsv;
+mod graph_contract;
 mod parse;
 mod passes;
 mod progress;
 
-use std::fs;
-
 use calyx_aster::plain_graph::PlainGraph;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{SlotId, SlotShape, SlotState};
-use calyx_lodestar::{
-    AsterAssocMetadata, CorpusWeaveReportParams, DEFAULT_ASTER_ASSOC_COLLECTION,
-    corpus_weave_report, write_assoc_metadata,
-};
+use calyx_lodestar::{CorpusWeaveReportParams, PANEL_ASTER_ASSOC_COLLECTION, corpus_weave_report};
 use calyx_registry::load_vault_panel_state;
 use serde::Serialize;
 use serde_json::json;
@@ -35,7 +32,7 @@ pub(crate) use coverage::CandidateSelectionMode;
 use progress::error_details;
 
 const DEFAULT_KNN: usize = 16;
-const DEFAULT_EDGE_COS_THRESHOLD: f32 = 0.5;
+const DEFAULT_EDGE_SCORE_THRESHOLD: f32 = 0.5;
 const DEFAULT_MAX_GROUNDEDNESS_DISTANCE: usize = 3;
 const DEFAULT_BATCH: usize = 512;
 
@@ -46,7 +43,7 @@ pub(crate) struct WeaveLoomArgs {
     pub vault: String,
     pub content_slot: Option<u16>,
     pub knn: usize,
-    pub edge_cos_threshold: f32,
+    pub edge_score_threshold: f32,
     pub max_groundedness_distance: usize,
     pub batch: usize,
     /// Cap the number of constellations processed (0 = all). For bounded FSV
@@ -67,7 +64,7 @@ impl Default for WeaveLoomArgs {
             vault: String::new(),
             content_slot: None,
             knn: DEFAULT_KNN,
-            edge_cos_threshold: DEFAULT_EDGE_COS_THRESHOLD,
+            edge_score_threshold: DEFAULT_EDGE_SCORE_THRESHOLD,
             max_groundedness_distance: DEFAULT_MAX_GROUNDEDNESS_DISTANCE,
             batch: DEFAULT_BATCH,
             limit: 0,
@@ -114,21 +111,17 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
         )?;
         return Err(CliError::usage(detail));
     }
-    let requested_slot = match resolve_requested_slot(
-        args.content_slot,
-        &content_slots,
-        &incompatible_content_slots,
-    ) {
-        Ok(slot) => slot,
-        Err(error) => {
-            let _ = progress.write(
-                "coverage_failed",
-                "content_slot_validation",
-                json!({ "error": error_details(&error) }),
-            );
-            return Err(error);
-        }
-    };
+    if args.content_slot.is_some() {
+        let error = CliError::usage(
+            "--content-slot would collapse the association graph to one lens; omit it so weave-loom binds every active dense content slot",
+        );
+        let _ = progress.write(
+            "coverage_failed",
+            "content_slot_validation",
+            json!({ "error": error_details(&error) }),
+        );
+        return Err(error);
+    }
 
     if args.limit == 1 {
         let detail = "weave-loom --limit must be 0 or at least 2 because graph selection needs at least two constellations";
@@ -145,7 +138,7 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
     let scan = match coverage::scan_dense_slot_coverage(
         &resolved.path,
         &content_slots,
-        requested_slot,
+        None,
         args.limit,
         args.candidate_selection,
         &deadline,
@@ -174,20 +167,14 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
         }),
     )?;
 
-    let selection = match coverage::select_slot_from_coverage(
-        requested_slot,
-        args.candidate_selection,
-        args.limit,
-        &scan.coverage,
-    ) {
-        Ok(selection) => selection,
+    let preflight = match coverage::materialize_panel_preflight(scan, &content_slots, args.limit) {
+        Ok(preflight) => preflight,
         Err(detail) => {
             progress.write(
                 "coverage_failed",
                 "dense_slot_coverage",
                 json!({
                     "error": detail,
-                    "coverage": &scan.coverage,
                     "progress_artifact": progress.path().display().to_string(),
                 }),
             )?;
@@ -197,13 +184,12 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
             )));
         }
     };
-    let preflight = coverage::materialize_selected_preflight(scan, &selection);
-    let knn_slot = selection.slot;
     progress.write(
         "running",
         "candidate_selection_complete",
         json!({
-            "selection": &selection,
+            "selection": "complete_panel_intersection",
+            "embedding_slots": content_slots.iter().map(|slot| slot.get()).collect::<Vec<_>>(),
             "candidate_rows": preflight.candidates.len(),
             "candidate_scan_rows": preflight.candidate_scan_rows,
             "candidate_scan_complete": preflight.candidate_scan_complete,
@@ -220,7 +206,8 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
             "skipped_incompatible_content_slots": incompatible_content_slots,
             "candidate_selection_mode": args.candidate_selection.as_str(),
             "candidate_order": "base_page_index_key_order",
-            "selection": &selection,
+            "selection": "complete_panel_intersection",
+            "embedding_slots": content_slots.iter().map(|slot| slot.get()).collect::<Vec<_>>(),
             "dense_slot_coverage": &preflight.coverage,
             "constellations_in_vault": preflight.constellations_in_vault,
             "candidate_scan_rows": preflight.candidate_scan_rows,
@@ -236,9 +223,9 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
         "running",
         "vault_open_start",
         json!({
-            "selected_content_slot": knn_slot.get(),
-            "selection_reason": selection.reason,
-            "candidate_selection_mode": selection.mode,
+            "embedding_slots": content_slots.iter().map(|slot| slot.get()).collect::<Vec<_>>(),
+            "selection_reason": "complete_panel_intersection",
+            "candidate_selection_mode": args.candidate_selection.as_str(),
             "candidate_rows": preflight.candidates.len(),
             "candidate_scan_rows": preflight.candidate_scan_rows,
             "candidate_scan_complete": preflight.candidate_scan_complete,
@@ -265,26 +252,27 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
         "running",
         "within_doc_start",
         json!({
-            "selected_content_slot": knn_slot.get(),
-            "selection_reason": selection.reason,
-            "candidate_selection_mode": selection.mode,
+            "embedding_slots": content_slots.iter().map(|slot| slot.get()).collect::<Vec<_>>(),
+            "selection_reason": "complete_panel_intersection",
+            "candidate_selection_mode": args.candidate_selection.as_str(),
             "candidate_rows": preflight.candidates.len(),
             "candidate_scan_rows": preflight.candidate_scan_rows,
         }),
     )?;
 
-    let graph = PlainGraph::new(&vault, DEFAULT_ASTER_ASSOC_COLLECTION)?;
-    let within = match passes::weave_within_doc(&vault, &graph, &preflight, knn_slot, args.batch) {
-        Ok(within) => within,
-        Err(error) => {
-            let _ = progress.write(
-                "incomplete",
-                "within_doc_error",
-                json!({ "error": error_details(&error) }),
-            );
-            return Err(error);
-        }
-    };
+    let graph = PlainGraph::new(&vault, PANEL_ASTER_ASSOC_COLLECTION)?;
+    let within =
+        match passes::weave_within_doc(&vault, &graph, &preflight, &content_slots, args.batch) {
+            Ok(within) => within,
+            Err(error) => {
+                let _ = progress.write(
+                    "incomplete",
+                    "within_doc_error",
+                    json!({ "error": error_details(&error) }),
+                );
+                return Err(error);
+            }
+        };
     if let Err(error) = deadline.check(
         "weave-loom",
         "within_doc_complete",
@@ -303,7 +291,7 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
         json!({
             "constellations_processed": within.constellations_processed,
             "xterm_rows_persisted": within.xterm_rows_persisted,
-            "knn_vectors": within.knn_vectors.len(),
+            "panel_constellations": within.panel_vectors.len(),
         }),
     )?;
 
@@ -332,10 +320,10 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
     };
     let graph_request = passes::BetweenDocGraphRequest {
         indexes: &indexes,
-        knn_slot,
+        embedding_slots: &content_slots,
         knn: args.knn,
-        edge_cos_threshold: args.edge_cos_threshold,
-        knn_vectors: &within.knn_vectors,
+        edge_score_threshold: args.edge_score_threshold,
+        panel_vectors: &within.panel_vectors,
     };
     let (edges_persisted, assoc_graph) = match passes::build_between_doc_graph(
         &vault,
@@ -353,11 +341,14 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
             return Err(error);
         }
     };
-    write_assoc_metadata(
-        &vault,
-        DEFAULT_ASTER_ASSOC_COLLECTION,
-        &AsterAssocMetadata::default(),
-    )?;
+    let graph_source_seq = vault.latest_seq();
+    let graph_contract = graph_contract::GraphContract::from_args(
+        content_slots.clone(),
+        u64::from(state.panel.version),
+        graph_source_seq,
+        &args,
+    );
+    graph_contract.persist(&vault)?;
     csr::persist_assoc_csr(&vault, &graph, &resolved.path, &progress)?;
 
     let report_params = CorpusWeaveReportParams {
@@ -374,10 +365,11 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
         "progress_artifact": progress.path().display().to_string(),
         "content_slots": content_slots.iter().map(|s| s.get()).collect::<Vec<_>>(),
         "skipped_incompatible_content_slots": incompatible_content_slots,
-        "knn_slot": knn_slot.get(),
-        "knn_slot_selection_reason": selection.reason,
-        "candidate_selection_mode": selection.mode,
-        "candidate_selection": &selection,
+        "embedding_slots": content_slots.iter().map(|slot| slot.get()).collect::<Vec<_>>(),
+        "fusion": "rrf",
+        "rrf_k": calyx_lodestar::PANEL_RRF_K,
+        "candidate_selection_mode": args.candidate_selection.as_str(),
+        "candidate_selection": "complete_panel_intersection",
         "dense_slot_coverage": &preflight.coverage,
         "candidate_order": "base_page_index_key_order",
         "candidate_scan_rows": preflight.candidate_scan_rows,
@@ -386,7 +378,8 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
         "selected_candidate_rows": preflight.selected_candidate_rows,
         "selected_candidate_cx_ids": &preflight.selected_candidate_cx_ids,
         "knn": args.knn,
-        "edge_cos_threshold": args.edge_cos_threshold,
+        "edge_score_threshold": args.edge_score_threshold,
+        "graph_contract": graph_contract,
         "constellations_in_vault": total_in_vault,
         "constellations_processed": within.constellations_processed,
         "limited": within.constellations_processed < total_in_vault,
@@ -401,7 +394,7 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
         },
     });
     progress.write("ok", "complete", json!({ "output": &output }))?;
-    write_fsv_readback(&output)?;
+    fsv::write(&output)?;
     print_json(&output)
 }
 
@@ -454,44 +447,6 @@ fn slot_shape_label(shape: SlotShape) -> String {
         SlotShape::Sparse(dim) => format!("sparse:{dim}"),
         SlotShape::Multi { token_dim } => format!("multi:{token_dim}"),
     }
-}
-
-fn resolve_requested_slot(
-    requested: Option<u16>,
-    content_slots: &[SlotId],
-    incompatible_content_slots: &[IncompatibleContentSlot],
-) -> CliResult<Option<SlotId>> {
-    match requested {
-        None => Ok(None),
-        Some(raw) => {
-            let slot = SlotId::new(raw);
-            if content_slots.contains(&slot) {
-                Ok(Some(slot))
-            } else {
-                Err(CliError::usage(format!(
-                    "--content-slot {raw} is not an active dense content lens; choose one of {:?}; incompatible active content slots={:?}",
-                    content_slots.iter().map(|s| s.get()).collect::<Vec<_>>(),
-                    incompatible_content_slots
-                )))
-            }
-        }
-    }
-}
-
-fn write_fsv_readback(output: &serde_json::Value) -> CliResult {
-    let Some(root) = calyx_fsv::env_fsv_root("CALYX_FSV_ROOT")
-        .map_err(|error| CliError::usage(error.to_string()))?
-    else {
-        return Ok(());
-    };
-    let dir = root.join("weave-loom");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join("weave_loom_report.json");
-    let bytes = serde_json::to_vec_pretty(output)
-        .map_err(|error| CliError::runtime(format!("serialize {}: {error}", path.display())))?;
-    fs::write(&path, bytes)?;
-    eprintln!("WEAVE_LOOM_READBACK={}", path.display());
-    Ok(())
 }
 
 #[cfg(test)]

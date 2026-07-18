@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
-use calyx_core::{CalyxError, SlotId, SlotVector};
+use calyx_core::{CalyxError, LensId, MeasurementGroupKey, SlotId, SlotVector};
 
 use crate::engine_trace::SearchTracer;
 use crate::error::CliResult;
@@ -46,7 +47,7 @@ pub(crate) fn measure_query_vectors_with_slots_traced(
         Some(format!("bytes={}", query.len())),
     );
     let input = Input::new(Modality::Text, query.as_bytes().to_vec());
-    let mut out = Vec::new();
+    let mut runnable = Vec::new();
     for slot in &state.panel.slots {
         if allowed_slots.is_some_and(|allowed| !allowed.contains(&slot.slot_id)) {
             continue;
@@ -61,32 +62,200 @@ pub(crate) fn measure_query_vectors_with_slots_traced(
                 None,
                 Some(slot.lens_id.to_string()),
             );
-            let vector = match state.registry.measure(slot.lens_id, &input) {
-                Ok(vector) => vector,
-                Err(error) => {
+            runnable.push((slot.slot_id, slot.lens_id));
+        }
+    }
+
+    let jobs = measurement_jobs(&state.registry, &runnable)?;
+    trace.emit_detail(
+        "query.measure_parallel.start",
+        None,
+        Some(jobs.len()),
+        Some(format!("slots={}", runnable.len())),
+    );
+    let epoch = Instant::now();
+    let outcomes = std::thread::scope(|scope| {
+        jobs.iter()
+            .map(|job| {
+                scope.spawn(|| {
+                    let started_ms = epoch.elapsed().as_millis();
+                    let measured = measure_job(&state.registry, job, &input);
+                    (started_ms, epoch.elapsed().as_millis(), measured)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join())
+            .collect::<Vec<_>>()
+    });
+
+    let mut measured_by_lens = BTreeMap::new();
+    let mut first_error = None;
+    for (job, outcome) in jobs.iter().zip(outcomes) {
+        let (started_ms, ended_ms, result) = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let error = CalyxError::lens_unreachable(format!(
+                    "parallel query measurement thread panicked for lenses [{}]",
+                    job.lens_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+                for slot in &job.slots {
                     trace.emit_detail(
                         "query.measure_slot.error",
-                        Some(slot.slot_id),
+                        Some(*slot),
                         None,
                         Some(format!("{} {}", error.code, error.message)),
                     );
-                    return Err(error.into());
                 }
-            };
-            let is_indexable = indexable(&vector);
-            trace.emit_detail(
-                "query.measure_slot.done",
-                Some(slot.slot_id),
-                Some(is_indexable as usize),
-                Some(slot_vector_shape(&vector)),
-            );
-            if is_indexable {
-                out.push((slot.slot_id, vector));
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        match result {
+            Ok(measured) => {
+                trace.emit_detail(
+                    "query.measure_parallel.job_done",
+                    None,
+                    Some(job.lens_ids.len()),
+                    Some(format!(
+                        "grouped={} started_ms={started_ms} ended_ms={ended_ms}",
+                        job.grouped
+                    )),
+                );
+                measured_by_lens.extend(measured);
+            }
+            Err(error) => {
+                for slot in &job.slots {
+                    trace.emit_detail(
+                        "query.measure_slot.error",
+                        Some(*slot),
+                        None,
+                        Some(format!("{} {}", error.code, error.message)),
+                    );
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
     }
+    if let Some(error) = first_error {
+        return Err(error.into());
+    }
+
+    let mut out = Vec::new();
+    for (slot, lens) in runnable {
+        let vector = measured_by_lens.get(&lens).ok_or_else(|| {
+            CalyxError::lens_dim_mismatch(format!(
+                "parallel query measurement omitted lens {lens} for slot {slot}"
+            ))
+        })?;
+        let is_indexable = indexable(vector);
+        trace.emit_detail(
+            "query.measure_slot.done",
+            Some(slot),
+            Some(is_indexable as usize),
+            Some(slot_vector_shape(vector)),
+        );
+        if is_indexable {
+            out.push((slot, vector.clone()));
+        }
+    }
+    trace.emit_detail(
+        "query.measure_parallel.done",
+        None,
+        Some(jobs.len()),
+        Some(format!("elapsed_ms={}", epoch.elapsed().as_millis())),
+    );
     trace.emit("query.measure.done", None, Some(out.len()));
     Ok(out)
+}
+
+struct MeasurementJob {
+    lens_ids: Vec<LensId>,
+    slots: Vec<SlotId>,
+    grouped: bool,
+}
+
+fn measurement_jobs(
+    registry: &calyx_registry::Registry,
+    runnable: &[(SlotId, LensId)],
+) -> Result<Vec<MeasurementJob>, CalyxError> {
+    let mut jobs: Vec<MeasurementJob> = Vec::new();
+    let mut grouped_jobs: BTreeMap<MeasurementGroupKey, usize> = BTreeMap::new();
+    let mut lens_jobs: BTreeMap<LensId, usize> = BTreeMap::new();
+    for &(slot, lens) in runnable {
+        if let Some(&job_index) = lens_jobs.get(&lens) {
+            jobs[job_index].slots.push(slot);
+            continue;
+        }
+        let job_index = match registry.measurement_group_key(lens)? {
+            Some(group) => {
+                if let Some(&job_index) = grouped_jobs.get(&group) {
+                    jobs[job_index].lens_ids.push(lens);
+                    jobs[job_index].slots.push(slot);
+                    job_index
+                } else {
+                    let job_index = jobs.len();
+                    grouped_jobs.insert(group, job_index);
+                    jobs.push(MeasurementJob {
+                        lens_ids: vec![lens],
+                        slots: vec![slot],
+                        grouped: true,
+                    });
+                    job_index
+                }
+            }
+            None => {
+                let job_index = jobs.len();
+                jobs.push(MeasurementJob {
+                    lens_ids: vec![lens],
+                    slots: vec![slot],
+                    grouped: false,
+                });
+                job_index
+            }
+        };
+        lens_jobs.insert(lens, job_index);
+    }
+    Ok(jobs)
+}
+
+fn measure_job(
+    registry: &calyx_registry::Registry,
+    job: &MeasurementJob,
+    input: &calyx_core::Input,
+) -> Result<BTreeMap<LensId, SlotVector>, CalyxError> {
+    if job.grouped {
+        let measured =
+            registry.measure_grouped_batch(&job.lens_ids, std::slice::from_ref(input))?;
+        return measured
+            .into_iter()
+            .map(|(lens, mut vectors)| {
+                let vector = vectors.pop().ok_or_else(|| {
+                    CalyxError::lens_dim_mismatch(format!(
+                        "grouped query measurement returned no vector for lens {lens}"
+                    ))
+                })?;
+                if !vectors.is_empty() {
+                    return Err(CalyxError::lens_dim_mismatch(format!(
+                        "grouped query measurement returned multiple vectors for one input and lens {lens}"
+                    )));
+                }
+                Ok((lens, vector))
+            })
+            .collect();
+    }
+    let lens = job.lens_ids[0];
+    registry
+        .measure(lens, input)
+        .map(|vector| BTreeMap::from([(lens, vector)]))
 }
 
 pub(crate) fn no_indexable_query_vectors() -> CalyxError {

@@ -3,6 +3,8 @@ mod render;
 mod runtime;
 mod xterms;
 
+use std::collections::BTreeSet;
+
 use calyx_core::{CalyxError, CxId, SlotId};
 use calyx_sextant::{
     CALYX_SEXTANT_SKILL_UNKNOWN, MAX_TRAVERSE_HOPS, SearchEngine, TraverseDirection, agree,
@@ -23,6 +25,7 @@ use runtime::{
 
 const CONSENSUS_K: usize = 5;
 const SEARCH_SKILL_K: usize = 10;
+const PERSISTED_RECALL_K: usize = 64;
 
 pub(super) fn register(server: &mut McpServer) -> Result<(), CalyxError> {
     server.register(Box::new(AgreeTool))?;
@@ -260,15 +263,22 @@ impl Tool for SearchSkillTool {
             )
             .into());
         };
-        // Default FreshDerived stands: the nav engine is built at the load
-        // snapshot with built_at_seq == base_seq, so a fresh engine passes and
-        // any seq-domain regression fails closed (issue #1104).
+        let members = tree.nodes[&args.skill]
+            .members
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let mut query = calyx_sextant::Query::new(args.query)
             .with_vector(vector)
             .with_slots(vec![slot])
             .require_stored_provenance(true);
-        query.k = SEARCH_SKILL_K;
-        let hits = calyx_sextant::search_skill(&runtime.engine, &tree, &args.skill, &query)?;
+        query.k = runtime.docs.len().clamp(SEARCH_SKILL_K, PERSISTED_RECALL_K);
+        let mut hits = runtime.engine.search(&query)?;
+        hits.retain(|hit| members.contains(&hit.cx_id));
+        hits.truncate(SEARCH_SKILL_K);
+        for (rank, hit) in hits.iter_mut().enumerate() {
+            hit.rank = rank + 1;
+        }
         Ok(json!({ "hits": output::render_hits(&hits, false, None) }))
     }
 
@@ -365,11 +375,11 @@ fn slot_consensus(
         .get(&cx_id)
         .and_then(|cx| cx.slots.get(&slot))
         .ok_or_else(|| CalyxError::stale_derived(format!("cx_id {cx_id} lacks slot {slot}")))?;
-    let mut hits =
-        runtime
-            .engine
-            .indexes
-            .search(slot, vector, runtime.docs.len().max(CONSENSUS_K), None)?;
+    let recall_k = runtime.docs.len().clamp(CONSENSUS_K, PERSISTED_RECALL_K);
+    let mut hits = runtime
+        .engine
+        .indexes
+        .search(slot, vector, recall_k, None)?;
     hits.retain(|hit| hit.cx_id != cx_id);
     if matches!(polarity, ConsensusPolarity::Disagree) {
         hits.sort_by(|a, b| {

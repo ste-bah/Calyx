@@ -1,7 +1,5 @@
-use std::fs;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{
     BoostConfig, CALYX_TEMPORAL_INVALID_BOOST_CONFIG, CxId, DecayFunction, FusionWeights, LedgerRef,
 };
@@ -11,6 +9,7 @@ use calyx_sextant::{
 };
 use serde_json::json;
 use sextant_support::{fsv_root, reset_dir, write_json, write_root_file_blake3_sums};
+use std::fs;
 
 const SCORE_EPSILON: f32 = 1.0e-5;
 

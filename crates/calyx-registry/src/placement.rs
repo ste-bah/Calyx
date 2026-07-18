@@ -3,10 +3,11 @@ use std::collections::VecDeque;
 use calyx_core::{CalyxError, LensCost, LensId, Placement, SlotResource};
 use serde::{Deserialize, Serialize};
 
-use crate::LensRuntime;
+use crate::{Bgem3Engine, LensRuntime};
 
 pub const CALYX_VRAM_BUDGET_EXCEEDED: &str = "CALYX_VRAM_BUDGET_EXCEEDED";
 pub const CALYX_RAM_BUDGET_EXCEEDED: &str = "CALYX_RAM_BUDGET_EXCEEDED";
+pub const CALYX_BGE_M3_CPU_GRAPH_GPU_PLACEMENT: &str = "CALYX_BGE_M3_CPU_GRAPH_GPU_PLACEMENT";
 pub const LENS_VRAM_REMEDIATION: &str =
     "lower precision, evict cold GPU lenses, move to CPU, or raise the Forge VRAM budget";
 pub const LENS_RAM_REMEDIATION: &str =
@@ -48,6 +49,41 @@ pub fn choose_placement(
     cost: LensCost,
     budget: PlacementBudget,
 ) -> Result<PlacementPlan, CalyxError> {
+    if matches!(
+        runtime,
+        LensRuntime::FastembedBgem3 {
+            engine: Bgem3Engine::FastembedCpu,
+            ..
+        }
+    ) {
+        if cost.vram_bytes != 0 {
+            return Err(CalyxError {
+                code: CALYX_BGE_M3_CPU_GRAPH_GPU_PLACEMENT,
+                message: format!(
+                    "CPU-only FastEmbed BGE-M3 graph declares {} VRAM bytes and would be falsely admitted as GPU-resident",
+                    cost.vram_bytes
+                ),
+                remediation: "commission the pinned onnx-bgem3-* joint CUDA artifact; do not relabel the CPU INT8 graph or fall back to CPU",
+            });
+        }
+        ensure_cpu_budget(cost, budget)?;
+        return Ok(plan(
+            cost,
+            Placement::Cpu,
+            budget,
+            "explicit legacy CPU-only BGE-M3 runtime",
+        ));
+    }
+
+    if algorithmic_cuda_capable(runtime) && budget.vram_soft_cap_bytes > 0 {
+        return Ok(plan(
+            cost,
+            Placement::Gpu,
+            budget,
+            "bulk algorithmic runtime uses dynamic CUDA/CPU crossover dispatch",
+        ));
+    }
+
     if cost.is_zero_cost() && matches!(runtime, LensRuntime::Algorithmic { .. }) {
         return Ok(plan(cost, Placement::Cpu, budget, "zero-cost lens admits"));
     }
@@ -90,13 +126,35 @@ fn plan(
 }
 
 fn runtime_prefers_cpu(runtime: &LensRuntime) -> bool {
+    match runtime {
+        LensRuntime::Algorithmic { .. } => !algorithmic_cuda_capable(runtime),
+        LensRuntime::MultimodalAdapter { .. }
+        | LensRuntime::StaticLookup { .. }
+        | LensRuntime::ExternalCmd { .. } => true,
+        _ => false,
+    }
+}
+
+fn algorithmic_cuda_capable(runtime: &LensRuntime) -> bool {
+    let LensRuntime::Algorithmic { kind } = runtime else {
+        return false;
+    };
     matches!(
-        runtime,
-        LensRuntime::Algorithmic { .. }
-            | LensRuntime::MultimodalAdapter { .. }
-            | LensRuntime::StaticLookup { .. }
-            | LensRuntime::ExternalCmd { .. }
-    )
+        kind.as_str(),
+        "byte"
+            | "byte-features"
+            | "byte_features"
+            | "sparse"
+            | "sparse-keywords"
+            | "sparse_keywords"
+            | "token-hash"
+            | "token_hash"
+            | "multi-hash"
+            | "multi_hash"
+    ) || kind.starts_with("sparse-keywords:")
+        || kind.starts_with("sparse_keywords:")
+        || kind.starts_with("token-hash:")
+        || kind.starts_with("token_hash:")
 }
 
 fn ensure_cpu_budget(cost: LensCost, budget: PlacementBudget) -> Result<(), CalyxError> {
@@ -262,6 +320,39 @@ mod tests {
     }
 
     #[test]
+    fn cpu_only_bgem3_with_vram_claim_is_rejected_before_admission() {
+        let budget = budget(8 * GIB, 0, 0, 8 * GIB, 0, 4, 0);
+        let runtime = LensRuntime::FastembedBgem3 {
+            model_id: "gpahal/bge-m3-onnx-int8".to_string(),
+            files: Vec::new(),
+            output: crate::FastembedBgem3Output::Dense,
+            engine: Bgem3Engine::FastembedCpu,
+        };
+
+        let error = choose_placement(&runtime, cost(10, GIB, 512 * MIB), budget)
+            .expect_err("CPU graph must not be labeled GPU");
+
+        assert_eq!(error.code, CALYX_BGE_M3_CPU_GRAPH_GPU_PLACEMENT);
+        assert!(error.message.contains("CPU-only"));
+    }
+
+    #[test]
+    fn onnx_cuda_bgem3_remains_gpu_only() {
+        let budget = budget(8 * GIB, 0, 0, 8 * GIB, 0, 4, 0);
+        let runtime = LensRuntime::FastembedBgem3 {
+            model_id: "BAAI/bge-m3".to_string(),
+            files: Vec::new(),
+            output: crate::FastembedBgem3Output::Dense,
+            engine: Bgem3Engine::OnnxCuda,
+        };
+
+        let plan = choose_placement(&runtime, cost(10, GIB, 512 * MIB), budget)
+            .expect("CUDA graph fits GPU budget");
+
+        assert_eq!(plan.resource.placement, Placement::Gpu);
+    }
+
+    #[test]
     fn oversized_gpu_lens_refuses_with_remediation() {
         let budget = budget(4 * GIB, 3 * GIB, 0, 8 * GIB, 0, 4, 0);
 
@@ -278,6 +369,34 @@ mod tests {
 
         let plan = choose_placement(&algorithmic_runtime(), LensCost::zero(), budget)
             .expect("zero-cost admits");
+
+        assert_eq!(plan.resource.placement, Placement::Cpu);
+    }
+
+    #[test]
+    fn bulk_algorithmic_runtime_persists_dynamic_gpu_placement() {
+        let budget = budget(8 * GIB, 2 * GIB, 0, 8 * GIB, 0, 4, 0);
+
+        for kind in ["byte_features", "sparse-keywords:65536", "token_hash:128"] {
+            let runtime = LensRuntime::Algorithmic {
+                kind: kind.to_string(),
+            };
+            let plan = choose_placement(&runtime, LensCost::zero(), budget)
+                .expect("bulk algorithmic runtime admits");
+
+            assert_eq!(plan.resource.placement, Placement::Gpu);
+            assert!(plan.reason.contains("crossover"));
+        }
+    }
+
+    #[test]
+    fn small_algorithmic_runtime_remains_cpu_native() {
+        let budget = budget(8 * GIB, 0, 0, 8 * GIB, 0, 4, 0);
+        let runtime = LensRuntime::Algorithmic {
+            kind: "scalar".to_string(),
+        };
+
+        let plan = choose_placement(&runtime, LensCost::zero(), budget).expect("scalar admits");
 
         assert_eq!(plan.resource.placement, Placement::Cpu);
     }

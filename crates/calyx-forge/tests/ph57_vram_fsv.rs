@@ -12,7 +12,7 @@
 //! manual (see the closing FSV comment on the issue). Here the system under
 //! test — the accounting + admission logic — runs on real in-memory bytes.
 //!
-//! Run with `cargo test -p calyx-forge --test ph57_vram_fsv -- --nocapture`
+//! Run with `cargo test -p calyx-forge --test __calyx_integration_suite_0 ph57_vram_fsv -- --nocapture`
 //! to emit the evidence log.
 
 use calyx_forge::{

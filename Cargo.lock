@@ -492,6 +492,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -503,6 +504,7 @@ dependencies = [
  "calyx-anneal",
  "calyx-aster",
  "calyx-core",
+ "calyx-forge",
  "calyx-fsv",
  "calyx-ledger",
  "calyx-lodestar",
@@ -562,6 +564,7 @@ dependencies = [
 name = "calyx-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bincode_reloaded",
  "blake3",
  "calyx-anneal",
@@ -574,6 +577,7 @@ dependencies = [
  "calyx-ledger",
  "calyx-lodestar",
  "calyx-loom",
+ "calyx-mcp",
  "calyx-oracle",
  "calyx-paths",
  "calyx-registry",
@@ -581,15 +585,21 @@ dependencies = [
  "calyx-sextant",
  "calyx-testkit",
  "calyx-ward",
+ "calyx-web-api",
  "calyxd",
  "ciborium",
  "crc32fast",
+ "http-body-util",
  "proptest",
  "rayon",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "signal-hook",
+ "socket2",
+ "tokio",
+ "tower",
  "ulid",
  "ureq",
  "windows-sys 0.61.2",
@@ -624,6 +634,7 @@ dependencies = [
  "proptest",
  "rand",
  "rand_chacha",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
@@ -634,6 +645,20 @@ dependencies = [
 [[package]]
 name = "calyx-fsv"
 version = "0.1.0"
+
+[[package]]
+name = "calyx-gatebrokerd"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
 
 [[package]]
 name = "calyx-hazard-soak"
@@ -739,11 +764,13 @@ dependencies = [
  "calyx-aster",
  "calyx-buildinfo",
  "calyx-core",
+ "calyx-forge",
  "calyx-fsv",
  "calyx-ledger",
  "calyx-loom",
  "calyx-paths",
  "calyx-registry",
+ "calyx-search",
  "calyx-sextant",
  "calyx-ward",
  "serde",
@@ -811,6 +838,7 @@ dependencies = [
  "calyx-assay",
  "calyx-aster",
  "calyx-core",
+ "calyx-fsv",
  "calyx-ledger",
  "calyx-lodestar",
  "calyx-loom",
@@ -879,6 +907,7 @@ dependencies = [
  "sha2",
  "ulid",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -4255,6 +4284,16 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
 
 [[package]]
 name = "signal-hook-registry"

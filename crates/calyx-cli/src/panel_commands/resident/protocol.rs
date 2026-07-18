@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use calyx_core::{AbsentReason, Modality, Placement, SlotVector};
 use serde::{Deserialize, Serialize};
 
-pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v1";
+pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v2";
 pub(super) const MEASURE_SCHEMA: &str = "calyx-panel-resident-measure-v1";
 pub(super) const MEASURE_BATCH_SCHEMA: &str = "calyx-panel-resident-measure-batch-v1";
 /// v2 (#1002): measure_batch responses stream as one header frame, one frame
@@ -44,12 +44,24 @@ pub(super) struct ReadyResponse {
     pub(super) ready_out: Option<PathBuf>,
     pub(super) max_resident_vram_mib: u64,
     pub(super) declared_template_vram_mib: u64,
-    pub(super) resident_overhead_multiplier: f32,
+    pub(super) resident_overhead_multiplier_milli: u64,
     pub(super) estimated_resident_vram_mib: u64,
     pub(super) max_load_secs: u64,
     pub(super) load_parallelism: usize,
     pub(super) load_ms: u128,
     pub(super) probe_ms: u128,
+    pub(super) max_runtime_batch: usize,
+    pub(super) capacity_probe_input_count: usize,
+    pub(super) capacity_probe_ms: u128,
+    pub(super) capacity_probe_modalities: Vec<Modality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) onnx_configured_shape_limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) onnx_required_shape_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) onnx_sequence_bucket_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) onnx_batch_bucket_count: Option<usize>,
     pub(super) slot_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) slot_scope: Vec<u16>,
@@ -58,6 +70,10 @@ pub(super) struct ReadyResponse {
     pub(super) warmed_lens_count: usize,
     pub(super) gpu_content_lens_count: usize,
     pub(super) cpu_content_lens_count: usize,
+    /// Active CPU/non-GPU content slots loudly excluded from the warm roster
+    /// (#1490): the resident is GPU-only; search measures these in-process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) cpu_excluded_slots: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

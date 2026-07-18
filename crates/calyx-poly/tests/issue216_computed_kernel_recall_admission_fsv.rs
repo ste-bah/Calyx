@@ -36,8 +36,8 @@ use calyx_poly::kernel_recall_admission::{
 use calyx_poly::superiority::SuperiorityTiers;
 use serde_json::json;
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 use support::{named_fsv_root, reset_dir, write_json};
 
 fn cx(i: u8) -> CxId {

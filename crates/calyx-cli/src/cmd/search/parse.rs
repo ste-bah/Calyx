@@ -3,6 +3,7 @@ use crate::error::{CliError, CliResult};
 use std::net::{IpAddr, SocketAddr};
 
 pub(super) const DEFAULT_K: usize = 10;
+pub(crate) const DEFAULT_KERNEL_MAX_HOPS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SearchArgs {
@@ -12,6 +13,7 @@ pub(crate) struct SearchArgs {
     pub fusion: SearchFusionArg,
     pub guard: SearchGuardArg,
     pub explain: bool,
+    pub rerank: bool,
     pub provenance: bool,
     pub freshness: SearchFreshnessArg,
     pub filter: Option<String>,
@@ -24,6 +26,10 @@ pub(crate) struct KernelAnswerArgs {
     pub query: String,
     pub anchor: Option<String>,
     pub explain: bool,
+    pub resident_addr: Option<SocketAddr>,
+    pub max_hops: usize,
+    pub citation_target: Option<String>,
+    pub citation_collection: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +67,7 @@ pub(crate) fn parse_search(rest: &[String]) -> CliResult<Subcommand> {
         fusion: SearchFusionArg::Rrf,
         guard: SearchGuardArg::Off,
         explain: false,
+        rerank: false,
         provenance: true,
         freshness: SearchFreshnessArg::Fresh,
         filter: None,
@@ -83,6 +90,7 @@ pub(crate) fn parse_search(rest: &[String]) -> CliResult<Subcommand> {
                 args.guard = SearchGuardArg::parse(value(rest, idx, "--guard")?)?;
             }
             "--explain" => args.explain = true,
+            "--rerank" => args.rerank = true,
             "--provenance" => args.provenance = true,
             "--no-provenance" => args.provenance = false,
             "--fresh" => set_freshness(&mut freshness_seen, &mut args, SearchFreshnessArg::Fresh)?,
@@ -116,6 +124,10 @@ pub(crate) fn parse_kernel_answer(rest: &[String]) -> CliResult<Subcommand> {
     validate_query_text(&query)?;
     let mut anchor = None;
     let mut explain = false;
+    let mut resident_addr = None;
+    let mut max_hops = DEFAULT_KERNEL_MAX_HOPS;
+    let mut citation_target = None;
+    let mut citation_collection = "legal-citations-v2".to_string();
     let mut idx = 2;
     while idx < rest.len() {
         match rest[idx].as_str() {
@@ -124,6 +136,37 @@ pub(crate) fn parse_kernel_answer(rest: &[String]) -> CliResult<Subcommand> {
                 anchor = Some(value(rest, idx, "--anchor")?.to_string());
             }
             "--explain" => explain = true,
+            "--resident-addr" => {
+                idx += 1;
+                resident_addr = Some(parse_resident_addr(value(rest, idx, "--resident-addr")?)?);
+            }
+            "--max-hops" => {
+                idx += 1;
+                let raw = value(rest, idx, "--max-hops")?;
+                max_hops = raw
+                    .parse::<usize>()
+                    .map_err(|error| CliError::usage(format!("parse --max-hops {raw}: {error}")))?;
+                if max_hops == 0 || max_hops > DEFAULT_KERNEL_MAX_HOPS {
+                    return Err(CliError::usage("--max-hops must be in 1..=32"));
+                }
+            }
+            "--citation-target" => {
+                idx += 1;
+                let value = value(rest, idx, "--citation-target")?;
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(CliError::usage(
+                        "--citation-target must be a CourtListener numeric opinion id",
+                    ));
+                }
+                citation_target = Some(value.to_string());
+            }
+            "--citation-collection" => {
+                idx += 1;
+                citation_collection = value(rest, idx, "--citation-collection")?.to_string();
+                if citation_collection.is_empty() {
+                    return Err(CliError::usage("--citation-collection must not be empty"));
+                }
+            }
             other => {
                 return Err(CliError::usage(format!(
                     "unexpected kernel-answer flag {other}"
@@ -137,6 +180,10 @@ pub(crate) fn parse_kernel_answer(rest: &[String]) -> CliResult<Subcommand> {
         query,
         anchor,
         explain,
+        resident_addr,
+        max_hops,
+        citation_target,
+        citation_collection,
     }))
 }
 
@@ -223,6 +270,9 @@ pub(crate) fn search_tokens(args: &SearchArgs) -> Vec<String> {
     if args.explain {
         out.push("--explain".to_string());
     }
+    if args.rerank {
+        out.push("--rerank".to_string());
+    }
     if !args.provenance {
         out.push("--no-provenance".to_string());
     }
@@ -250,6 +300,21 @@ pub(crate) fn kernel_answer_tokens(args: &KernelAnswerArgs) -> Vec<String> {
     }
     if args.explain {
         out.push("--explain".to_string());
+    }
+    if let Some(addr) = args.resident_addr {
+        out.extend(["--resident-addr".to_string(), addr.to_string()]);
+    }
+    if args.max_hops != DEFAULT_KERNEL_MAX_HOPS {
+        out.extend(["--max-hops".to_string(), args.max_hops.to_string()]);
+    }
+    if let Some(target) = &args.citation_target {
+        out.extend(["--citation-target".to_string(), target.clone()]);
+        if args.citation_collection != "legal-citations-v2" {
+            out.extend([
+                "--citation-collection".to_string(),
+                args.citation_collection.clone(),
+            ]);
+        }
     }
     out
 }

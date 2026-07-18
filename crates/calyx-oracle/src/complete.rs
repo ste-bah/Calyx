@@ -20,6 +20,9 @@ pub const COMPLETION_LEDGER_TAG: &str = "oracle_completion_v1";
 
 const LEDGER_ACTOR: &str = "calyx-oracle";
 
+pub(crate) type DescentProvider =
+    fn(&mut [f32], &[&[f32]], f32, usize, f32) -> Result<crate::DescentResult, OracleError>;
+
 /// Supplies trusted-region attractors for each free lens.
 pub trait CompletionRegion {
     fn members_for_lens(
@@ -159,6 +162,42 @@ where
     L: CompletionLedger,
     R: CompletionRegion,
 {
+    complete_with_descent_provider(
+        assay,
+        ledger,
+        cx,
+        panel,
+        domain,
+        clamp,
+        free,
+        region,
+        self_consistency,
+        anneal,
+        clock,
+        descend,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn complete_with_descent_provider<A, L, R>(
+    assay: &A,
+    ledger: &L,
+    cx: &Constellation,
+    panel: &Panel,
+    domain: DomainId,
+    clamp: SlotSet,
+    free: SlotSet,
+    region: &R,
+    self_consistency: OracleSelfConsistency,
+    anneal: &dyn AnnealConfig,
+    clock: &dyn Clock,
+    descent_provider: DescentProvider,
+) -> Result<CompletionResult, OracleError>
+where
+    A: SufficiencyAssay,
+    L: CompletionLedger,
+    R: CompletionRegion,
+{
     let all_slots = validate_request(cx, panel, &clamp, &free)?;
     let sufficiency = check_sufficiency_with_assay(assay, panel, domain.clone(), clock)?;
     let slot_vectors = dense_vectors_by_lens(cx, panel)?;
@@ -173,7 +212,7 @@ where
             .cloned()
             .unwrap_or_else(|| mean_vector(&members));
         let beta = get_beta(domain.clone(), anneal);
-        let descent = descend(
+        let descent = descent_provider(
             &mut vector,
             &member_refs,
             beta,

@@ -66,6 +66,26 @@ impl TurboQuantCodec {
         &self.rademacher
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn seed(&self) -> &RotationSeed {
+        &self.seed
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rotation(&self) -> &RotationSeed {
+        &self.rotation
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rotation_width(&self) -> usize {
+        self.rot_width
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn cuda_codebook_tables(&self) -> (Vec<f32>, Vec<f32>) {
+        lloyd::cuda_codebook_tables()
+    }
+
     pub fn prepare(&self, qv: &QuantizedVec) -> Result<PreparedQuant> {
         prepared::prepare(self, qv)
     }

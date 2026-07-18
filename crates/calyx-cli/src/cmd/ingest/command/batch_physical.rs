@@ -6,29 +6,6 @@ pub(super) struct BatchPhysicalBaseState {
     pub(super) tombstoned: BTreeSet<CxId>,
 }
 
-pub(super) fn collect_batch_cx_ids(
-    vault: &AsterVault,
-    state: &VaultPanelState,
-    path: &std::path::Path,
-) -> CliResult<BTreeSet<CxId>> {
-    use std::io::BufRead;
-
-    let file = std::fs::File::open(path)
-        .map_err(|err| CliError::io(format!("open batch {}: {err}", path.display())))?;
-    let reader = std::io::BufReader::new(file);
-    let mut ids = BTreeSet::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line =
-            line.map_err(|err| CliError::io(format!("read batch line {}: {err}", index + 1)))?;
-        let Some((text, _, _, _)) = parse_batch_line(index, &line)? else {
-            continue;
-        };
-        let input = text_input(text);
-        ids.insert(vault.cx_id_for_input(&input.bytes, state.panel.version));
-    }
-    Ok(ids)
-}
-
 pub(super) fn physical_batch_base_state(
     vault_path: &std::path::Path,
     cx_ids: &BTreeSet<CxId>,
@@ -37,58 +14,77 @@ pub(super) fn physical_batch_base_state(
         .iter()
         .map(|cx_id| base_key(*cx_id))
         .collect::<Vec<_>>();
-    let rows = if vault_path
-        .join(calyx_aster::base_page_index::BASE_PAGE_INDEX_DIR)
-        .join(calyx_aster::base_page_index::BASE_PAGE_INDEX_MANIFEST)
-        .exists()
-    {
-        read_indexed_batch_base_rows(vault_path, &keys)?
-    } else {
-        crate::cf_read::latest_cf_rows_for_keys(vault_path, ColumnFamily::Base, &keys).map_err(
-            |err| {
-                CliError::io(format!(
-                    "read physical Base CF rows for batch in {}: {err}",
-                    vault_path.display()
-                ))
-            },
-        )?
-    };
+    // The Base page index is a checked physical source of truth, not an
+    // optional cache. A missing manifest must follow the same rebuild path as
+    // a stale manifest; silently substituting a full CF scan both repeats the
+    // expensive I/O on every ingest and lets ingest report complete while
+    // `fsv vault-health` correctly reports the vault unready (#1675).
     let mut visible = BTreeSet::new();
     let mut tombstoned = BTreeSet::new();
-    for cx_id in cx_ids {
-        let key = base_key(*cx_id);
-        let Some(value) = rows.get(&key).cloned().flatten() else {
-            continue;
+    let stats = visit_indexed_batch_base_rows(vault_path, &keys, |key, value| {
+        let key_bytes: [u8; 16] = key.try_into().map_err(|_| {
+            CliError::runtime(format!(
+                "physical Base CF selection returned a {}-byte key; expected 16",
+                key.len()
+            ))
+        })?;
+        let cx_id = CxId::from_bytes(key_bytes);
+        let Some(value) = value else {
+            return Ok(());
         };
         if calyx_aster::mvcc::is_tombstone_value(&value) {
-            tombstoned.insert(*cx_id);
-            continue;
+            tombstoned.insert(cx_id);
+            return Ok(());
         }
         let decoded = decode_constellation_base(&value)?;
-        if decoded.cx_id != *cx_id {
+        if decoded.cx_id != cx_id {
             return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
                 "physical Base CF key {} decoded as mismatched cx {}",
                 cx_id, decoded.cx_id
             ))
             .into());
         }
-        visible.insert(*cx_id);
-    }
+        visible.insert(cx_id);
+        Ok(())
+    })?;
+    ingest_runtime_log(format_args!(
+        "phase=batch_physical_base_index_visit unique_keys={} touched_pages={} source_files={} live_rows={} missing_rows={}",
+        stats.unique_keys,
+        stats.touched_pages,
+        stats.source_files,
+        stats.live_rows,
+        stats.missing_rows
+    ));
     Ok(BatchPhysicalBaseState {
         visible,
         tombstoned,
     })
 }
 
-fn read_indexed_batch_base_rows(
+pub(super) fn visit_indexed_batch_base_rows(
     vault_path: &std::path::Path,
     keys: &[Vec<u8>],
-) -> CliResult<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
-    match calyx_aster::base_page_index::read_indexed_base_rows_for_keys(vault_path, keys) {
-        Ok(rows) => Ok(rows),
-        Err(error) if error.code == "CALYX_BASE_PAGE_INDEX_STALE" => {
+    mut visitor: impl FnMut(&[u8], Option<Vec<u8>>) -> CliResult<()>,
+) -> CliResult<calyx_aster::base_page_index::SelectedBaseRowsVisit> {
+    match calyx_aster::base_page_index::visit_indexed_base_rows_for_keys(
+        vault_path,
+        keys,
+        &mut visitor,
+    ) {
+        Ok(stats) => Ok(stats),
+        Err(error)
+            if matches!(
+                error.code(),
+                "CALYX_BASE_PAGE_INDEX_MISSING" | "CALYX_BASE_PAGE_INDEX_STALE"
+            ) =>
+        {
+            let reason = if error.code() == "CALYX_BASE_PAGE_INDEX_MISSING" {
+                "missing"
+            } else {
+                "stale"
+            };
             ingest_runtime_log(format_args!(
-                "phase=batch_base_page_index_rebuild_start reason=stale vault={} key_count={}",
+                "phase=batch_base_page_index_rebuild_start reason={reason} vault={} key_count={}",
                 vault_path.display(),
                 keys.len()
             ));
@@ -98,15 +94,17 @@ fn read_indexed_batch_base_rows(
                 |_| Ok(()),
             )?;
             ingest_runtime_log(format_args!(
-                "phase=batch_base_page_index_rebuild_ok vault={} live_entries={} pages={} ledger_head={}",
+                "phase=batch_base_page_index_rebuild_ok reason={reason} vault={} live_entries={} pages={} ledger_head={}",
                 vault_path.display(),
                 manifest.live_entries,
                 manifest.pages.len(),
                 manifest.ledger_head_height
             ));
-            Ok(calyx_aster::base_page_index::read_indexed_base_rows_for_keys(vault_path, keys)?)
+            calyx_aster::base_page_index::visit_indexed_base_rows_for_keys(
+                vault_path, keys, visitor,
+            )
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 
@@ -196,6 +194,7 @@ pub(super) fn reconcile_summary_with_physical_base(
     summary.batch_base_tombstoned_after = after.tombstoned.len();
     summary.new_count = materialized.len();
     summary.already_count = summary.row_count - summary.new_count;
+    summary.physical_reconciled = true;
     ingest_runtime_log(format_args!(
         "phase=batch_physical_base_readback_ok row_count={} distinct_cx={} new_count={} already_count={} runtime_new_count={} runtime_already_count={} visible_before={} visible_after={} tombstoned_before={} tombstoned_after={}",
         summary.row_count,

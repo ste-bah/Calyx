@@ -98,6 +98,9 @@ fn ten_events_persist_with_quantized_metadata() {
 
     assert_eq!(stats.ingested, 10);
     assert_eq!(stats.quantized, 10, "one dense slot quantized per event");
+    assert_eq!(stats.cpu_quantized, 10);
+    assert_eq!(stats.cuda_quantized, 0);
+    assert_eq!(stats.cuda_kernel_launches, 0);
     assert_eq!(stats.backpressured, 0);
     assert!(stats.batches >= 1);
 
@@ -243,4 +246,131 @@ fn nan_slot_fails_closed_at_send_and_writes_nothing() {
     assert_eq!(scan(&vault, ColumnFamily::Base).len(), 0);
     drop(vault);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn large_quantization_refuses_silent_cpu_fallback_without_cuda() {
+    let dir = test_dir("cuda-required");
+    let vault = durable_vault(&dir);
+    let input = IngestInput::new(b"cuda-required".to_vec(), 41, Modality::Text).with_slot(
+        SlotId::new(0),
+        SlotVector::Dense {
+            dim: 32_768,
+            data: vec![0.25; 32_768],
+        },
+    );
+    let ingester = StreamIngester::new(Arc::clone(&vault), config(), BackpressureGuard::new(1, 0));
+    ingester.send(input, EpochSecs(1_000)).expect("queue row");
+    let err = ingester
+        .drain_and_close()
+        .expect_err("large batch requires compiled CUDA");
+    assert_eq!(err.code, "CALYX_FORGE_DEVICE_UNAVAILABLE");
+    assert_eq!(scan(&vault, ColumnFamily::Base).len(), 0);
+    drop(vault);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA device; manual issue-1518 streaming FSV"]
+fn mixed_shape_cuda_microbatch_is_canonical_and_durable() {
+    let external = std::env::var_os("CALYX_ISSUE1518_VAULT").map(PathBuf::from);
+    let dir = external
+        .clone()
+        .unwrap_or_else(|| test_dir("issue1518-cuda-fsv"));
+    if external.is_some() {
+        assert!(!dir.exists(), "FSV vault must not already exist");
+        fs::create_dir_all(&dir).expect("create FSV vault");
+    }
+    let vault = durable_vault(&dir);
+    let events = (0..MICROBATCH_MAX)
+        .map(|index| StreamEvent {
+            input: mixed_shape_event(index),
+            at: EpochSecs(10_000 + index as i64),
+        })
+        .collect::<Vec<_>>();
+    let mut quantizer = quantize_batch::BatchQuantizer::default();
+    let started = std::time::Instant::now();
+    let outcome = process_batch(&vault, &config(), &events, None, &mut quantizer)
+        .expect("CUDA process microbatch");
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.ingested, MICROBATCH_MAX);
+    assert_eq!(outcome.quantized, MICROBATCH_MAX * 2);
+    assert_eq!(outcome.cpu_quantized, 0);
+    assert_eq!(outcome.cuda_quantized, MICROBATCH_MAX * 2);
+    assert_eq!(outcome.cuda_shape_groups, 2);
+    assert_eq!(outcome.cuda_kernel_launches, 12);
+    vault.flush().expect("flush FSV vault");
+    assert_eq!(scan(&vault, ColumnFamily::Base).len(), MICROBATCH_MAX);
+
+    for (index, event) in events.iter().enumerate() {
+        let cx_id = vault.cx_id_for_input(&event.input.raw_bytes, event.input.panel_version);
+        let stored = vault.get(cx_id, vault.snapshot()).expect("readback row");
+        assert_eq!(
+            stored.metadata.get("quantized").map(String::as_str),
+            Some("true")
+        );
+        for (slot_id, vector) in &event.input.slots {
+            let SlotVector::Dense { data, .. } = vector else {
+                unreachable!()
+            };
+            let expected = to_hex(&quantize_slot_online(data, &config(), cx_id).unwrap().bytes);
+            assert_eq!(
+                stored.metadata.get(&format!("quant_slot_{}", slot_id.0)),
+                Some(&expected),
+                "event {index} slot {}",
+                slot_id.0,
+            );
+        }
+    }
+    println!(
+        "ASTER_CUDA_STREAM_BENCH_JSON={}",
+        serde_json::json!({
+            "issue": 1518,
+            "events": MICROBATCH_MAX,
+            "quantized_rows": outcome.cuda_quantized,
+            "shape_groups": outcome.cuda_shape_groups,
+            "kernel_launches": outcome.cuda_kernel_launches,
+            "h2d_bytes": outcome.cuda_h2d_bytes,
+            "d2h_bytes": outcome.cuda_d2h_bytes,
+            "elapsed_seconds": elapsed.as_secs_f64(),
+            "events_per_second": MICROBATCH_MAX as f64 / elapsed.as_secs_f64(),
+            "storage_rows_read_back": MICROBATCH_MAX,
+            "canonical_rows_checked": MICROBATCH_MAX * 2,
+            "vault": dir,
+        })
+    );
+    drop(vault);
+    if external.is_none() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn mixed_shape_event(index: usize) -> IngestInput {
+    let vector = |dim: usize, salt: usize| {
+        (0..dim)
+            .map(|offset| ((index * 17 + offset * 13 + salt) as f32 * 0.003_906_25).sin())
+            .collect::<Vec<_>>()
+    };
+    IngestInput::new(
+        format!("issue1518-event-{index}").into_bytes(),
+        41,
+        Modality::Text,
+    )
+    .with_slot(
+        SlotId::new(0),
+        SlotVector::Dense {
+            dim: 128,
+            data: vector(128, 3),
+        },
+    )
+    .with_slot(
+        SlotId::new(1),
+        SlotVector::Dense {
+            dim: 64,
+            data: vector(64, 11),
+        },
+    )
 }

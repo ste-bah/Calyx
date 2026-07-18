@@ -232,6 +232,7 @@ pub(crate) fn run(args: &[String]) -> CliResult {
         "final_assignment_rng_factor": manifest.final_assignment_rng_factor,
         "final_assignment_closure": manifest.final_assignment_closure,
         "region_balance_cap": manifest.region_balance_cap,
+        "partition_build_diagnostics": manifest.partition_build_diagnostics,
         "root_graph_rel": manifest.root_graph_rel,
         "centroids_rel": manifest.centroids_rel,
         "build_seconds": build_secs,

@@ -153,6 +153,72 @@ fn batch_ingest_retains_new_rows_and_migrates_pointerless_rows() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn batch_pointer_preflight_skips_exact_rows_and_locks_only_pointerless_rows() {
+    let (root, resolved) = test_vault_with_registered_dense_lens("retained-batch-fast-path");
+    let exact = "issue1669 exact retained pointer";
+    let legacy = "issue1669 legacy pointerless input";
+    let fresh = "issue1669 absent fresh input";
+    let exact_hash = *blake3::hash(exact.as_bytes()).as_bytes();
+    let exact_pointer = calyx_aster::retained_input::canonical_text_pointer(&exact_hash);
+    let batch = root.join("pointer-fast-path.jsonl");
+    let metadata_map = BTreeMap::from([
+        (
+            "source_dataset".to_string(),
+            "issue1669-pointer-fast-path".to_string(),
+        ),
+        (
+            "source_sha256".to_string(),
+            "sha256-issue1669-pointer-fast-path".to_string(),
+        ),
+        (
+            "source_url".to_string(),
+            "https://example.test/issue1669-pointer-fast-path".to_string(),
+        ),
+        ("license".to_string(), "CC-BY-4.0".to_string()),
+        (
+            "retrieval_ts".to_string(),
+            "2026-07-14T00:00:00Z".to_string(),
+        ),
+    ]);
+    let exact_id = put_measured(&resolved, exact, Some(&exact_pointer), metadata_map.clone());
+    let legacy_id = put_pointerless_with_metadata(&resolved, legacy, metadata_map.clone());
+    let metadata = serde_json::to_value(metadata_map).unwrap();
+    fs::write(
+        &batch,
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"text": exact, "metadata": metadata.clone()}),
+            json!({"text": legacy, "metadata": metadata.clone()}),
+            json!({"text": fresh, "metadata": metadata}),
+        ),
+    )
+    .unwrap();
+    let vault = open_vault(&resolved).unwrap();
+    let state = load_vault_panel_state(&resolved.path).unwrap();
+    let exact_before = vault.get(exact_id, vault.snapshot()).unwrap();
+
+    let preflight =
+        preflight_batch_existing_identity(&vault, &state, &resolved.path, &batch, 3).unwrap();
+    let stats = backfill_batch_existing_input_pointers(&vault, &preflight).unwrap();
+
+    assert_eq!(stats.distinct_existing, 2);
+    assert_eq!(stats.exact_pointer_skipped, 1);
+    assert_eq!(stats.backfill_attempted, 1);
+    assert_eq!(stats.changed, 1);
+    let exact_after = vault.get(exact_id, vault.snapshot()).unwrap();
+    let legacy_after = vault.get(legacy_id, vault.snapshot()).unwrap();
+    assert_eq!(exact_after.input_ref, exact_before.input_ref);
+    assert_eq!(exact_after.provenance, exact_before.provenance);
+    assert!(legacy_after.input_ref.pointer.is_some());
+    assert!(
+        ledger_entries(&vault)
+            .iter()
+            .any(|entry| entry.kind == calyx_ledger::EntryKind::Migrate)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn put_pointerless(resolved: &ResolvedVault, text: &str) -> CxId {
     put_measured(resolved, text, None, BTreeMap::new())
 }

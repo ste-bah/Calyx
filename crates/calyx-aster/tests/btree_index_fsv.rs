@@ -5,7 +5,7 @@
 //! reads the bytes back through `decode_index_key` to prove the round-trip. Run:
 //!
 //! ```text
-//! cargo test -p calyx-aster --test btree_index_fsv -- --nocapture
+//! cargo test -p calyx-aster --test __calyx_integration_suite_0 btree_index_fsv -- --nocapture
 //! ```
 
 use calyx_aster::collection::FieldType;

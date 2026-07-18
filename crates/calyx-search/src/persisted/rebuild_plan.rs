@@ -1,15 +1,25 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 
-use calyx_core::{Constellation, CxId, SlotId};
+use calyx_core::{CxId, SlotId};
 use calyx_sextant::index::DiskAnnBuildBackend;
 
 use crate::error::{CliError, CliResult};
 use crate::persisted::SearchIndexManifest;
 
+pub(super) const DISKANN_BUILD_BACKEND_ENV: &str = "CALYX_SEARCH_DISKANN_BUILD_BACKEND";
+const REQUIRE_CUVS_ENV: &str = "CALYX_SEARCH_REQUIRE_CUVS_CAGRA";
+const ALLOW_CPU_REFERENCE_ENV: &str = "CALYX_SEARCH_ALLOW_CPU_DISKANN_REBUILD";
+const CUVS_UNAVAILABLE_CODE: &str = "CALYX_SEARCH_CUVS_CAGRA_UNAVAILABLE";
+const CPU_REFERENCE_CODE: &str = "CALYX_SEARCH_CPU_REFERENCE_OVERRIDE_REQUIRED";
+const CUVS_REMEDIATION: &str = "build the search binary on Linux with the cuda/cuVS feature set, or unset the strict cuVS requirement for a CPU-only reference run";
+const CPU_REFERENCE_REMEDIATION: &str = "set CALYX_SEARCH_ALLOW_CPU_DISKANN_REBUILD=1 only for an audited CPU reference rebuild, otherwise use cuVS CAGRA";
 const DEFAULT_REBUILD_SLOT_MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const DEFAULT_REBUILD_READER_LEASE_MS: u64 = 60 * 60 * 1000;
-const DEFAULT_REBUILD_SCAN_PAGE_ROWS: usize = 4096;
+// Base rows repeat every persisted slot payload and can be multiple MiB each.
+// Keep their transient scan window bounded independently of total corpus size.
+// Slot-CF payloads use a stricter one-row point-read bound in rebuild_scan.rs.
+const DEFAULT_REBUILD_SCAN_PAGE_ROWS: usize = 128;
 const DEFAULT_SLOT_ROW_MEMORY_ESTIMATE_BYTES: usize = 32 * 1024;
 const MIN_SLOT_MEMORY_ESTIMATE_BYTES: usize = 1024 * 1024;
 const DENSE_REBUILD_MEMORY_MULTIPLIER: usize = 6;
@@ -25,13 +35,20 @@ pub(super) struct SlotBuildPlan {
     pub(super) estimated_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DiskAnnBuildPolicy {
+    pub(super) backend: DiskAnnBuildBackend,
+    pub(super) source: &'static str,
+    pub(super) cuvs_compiled: bool,
+}
+
 pub(super) fn validate_parallel_rebuild_config() -> CliResult {
     configured_nonzero_usize("CALYX_SEARCH_REBUILD_MAX_PARALLEL_SLOTS")?;
     configured_nonzero_usize("RAYON_NUM_THREADS")?;
     configured_nonzero_usize("CALYX_SEARCH_REBUILD_MEMORY_BUDGET_BYTES")?;
     configured_nonzero_u64("CALYX_SEARCH_REBUILD_READER_LEASE_MS")?;
     configured_nonzero_usize("CALYX_SEARCH_REBUILD_SCAN_PAGE_ROWS")?;
-    configured_diskann_build_backend()?;
+    configured_diskann_build_policy()?;
     Ok(())
 }
 
@@ -49,47 +66,154 @@ pub(super) fn configured_rebuild_scan_page_rows() -> CliResult<usize> {
     )
 }
 
-pub(super) fn configured_diskann_build_backend() -> CliResult<DiskAnnBuildBackend> {
-    let raw = match env::var("CALYX_SEARCH_DISKANN_BUILD_BACKEND") {
-        Ok(raw) => raw,
-        Err(env::VarError::NotPresent) => return Ok(DiskAnnBuildBackend::CpuVamana),
+pub(super) fn configured_diskann_build_policy() -> CliResult<DiskAnnBuildPolicy> {
+    let raw_backend = match env::var(DISKANN_BUILD_BACKEND_ENV) {
+        Ok(raw) => Some(raw),
+        Err(env::VarError::NotPresent) => None,
         Err(env::VarError::NotUnicode(_)) => {
             return Err(CliError::usage(
                 "CALYX_SEARCH_DISKANN_BUILD_BACKEND must be valid UTF-8 when set",
             ));
         }
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(CliError::usage(
-            "CALYX_SEARCH_DISKANN_BUILD_BACKEND must not be empty",
+    resolve_diskann_build_policy(
+        raw_backend.as_deref(),
+        configured_bool(REQUIRE_CUVS_ENV)?,
+        configured_bool(ALLOW_CPU_REFERENCE_ENV)?,
+        calyx_sextant::CUVS_COMPILED,
+    )
+}
+
+fn resolve_diskann_build_policy(
+    raw_backend: Option<&str>,
+    require_cuvs: bool,
+    allow_cpu_reference: bool,
+    cuvs_compiled: bool,
+) -> CliResult<DiskAnnBuildPolicy> {
+    let (backend, source) = match raw_backend {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(CliError::usage(
+                    "CALYX_SEARCH_DISKANN_BUILD_BACKEND must not be empty",
+                ));
+            }
+            let backend = trimmed.parse::<DiskAnnBuildBackend>().map_err(|err| {
+                CliError::usage(format!(
+                    "CALYX_SEARCH_DISKANN_BUILD_BACKEND must be cpu-vamana or cuvs-cagra, got {raw:?}: {err}"
+                ))
+            })?;
+            (backend, "env")
+        }
+        None if cuvs_compiled => (DiskAnnBuildBackend::CuvsCagra, "compiled-cuvs-default"),
+        None => (DiskAnnBuildBackend::CpuVamana, "compiled-cpu-default"),
+    };
+    if require_cuvs && backend != DiskAnnBuildBackend::CuvsCagra {
+        return Err(calyx_error(
+            CUVS_UNAVAILABLE_CODE,
+            format!(
+                "{REQUIRE_CUVS_ENV}=1 requires cuvs-cagra, but resolved {backend:?} from {source}"
+            ),
+            CUVS_REMEDIATION,
         ));
     }
-    trimmed.parse::<DiskAnnBuildBackend>().map_err(|err| {
-        CliError::usage(format!(
-            "CALYX_SEARCH_DISKANN_BUILD_BACKEND must be cpu-vamana or cuvs-cagra, got {raw:?}: {err}"
-        ))
+    if backend == DiskAnnBuildBackend::CuvsCagra && !cuvs_compiled {
+        let reason =
+            calyx_sextant::cuvs_unavailable_reason("search-index rebuild cuvs-cagra backend");
+        return Err(calyx_error(
+            CUVS_UNAVAILABLE_CODE,
+            format!(
+                "{DISKANN_BUILD_BACKEND_ENV}=cuvs-cagra resolved from {source} requires cuVS CAGRA, but {reason}"
+            ),
+            CUVS_REMEDIATION,
+        ));
+    }
+    if backend == DiskAnnBuildBackend::CpuVamana && cuvs_compiled && !allow_cpu_reference {
+        return Err(calyx_error(
+            CPU_REFERENCE_CODE,
+            format!(
+                "{DISKANN_BUILD_BACKEND_ENV}=cpu-vamana is a CPU reference rebuild while cuVS is compiled"
+            ),
+            CPU_REFERENCE_REMEDIATION,
+        ));
+    }
+    let source = if backend == DiskAnnBuildBackend::CpuVamana && cuvs_compiled {
+        "env-cpu-reference"
+    } else {
+        source
+    };
+    Ok(DiskAnnBuildPolicy {
+        backend,
+        source,
+        cuvs_compiled,
     })
 }
 
-pub(super) fn slot_build_plans(
-    base_docs: &BTreeMap<CxId, Constellation>,
-    previous_manifest: Option<&SearchIndexManifest>,
-) -> Vec<SlotBuildPlan> {
-    let mut ids_by_slot = BTreeMap::<SlotId, Vec<CxId>>::new();
-    for (cx_id, cx) in base_docs {
-        for slot in cx.slots.keys() {
-            ids_by_slot.entry(*slot).or_default().push(*cx_id);
+fn configured_bool(name: &str) -> CliResult<bool> {
+    let raw = match env::var(name) {
+        Ok(raw) => raw,
+        Err(env::VarError::NotPresent) => return Ok(false),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(CliError::usage(format!(
+                "{name} must be valid UTF-8 when set"
+            )));
         }
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        "" => Err(CliError::usage(format!("{name} must not be empty"))),
+        other => Err(CliError::usage(format!(
+            "{name} must be one of 1/0/true/false/yes/no/on/off, got {other:?}"
+        ))),
     }
+}
+
+fn calyx_error(
+    code: &'static str,
+    message: impl Into<String>,
+    remediation: &'static str,
+) -> CliError {
+    calyx_core::CalyxError {
+        code,
+        message: message.into(),
+        remediation,
+    }
+    .into()
+}
+
+pub(super) fn manifest_backend(policy: DiskAnnBuildPolicy) -> (String, String, bool) {
+    (
+        policy.backend.as_str().to_string(),
+        policy.source.to_string(),
+        policy.cuvs_compiled,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn cpu_reference_policy_for_tests() -> DiskAnnBuildPolicy {
+    DiskAnnBuildPolicy {
+        backend: DiskAnnBuildBackend::CpuVamana,
+        source: "test-cpu-reference",
+        cuvs_compiled: calyx_sextant::CUVS_COMPILED,
+    }
+}
+
+pub(super) fn slot_build_plans(
+    ids_by_slot: &BTreeMap<SlotId, Vec<CxId>>,
+    previous_manifest: Option<&SearchIndexManifest>,
+    active_slots: Option<&BTreeSet<SlotId>>,
+) -> Vec<SlotBuildPlan> {
     ids_by_slot
-        .into_iter()
-        .map(|(slot, mut expected_ids)| {
+        .iter()
+        .filter(|(slot, _)| active_slots.is_none_or(|active| active.contains(slot)))
+        .map(|(slot, expected_ids)| {
+            let mut expected_ids = expected_ids.clone();
             expected_ids.sort();
             expected_ids.dedup();
-            let estimated_bytes = estimate_slot_bytes(slot, expected_ids.len(), previous_manifest);
+            let estimated_bytes = estimate_slot_bytes(*slot, expected_ids.len(), previous_manifest);
             SlotBuildPlan {
-                slot,
+                slot: *slot,
                 expected_ids,
                 estimated_bytes,
             }
@@ -207,4 +331,69 @@ fn configured_nonzero_u64(name: &str) -> CliResult<Option<u64>> {
         return Err(CliError::usage(format!("{name} must be >= 1")));
     }
     Ok(Some(parsed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_env_defaults_to_cuvs_when_compiled() {
+        let policy = resolve_diskann_build_policy(None, false, false, true).unwrap();
+
+        assert_eq!(policy.backend, DiskAnnBuildBackend::CuvsCagra);
+        assert_eq!(policy.source, "compiled-cuvs-default");
+        assert!(policy.cuvs_compiled);
+    }
+
+    #[test]
+    fn absent_env_defaults_to_cpu_only_when_cuvs_is_not_compiled() {
+        let policy = resolve_diskann_build_policy(None, false, false, false).unwrap();
+
+        assert_eq!(policy.backend, DiskAnnBuildBackend::CpuVamana);
+        assert_eq!(policy.source, "compiled-cpu-default");
+        assert!(!policy.cuvs_compiled);
+    }
+
+    #[test]
+    fn strict_gpu_requirement_fails_without_cuvs() {
+        let err = resolve_diskann_build_policy(None, true, false, false).unwrap_err();
+
+        assert_eq!(err.code(), CUVS_UNAVAILABLE_CODE);
+        assert!(err.message().contains(REQUIRE_CUVS_ENV));
+    }
+
+    #[test]
+    fn explicit_cuvs_fails_before_rebuild_when_cuvs_is_not_compiled() {
+        let err =
+            resolve_diskann_build_policy(Some("cuvs-cagra"), false, false, false).unwrap_err();
+
+        assert_eq!(err.code(), CUVS_UNAVAILABLE_CODE);
+        assert!(err.message().contains("requires cuVS"));
+    }
+
+    #[test]
+    fn cpu_reference_requires_audited_override_when_cuvs_is_compiled() {
+        let err = resolve_diskann_build_policy(Some("cpu-vamana"), false, false, true).unwrap_err();
+
+        assert_eq!(err.code(), CPU_REFERENCE_CODE);
+        assert!(err.message().contains("CPU reference rebuild"));
+    }
+
+    #[test]
+    fn cpu_reference_override_records_audited_source() {
+        let policy = resolve_diskann_build_policy(Some("cpu-vamana"), false, true, true).unwrap();
+
+        assert_eq!(policy.backend, DiskAnnBuildBackend::CpuVamana);
+        assert_eq!(policy.source, "env-cpu-reference");
+        assert!(policy.cuvs_compiled);
+    }
+
+    #[test]
+    fn invalid_backend_remains_usage_error() {
+        let err = resolve_diskann_build_policy(Some("surprise"), false, false, true).unwrap_err();
+
+        assert_eq!(err.code(), "CALYX_CLI_USAGE_ERROR");
+        assert!(err.message().contains(DISKANN_BUILD_BACKEND_ENV));
+    }
 }

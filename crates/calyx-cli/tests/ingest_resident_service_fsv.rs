@@ -59,7 +59,8 @@ fn batch_ingest_uses_existing_resident_service_and_persists_cfs() {
     );
 
     let progress = root.join("resident-progress.jsonl");
-    let mut service = spawn_resident_service(&root, template, &progress);
+    let service_stderr_path = root.join("resident-service.stderr.log");
+    let mut service = spawn_resident_service(&root, template, &progress, &service_stderr_path);
     let ready = read_ready(&mut service);
     let addr = ready["bind"].as_str().expect("ready bind").to_string();
     let process_id = ready["process_id"].as_u64().expect("ready process_id");
@@ -179,9 +180,11 @@ fn batch_ingest_uses_existing_resident_service_and_persists_cfs() {
     if !stop.status.success() {
         service.kill().ok();
     }
-    let service_output = service
+    let mut service_output = service
         .wait_with_output()
         .expect("wait for resident service");
+    service_output.stderr =
+        fs::read(&service_stderr_path).expect("read drained resident service stderr");
     println!(
         "resident_service_fsv_service_stderr={}",
         String::from_utf8_lossy(&service_output.stderr)
@@ -273,6 +276,7 @@ fn write_algorithmic_catalog(root: &Path, count: usize) {
                 truncate_dim: None,
                 recall_delta: calyx_registry::spec::default_recall_delta(),
                 max_batch: Some(4),
+                max_tokens: None,
                 batch_policy: None,
             };
             fs::write(
@@ -318,7 +322,13 @@ fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn spawn_resident_service(root: &Path, template: &str, progress: &Path) -> Child {
+fn spawn_resident_service(
+    root: &Path,
+    template: &str,
+    progress: &Path,
+    stderr_path: &Path,
+) -> Child {
+    let stderr = fs::File::create(stderr_path).expect("create resident service stderr log");
     Command::new(calyx_exe())
         .env("CALYX_HOME", root)
         .arg("panel")
@@ -335,7 +345,7 @@ fn spawn_resident_service(root: &Path, template: &str, progress: &Path) -> Child
         .arg("--max-load-secs")
         .arg("30")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn resident service")
 }

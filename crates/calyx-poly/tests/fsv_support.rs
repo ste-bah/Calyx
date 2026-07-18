@@ -1,7 +1,33 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+
+thread_local! {
+    /// Fallback FSV roots are test-temporary state. Owning them in TLS makes
+    /// cleanup run when the test thread exits, including unwind after panic,
+    /// while explicitly configured evidence roots are never registered.
+    static TEMP_FSV_ROOTS: RefCell<TempFsvRoots> = RefCell::new(TempFsvRoots::default());
+}
+
+#[derive(Default)]
+struct TempFsvRoots(Vec<PathBuf>);
+
+impl Drop for TempFsvRoots {
+    fn drop(&mut self) {
+        for path in self.0.iter().rev() {
+            if let Err(error) = fs::remove_dir_all(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "CALYX_POLY_TEMP_FSV_CLEANUP_FAILED path={} error={error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
 
 #[allow(
     dead_code,
@@ -151,10 +177,9 @@ pub fn named_fsv_root(env: &str, fallback_name: &str) -> (PathBuf, bool) {
     if let Some(value) = std::env::var_os(env) {
         return (PathBuf::from(value), true);
     }
-    (
-        std::env::temp_dir().join(format!("{fallback_name}-{}", std::process::id())),
-        false,
-    )
+    let path = std::env::temp_dir().join(format!("{fallback_name}-{}", std::process::id()));
+    TEMP_FSV_ROOTS.with(|roots| roots.borrow_mut().0.push(path.clone()));
+    (path, false)
 }
 
 #[allow(

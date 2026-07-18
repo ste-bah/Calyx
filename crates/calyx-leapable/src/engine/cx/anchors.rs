@@ -1,6 +1,6 @@
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::dedup::{AnchorConflictResult, check_anchor_conflict};
-use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, VaultStore};
+use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId, VaultStore};
 use serde_json::Value;
 
 use super::super::error::{AnchorConflictError, EngineError};
@@ -10,22 +10,54 @@ const ANCHOR_COMPACTION_MARKER: &[u8] = b"cx_anchor_compaction_v1";
 const ANCHOR_CONFLICT_REMEDIATION: &str =
     "send only one compatible anchor value per kind for duplicate cx.put";
 
-pub(super) fn merge_duplicate_anchors(
+/// Preserves Leapable's structured anchor-conflict contract without restoring
+/// a Base preflight read on successful puts. The diagnostic read occurs only
+/// after Aster has rejected the atomic put and is never used as a fallback.
+pub(super) fn classify_put_error(
     handle: &VaultHandle,
-    constellation: &Constellation,
-) -> EngineResult<usize> {
-    if constellation.anchors.is_empty() {
-        return Ok(0);
+    cx_id: CxId,
+    incoming_anchors: &[Anchor],
+    error: calyx_core::CalyxError,
+) -> EngineError {
+    if error.code != "CALYX_ASTER_CORRUPT_SHARD" || incoming_anchors.is_empty() {
+        return EngineError::Calyx(error);
     }
-    let existing = handle
-        .vault
-        .get(constellation.cx_id, handle.vault.snapshot())?;
-    if let Some(conflict) = anchor_conflict_error(&constellation.anchors, &existing) {
-        return Err(EngineError::AnchorConflict(Box::new(conflict)));
+    let existing = match handle.vault.get(cx_id, handle.vault.snapshot()) {
+        Ok(existing) => existing,
+        Err(_) => return EngineError::Calyx(error),
+    };
+    anchor_conflict_error(incoming_anchors, &existing)
+        .map(|conflict| EngineError::AnchorConflict(Box::new(conflict)))
+        .unwrap_or(EngineError::Calyx(error))
+}
+
+/// Identifies the first real anchor conflict after an atomic batch rejection.
+/// Stored rows and earlier same-id inputs are inspected only on the error path.
+pub(super) fn classify_batch_put_error(
+    handle: &VaultHandle,
+    constellations: &[Constellation],
+    error: calyx_core::CalyxError,
+) -> EngineError {
+    if error.code != "CALYX_ASTER_CORRUPT_SHARD" {
+        return EngineError::Calyx(error);
     }
-    Ok(handle
-        .vault
-        .merge_anchors(constellation.cx_id, constellation.anchors.clone())?)
+    let snapshot = handle.vault.snapshot();
+    let mut earlier = std::collections::BTreeMap::new();
+    for constellation in constellations {
+        if !constellation.anchors.is_empty() {
+            if let Some(existing) = earlier.get(&constellation.cx_id) {
+                if let Some(conflict) = anchor_conflict_error(&constellation.anchors, existing) {
+                    return EngineError::AnchorConflict(Box::new(conflict));
+                }
+            } else if let Ok(existing) = handle.vault.get(constellation.cx_id, snapshot)
+                && let Some(conflict) = anchor_conflict_error(&constellation.anchors, &existing)
+            {
+                return EngineError::AnchorConflict(Box::new(conflict));
+            }
+        }
+        earlier.insert(constellation.cx_id, constellation.clone());
+    }
+    EngineError::Calyx(error)
 }
 
 pub(super) fn repair_duplicate_anchor_bloat(handle: &VaultHandle) -> EngineResult<()> {

@@ -12,7 +12,7 @@ pub(super) const GPU_MEM_LIMIT_ENV: &str = "CALYX_ONNX_GPU_MEM_LIMIT_MIB";
 pub(super) const ARENA_SHRINK_ENV: &str = "CALYX_ONNX_ARENA_SHRINK";
 pub(super) const MAX_DISTINCT_SHAPES_ENV: &str = "CALYX_ONNX_MAX_DISTINCT_SHAPES";
 
-const DEFAULT_MAX_DISTINCT_SHAPES: usize = 64;
+pub(in crate::runtime::onnx) const DEFAULT_MAX_DISTINCT_SHAPES: usize = 64;
 pub(super) const ARENA_SHRINKAGE_RUN_KEY: &str = "memory.enable_memory_arena_shrinkage";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,17 +88,17 @@ pub(super) fn preflight_gpu_mem_limit_for_artifacts<'a>(
 
 pub(super) fn configured_arena_shrink() -> Result<ArenaShrinkPolicy> {
     let Ok(raw) = std::env::var(ARENA_SHRINK_ENV) else {
-        return Ok(ArenaShrinkPolicy::NewShape);
+        return Ok(ArenaShrinkPolicy::Always);
     };
     match raw.trim() {
-        "" => Ok(ArenaShrinkPolicy::NewShape),
+        "" => Ok(ArenaShrinkPolicy::Always),
         "off" => Ok(ArenaShrinkPolicy::Off),
         "new-shape" => Ok(ArenaShrinkPolicy::NewShape),
         "always" => Ok(ArenaShrinkPolicy::Always),
         other => Err(CalyxError {
             code: "CALYX_ONNX_ARENA_SHRINK_INVALID",
             message: format!("{ARENA_SHRINK_ENV}={other} is not a known arena shrink policy"),
-            remediation: "set CALYX_ONNX_ARENA_SHRINK to off, new-shape, or always (default new-shape)",
+            remediation: "set CALYX_ONNX_ARENA_SHRINK to off, new-shape, or always (default always)",
         }),
     }
 }

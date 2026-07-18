@@ -1,17 +1,26 @@
-use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use calyx_core::{
-    Input, Lens, LensId, Modality, Result, SlotShape, SlotVector, SparseEntry, content_address,
-};
+use calyx_core::{Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::lens::ensure_input_modality;
 
+mod batch;
+#[cfg(all(test, feature = "cuda"))]
+mod benchmark;
+mod cpu;
 mod gdelt;
 
+pub use batch::{
+    AlgorithmicBatchProvider, AlgorithmicBatchStats, BYTE_FEATURES_CUDA_MIN_INPUT_BYTES,
+    SPARSE_KEYWORDS_CUDA_MIN_TOKENS, TOKEN_HASH_CUDA_MIN_WORDS,
+};
+use cpu::{
+    ast_style_features, byte_features, hash_part, one_hot_features, scalar_features,
+    sparse_keywords, token_hash,
+};
+
 const BYTE_FEATURE_DIM: u32 = 16;
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
 
 /// Deterministic, data-local feature encoders with no model weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +139,7 @@ pub struct AlgorithmicLens {
     modality: Modality,
     encoder: AlgorithmicEncoder,
     contract: FrozenLensContract,
+    batch: Arc<batch::BatchState>,
 }
 
 impl AlgorithmicLens {
@@ -228,6 +238,7 @@ impl AlgorithmicLens {
             modality,
             encoder,
             contract,
+            batch: Arc::new(batch::BatchState::default()),
         }
     }
 
@@ -235,23 +246,13 @@ impl AlgorithmicLens {
     pub fn contract(&self) -> &FrozenLensContract {
         &self.contract
     }
-}
 
-impl Lens for AlgorithmicLens {
-    fn id(&self) -> LensId {
-        self.id
+    /// Returns the most recent serializable batch provider/transfer evidence.
+    pub fn last_batch_stats(&self) -> Option<AlgorithmicBatchStats> {
+        self.batch.last_stats()
     }
 
-    fn shape(&self) -> SlotShape {
-        self.encoder.shape()
-    }
-
-    fn modality(&self) -> Modality {
-        self.modality
-    }
-
-    fn measure(&self, input: &Input) -> Result<SlotVector> {
-        ensure_input_modality(self, input)?;
+    fn measure_cpu(&self, input: &Input) -> Result<SlotVector> {
         Ok(match self.encoder {
             AlgorithmicEncoder::ByteFeatures => SlotVector::Dense {
                 dim: self.encoder.dim(),
@@ -297,6 +298,36 @@ impl Lens for AlgorithmicLens {
     }
 }
 
+impl Lens for AlgorithmicLens {
+    fn id(&self) -> LensId {
+        self.id
+    }
+
+    fn shape(&self) -> SlotShape {
+        self.encoder.shape()
+    }
+
+    fn modality(&self) -> Modality {
+        self.modality
+    }
+
+    fn measure(&self, input: &Input) -> Result<SlotVector> {
+        ensure_input_modality(self, input)?;
+        let output = self.measure_cpu(input)?;
+        self.batch.record(batch::cpu_stats(
+            self.encoder,
+            std::slice::from_ref(input),
+            1,
+            "single-input CPU path",
+        ));
+        Ok(output)
+    }
+
+    fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
+        batch::measure_batch(self, inputs)
+    }
+}
+
 fn algorithmic_contract(
     name: &str,
     modality: Modality,
@@ -315,160 +346,6 @@ fn algorithmic_contract(
         LensDType::F32,
         NormPolicy::None,
     )
-}
-
-fn byte_features(bytes: &[u8]) -> Vec<f32> {
-    let mut out = vec![0.0_f32; BYTE_FEATURE_DIM as usize];
-    if bytes.is_empty() {
-        out[0] = 1.0;
-        return out;
-    }
-
-    let mut ascii = 0_u32;
-    let mut whitespace = 0_u32;
-    let mut alphabetic = 0_u32;
-    let mut digits = 0_u32;
-    let mut punctuation = 0_u32;
-    let mut uppercase = 0_u32;
-    let mut lowercase = 0_u32;
-    let mut control = 0_u32;
-    let mut nul = 0_u32;
-    let mut path = 0_u32;
-    let mut brackets = 0_u32;
-    let mut newline = 0_u32;
-    let mut byte_sum = 0_u64;
-    let mut hash = FNV_OFFSET;
-
-    for &byte in bytes {
-        byte_sum += u64::from(byte);
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-        ascii += byte.is_ascii() as u32;
-        whitespace += byte.is_ascii_whitespace() as u32;
-        alphabetic += byte.is_ascii_alphabetic() as u32;
-        digits += byte.is_ascii_digit() as u32;
-        punctuation += byte.is_ascii_punctuation() as u32;
-        uppercase += byte.is_ascii_uppercase() as u32;
-        lowercase += byte.is_ascii_lowercase() as u32;
-        control += byte.is_ascii_control() as u32;
-        nul += (byte == 0) as u32;
-        path += matches!(byte, b'/' | b'\\') as u32;
-        brackets += matches!(byte, b'{' | b'}' | b'(' | b')' | b'[' | b']') as u32;
-        newline += matches!(byte, b'\n' | b'\r') as u32;
-    }
-
-    let len = bytes.len().min(u32::MAX as usize) as f32;
-    let inv_len = 1.0 / len.max(1.0);
-    out[0] = len.log2().max(0.0) / 32.0;
-    out[1] = ascii as f32 * inv_len;
-    out[2] = whitespace as f32 * inv_len;
-    out[3] = alphabetic as f32 * inv_len;
-    out[4] = digits as f32 * inv_len;
-    out[5] = punctuation as f32 * inv_len;
-    out[6] = uppercase as f32 * inv_len;
-    out[7] = lowercase as f32 * inv_len;
-    out[8] = control as f32 * inv_len;
-    out[9] = nul as f32 * inv_len;
-    out[10] = path as f32 * inv_len;
-    out[11] = brackets as f32 * inv_len;
-    out[12] = newline as f32 * inv_len;
-    out[13] = byte_sum as f32 / (len * 255.0);
-    out[14] = hash_part((hash & 0xffff_ffff) as u32);
-    out[15] = hash_part((hash >> 32) as u32);
-    out
-}
-
-fn hash_part(value: u32) -> f32 {
-    (value as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn scalar_features(bytes: &[u8]) -> Vec<f32> {
-    if bytes.is_empty() {
-        return vec![0.0];
-    }
-    let mean = bytes.iter().map(|byte| f32::from(*byte)).sum::<f32>() / bytes.len() as f32;
-    vec![(mean - 80.0) / 80.0]
-}
-
-fn one_hot_features(bytes: &[u8], buckets: u32) -> Vec<f32> {
-    let buckets = buckets.max(1);
-    let mut out = vec![0.0; buckets as usize];
-    let hash = bytes.iter().fold(FNV_OFFSET, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
-    });
-    out[(hash % u64::from(buckets)) as usize] = 1.0;
-    out
-}
-
-fn ast_style_features(bytes: &[u8]) -> Vec<f32> {
-    let text = String::from_utf8_lossy(bytes);
-    let len = bytes.len().max(1) as f32;
-    let count = |needle: &str| text.matches(needle).count() as f32 / len;
-    vec![
-        count("fn"),
-        count("let"),
-        count("struct"),
-        count("impl"),
-        bytes.iter().filter(|b| matches!(b, b'{' | b'}')).count() as f32 / len,
-        bytes.iter().filter(|b| **b == b';').count() as f32 / len,
-        bytes.iter().filter(|b| **b == b'(').count() as f32 / len,
-        bytes.iter().filter(|b| **b == b'\n').count() as f32 / len,
-    ]
-}
-
-fn sparse_keywords(bytes: &[u8], dim: u32) -> Result<SlotVector> {
-    let dim = dim.max(1);
-    let mut counts = BTreeMap::<u32, f32>::new();
-    for term in String::from_utf8_lossy(bytes).split_whitespace() {
-        let digest = content_address([term.as_bytes()]);
-        let hash = u32::from_be_bytes(digest[..4].try_into().expect("content hash has bytes"));
-        *counts.entry(hash % dim).or_default() += 1.0;
-    }
-    let total = counts.values().sum::<f32>().max(1.0);
-    Ok(SlotVector::Sparse {
-        dim,
-        entries: counts
-            .into_iter()
-            .map(|(idx, val)| SparseEntry {
-                idx,
-                val: val / total,
-            })
-            .collect(),
-    })
-}
-
-fn token_hash(bytes: &[u8], token_dim: u32) -> Result<SlotVector> {
-    let token_dim = token_dim.max(1);
-    let mut tokens = String::from_utf8_lossy(bytes)
-        .split_whitespace()
-        .take(32)
-        .map(|term| token_vector(term.as_bytes(), token_dim))
-        .collect::<Vec<_>>();
-    if tokens.is_empty() {
-        tokens.push(token_vector(bytes, token_dim));
-    }
-    Ok(SlotVector::Multi { token_dim, tokens })
-}
-
-fn token_vector(seed: &[u8], dim: u32) -> Vec<f32> {
-    let mut out = Vec::with_capacity(dim as usize);
-    let mut counter = 0_u32;
-    while out.len() < dim as usize {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"calyx-algorithmic-token-hash-v1");
-        hasher.update(seed);
-        hasher.update(&counter.to_be_bytes());
-        for chunk in hasher.finalize().as_bytes().chunks_exact(4) {
-            let raw = u32::from_be_bytes(chunk.try_into().expect("blake3 chunk is 4 bytes"));
-            let unit = (raw as f32 / u32::MAX as f32) * 2.0 - 1.0;
-            out.push(unit);
-            if out.len() == dim as usize {
-                break;
-            }
-        }
-        counter = counter.saturating_add(1);
-    }
-    out
 }
 
 #[cfg(test)]

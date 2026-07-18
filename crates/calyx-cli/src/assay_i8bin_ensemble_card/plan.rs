@@ -180,9 +180,13 @@ struct PlanSlotParts {
 
 fn plan_slot(parts: PlanSlotParts, report_slot: Option<&ReportSlot>) -> PlanSlot {
     let manifest = report_slot.and_then(|slot| slot.manifest.clone());
-    let runtime = manifest
-        .as_ref()
-        .and_then(|path| manifest_runtime(path).ok());
+    let runtime = report_slot
+        .and_then(|slot| slot.runtime.clone())
+        .or_else(|| {
+            manifest
+                .as_ref()
+                .and_then(|path| manifest_runtime(path).ok())
+        });
     PlanSlot {
         slot: parts.slot,
         name: parts.name,
@@ -325,6 +329,8 @@ struct StreamReportJson {
 struct ReportSlot {
     slot: u16,
     manifest: Option<PathBuf>,
+    #[serde(default)]
+    runtime: Option<String>,
     dim: usize,
     max_batch: Option<usize>,
     #[serde(default)]

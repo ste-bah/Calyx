@@ -139,6 +139,73 @@ where
         })
     }
 
+    /// Atomically appends ordered prefix entries and one completion entry that
+    /// can bind the prefix ledger refs. Every payload is prepared and checked
+    /// before the single durable storage commit, so a late completion failure
+    /// leaves no visible prefix rows.
+    pub fn append_ledger_entries_with_final<F>(
+        &self,
+        entries: Vec<(EntryKind, SubjectId, Vec<u8>, ActorId)>,
+        final_entry: F,
+    ) -> Result<Vec<LedgerRef>>
+    where
+        F: FnOnce(&[LedgerRef]) -> Result<(EntryKind, SubjectId, Vec<u8>, ActorId)>,
+    {
+        self.with_durable_commit_lock(move || {
+            let Some(hook) = &self.ledger_hook else {
+                let store = AsterRawLedgerStore { vault: self };
+                let appender = LedgerAppender::open(store, SystemClock)?;
+                let mut prepared = Vec::new();
+                let mut data_refs = Vec::new();
+                for (kind, subject, payload, actor) in entries {
+                    let next = match prepared.last() {
+                        Some(predecessor) => {
+                            appender.prepare_after(predecessor, kind, subject, payload, actor)?
+                        }
+                        None => appender.prepare(kind, subject, payload, actor)?,
+                    };
+                    data_refs.push(next.ledger_ref());
+                    prepared.push(next);
+                }
+                let (kind, subject, payload, actor) = final_entry(&data_refs)?;
+                let final_prepared = match prepared.last() {
+                    Some(predecessor) => {
+                        appender.prepare_after(predecessor, kind, subject, payload, actor)?
+                    }
+                    None => appender.prepare(kind, subject, payload, actor)?,
+                };
+                data_refs.push(final_prepared.ledger_ref());
+                prepared.push(final_prepared);
+                let rows = prepared
+                    .iter()
+                    .map(|entry| encode::WriteRow {
+                        cf: ColumnFamily::Ledger,
+                        key: ledger_key(entry.seq()),
+                        value: entry.bytes().to_vec(),
+                    })
+                    .collect::<Vec<_>>();
+                self.commit_rows_locked(&rows)?;
+                return Ok(data_refs);
+            };
+            let mut guard = ledger_hook::lock_hook(hook)?;
+            let (staged, data_refs) =
+                guard.stage_many_with_checkpoints_and_final(entries, final_entry)?;
+            let rows = staged
+                .iter()
+                .map(|row| encode::WriteRow {
+                    cf: ColumnFamily::Ledger,
+                    key: row.key().to_vec(),
+                    value: row.value().to_vec(),
+                })
+                .collect::<Vec<_>>();
+            self.commit_rows_locked(&rows)?;
+            for row in &staged {
+                guard.commit_staged(row)?;
+            }
+            Ok(data_refs)
+        })
+    }
+
     /// Records a reproduce verdict as a `reproduce_v1` Ledger Admin row.
     pub fn record_reproduce_with_input_resolver(
         &self,
@@ -175,6 +242,47 @@ where
         let store = AsterRawLedgerStore { vault: self };
         let mut appender = LedgerAppender::open(store, SystemClock)?;
         appender.append(kind, subject, payload, actor)
+    }
+
+    /// Appends a ledger row prepared by an external adapter while keeping the
+    /// vault-owned live ledger hook synchronized with the durable Ledger CF.
+    pub fn append_external_ledger_row(&self, seq: u64, bytes: &[u8]) -> Result<()> {
+        self.with_durable_commit_lock(|| {
+            let key = ledger_key(seq);
+            if self
+                .read_cf_at(self.latest_seq(), ColumnFamily::Ledger, &key)?
+                .is_some()
+            {
+                return Err(CalyxError::ledger_append_only_violation(format!(
+                    "Aster ledger seq {seq} already exists"
+                )));
+            }
+            let rows = [encode::WriteRow {
+                cf: ColumnFamily::Ledger,
+                key,
+                value: bytes.to_vec(),
+            }];
+            self.commit_rows_locked(&rows)?;
+            self.refresh_ledger_hook_after_external_append_locked()
+        })
+    }
+
+    fn refresh_ledger_hook_after_external_append_locked(&self) -> Result<()> {
+        let (Some(hook), Some(durable)) = (&self.ledger_hook, &self.durable) else {
+            return Ok(());
+        };
+        let recovered = durable.recover_current_batches()?;
+        if durable.value_crypto_enabled() {
+            ledger_hook::refresh_hook_from_recovery(hook, &recovered, durable.ledger_checkpoint())
+        } else {
+            ledger_hook::refresh_hook(
+                hook,
+                durable.root(),
+                &recovered,
+                durable.ledger_checkpoint(),
+                durable.tiering_policy(),
+            )
+        }
     }
 
     fn anchor_with_raw_ledger_entry(
@@ -214,14 +322,38 @@ where
 
     pub(crate) fn commit_rows_with_ledger_entry_locked(
         &self,
-        mut rows: Vec<encode::WriteRow>,
+        rows: Vec<encode::WriteRow>,
         kind: EntryKind,
         subject: SubjectId,
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<LedgerRef> {
+        self.commit_rows_with_ledger_entry_policy_locked(rows, kind, subject, payload, actor, false)
+    }
+
+    pub(crate) fn commit_erasure_rows_with_ledger_entry_locked(
+        &self,
+        rows: Vec<encode::WriteRow>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<LedgerRef> {
+        self.commit_rows_with_ledger_entry_policy_locked(rows, kind, subject, payload, actor, true)
+    }
+
+    fn commit_rows_with_ledger_entry_policy_locked(
+        &self,
+        mut rows: Vec<encode::WriteRow>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+        erasure: bool,
+    ) -> Result<LedgerRef> {
         let Some(hook) = &self.ledger_hook else {
-            return self.commit_rows_with_raw_ledger_entry(rows, kind, subject, payload, actor);
+            return self
+                .commit_rows_with_raw_ledger_entry(rows, kind, subject, payload, actor, erasure);
         };
         let mut guard = ledger_hook::lock_hook(hook)?;
         let staged = guard.stage_with_checkpoints(kind, subject, payload, actor)?;
@@ -234,7 +366,11 @@ where
             key: row.key().to_vec(),
             value: row.value().to_vec(),
         }));
-        self.commit_rows_locked(&rows)?;
+        if erasure {
+            self.commit_erasure_rows_locked(&rows)?;
+        } else {
+            self.commit_rows_locked(&rows)?;
+        }
         for row in &staged {
             guard.commit_staged(row)?;
         }
@@ -248,6 +384,7 @@ where
         subject: SubjectId,
         payload: Vec<u8>,
         actor: ActorId,
+        erasure: bool,
     ) -> Result<LedgerRef> {
         let store = AsterRawLedgerStore { vault: self };
         let appender = LedgerAppender::open(store, SystemClock)?;
@@ -258,7 +395,11 @@ where
             key: ledger_key(prepared.seq()),
             value: prepared.bytes().to_vec(),
         });
-        self.commit_rows_locked(&rows)?;
+        if erasure {
+            self.commit_erasure_rows_locked(&rows)?;
+        } else {
+            self.commit_rows_locked(&rows)?;
+        }
         Ok(ledger_ref)
     }
 }

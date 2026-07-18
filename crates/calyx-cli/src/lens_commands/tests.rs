@@ -79,3 +79,41 @@ fn commission_rejects_zero_max_batch() {
     assert_eq!(error.code(), "CALYX_CLI_USAGE_ERROR");
     assert!(error.message().contains("--max-batch must be > 0"));
 }
+
+#[test]
+fn commission_rejects_zero_max_tokens() {
+    let error = run(
+        "commission",
+        &[
+            "--hf".to_string(),
+            "Qwen/Qwen3-Embedding-0.6B".to_string(),
+            "--runtime".to_string(),
+            "fastembed-qwen3".to_string(),
+            "--max-tokens".to_string(),
+            "0".to_string(),
+        ],
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), "CALYX_CLI_USAGE_ERROR");
+    assert!(error.message().contains("--max-tokens must be > 0"));
+}
+
+#[test]
+fn commission_rejects_max_tokens_for_non_qwen_runtime() {
+    let error = run(
+        "commission",
+        &[
+            "--hf".to_string(),
+            "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            "--runtime".to_string(),
+            "onnx-fp32".to_string(),
+            "--max-tokens".to_string(),
+            "8192".to_string(),
+        ],
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), "CALYX_CLI_USAGE_ERROR");
+    assert!(error.message().contains("fastembed-qwen3"));
+}

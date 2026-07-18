@@ -1,7 +1,7 @@
 use crate::cf::{ColumnFamily, SlotFamilyKind};
 use calyx_core::{CalyxError, Result, SlotId};
 
-pub(super) fn cf_tag(cf: ColumnFamily) -> u8 {
+pub(crate) fn cf_tag(cf: ColumnFamily) -> u8 {
     match cf {
         ColumnFamily::Base => 0,
         ColumnFamily::Collections => 117,
@@ -47,7 +47,7 @@ pub(super) fn cf_tag(cf: ColumnFamily) -> u8 {
     }
 }
 
-pub(super) fn decode_cf(tag: u8) -> Result<ColumnFamily> {
+pub(crate) fn decode_cf(tag: u8) -> Result<ColumnFamily> {
     Ok(match tag {
         0 => ColumnFamily::Base,
         117 => ColumnFamily::Collections,

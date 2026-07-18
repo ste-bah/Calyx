@@ -37,6 +37,11 @@ fn seed_vault(dir: &std::path::Path) {
         DEFAULT_ASTER_ASSOC_COLLECTION,
         &AsterAssocMetadata {
             retention_horizon: Some(1),
+            embedding_slot: None,
+            panel_version: None,
+            graph_source_seq: None,
+            knn: None,
+            edge_cos_threshold: None,
         },
     )
     .unwrap();

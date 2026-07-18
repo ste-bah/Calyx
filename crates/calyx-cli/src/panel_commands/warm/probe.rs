@@ -260,7 +260,7 @@ pub(super) fn base_progress_record(template: &str, phase: &str) -> WarmProgressR
         declared_template_vram_mib: None,
         estimated_resident_vram_mib: None,
         max_resident_vram_mib: None,
-        resident_overhead_multiplier: None,
+        resident_overhead_multiplier_milli: None,
         load_parallelism: None,
         vector_kind: None,
         vector_len: None,
@@ -287,7 +287,7 @@ pub(super) fn vector_kind_len(vector: &SlotVector) -> (&'static str, usize) {
     }
 }
 
-pub(super) fn probe_bytes(modality: Modality) -> CliResult<Vec<u8>> {
+pub(in crate::panel_commands) fn probe_bytes(modality: Modality) -> CliResult<Vec<u8>> {
     match modality {
         Modality::Text => Ok(b"Calyx Blackwell warm-load probe: semantic text path.".to_vec()),
         Modality::Code => Ok(b"fn calyx_warm_probe() -> u32 { 42 }".to_vec()),
@@ -362,8 +362,11 @@ pub(super) fn runtime_detail(runtime: &LensRuntime) -> String {
             model_id, output, ..
         } => format!("{model_id};output={output:?}"),
         LensRuntime::FastembedQwen3 {
-            model_id, dtype, ..
-        } => format!("{model_id};dtype={dtype}"),
+            model_id,
+            dtype,
+            max_tokens,
+            ..
+        } => format!("{model_id};dtype={dtype};max_tokens={max_tokens}"),
         LensRuntime::StaticLookup {
             embeddings_file,
             tokenizer,

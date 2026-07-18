@@ -76,6 +76,14 @@ pub enum SpectralError {
     GraphTooSmall { n: usize, required: usize },
     #[error("CALYX_SPECTRAL_SINGULAR_MATRIX: graph has no positive spectral mass")]
     SingularMatrix,
+    #[error(
+        "CALYX_SPECTRAL_INVALID_OPERATOR: operator returned length {actual} for dimension {expected} with {non_finite} non-finite values"
+    )]
+    InvalidOperator {
+        expected: usize,
+        actual: usize,
+        non_finite: usize,
+    },
 }
 
 impl SpectralError {
@@ -84,6 +92,7 @@ impl SpectralError {
             Self::NotConverged { .. } => "CALYX_SPECTRAL_NOT_CONVERGED",
             Self::GraphTooSmall { .. } => "CALYX_SPECTRAL_GRAPH_TOO_SMALL",
             Self::SingularMatrix => "CALYX_SPECTRAL_SINGULAR_MATRIX",
+            Self::InvalidOperator { .. } => "CALYX_SPECTRAL_INVALID_OPERATOR",
         }
     }
 }
@@ -123,6 +132,35 @@ pub fn laplacian_eigenmaps_with_max_iter(
     k: usize,
     max_iter: usize,
 ) -> SpectralResult<Vec<EigenPair>> {
+    eigenmaps_with_max_iter(graph, k, max_iter, LaplacianKind::Unnormalized)
+}
+
+/// Smallest eigenpairs of the symmetric normalized Laplacian.
+///
+/// This is the operator used by multiway spectral clustering: unlike the
+/// unnormalized Laplacian, degree variation cannot dominate the embedding,
+/// and callers can row-normalize the returned coordinates as in Ng-Jordan-
+/// Weiss before clustering.
+pub fn normalized_laplacian_eigenmaps_with_max_iter(
+    graph: &SparseGraph,
+    k: usize,
+    max_iter: usize,
+) -> SpectralResult<Vec<EigenPair>> {
+    eigenmaps_with_max_iter(graph, k, max_iter, LaplacianKind::Normalized)
+}
+
+#[derive(Clone, Copy)]
+enum LaplacianKind {
+    Unnormalized,
+    Normalized,
+}
+
+fn eigenmaps_with_max_iter(
+    graph: &SparseGraph,
+    k: usize,
+    max_iter: usize,
+    kind: LaplacianKind,
+) -> SpectralResult<Vec<EigenPair>> {
     ensure_min_nodes(graph, 2)?;
     if k == 0 {
         return Ok(Vec::new());
@@ -132,10 +170,14 @@ pub fn laplacian_eigenmaps_with_max_iter(
     }
     let sparse = SymmetricSparseGraph::from_assoc(graph);
     let target_dim = lanczos_target_dim(sparse.len(), k, max_iter)?;
-    let shift = sparse.laplacian_shift();
+    let shift = match kind {
+        LaplacianKind::Unnormalized => sparse.laplacian_shift(),
+        LaplacianKind::Normalized => 2.0 + EIGEN_EPS,
+    };
     let (values, vectors) =
-        lanczos_eigen_operator(sparse.len(), target_dim, target_dim, |vector| {
-            sparse.shifted_laplacian_mat_vec(vector, shift)
+        lanczos_eigen_operator(sparse.len(), target_dim, target_dim, |vector| match kind {
+            LaplacianKind::Unnormalized => sparse.shifted_laplacian_mat_vec(vector, shift),
+            LaplacianKind::Normalized => sparse.shifted_normalized_laplacian_mat_vec(vector, shift),
         })?;
     let mut pairs: Vec<_> = values
         .into_iter()
@@ -275,6 +317,30 @@ impl SymmetricSparseGraph {
                     self.degree[row_index] * vector[row_index],
                     |acc, (col_index, weight)| acc - weight * vector[*col_index],
                 );
+                shift * vector[row_index] - laplacian_value
+            })
+            .collect()
+    }
+
+    fn shifted_normalized_laplacian_mat_vec(&self, vector: &[f32], shift: f32) -> Vec<f32> {
+        self.adjacency
+            .par_iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let row_degree = self.degree[row_index];
+                let normalized_adjacency = if row_degree <= EIGEN_EPS {
+                    0.0
+                } else {
+                    row.iter().fold(0.0_f32, |acc, (col_index, weight)| {
+                        let col_degree = self.degree[*col_index];
+                        if col_degree <= EIGEN_EPS {
+                            acc
+                        } else {
+                            acc + weight * vector[*col_index] / (row_degree * col_degree).sqrt()
+                        }
+                    })
+                };
+                let laplacian_value = vector[row_index] - normalized_adjacency;
                 shift * vector[row_index] - laplacian_value
             })
             .collect()

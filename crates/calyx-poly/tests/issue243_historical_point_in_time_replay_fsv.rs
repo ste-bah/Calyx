@@ -3,7 +3,9 @@
 //! Source of truth: persisted cutoff snapshots, CalyxNative forecast artifacts, score artifacts,
 //! and score ledger rows read back from disk.
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_rs as fsv_support;
 
 use std::fs;
 use std::path::Path;

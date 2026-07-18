@@ -149,6 +149,26 @@ fn parse_kernel_answer_accepts_anchor_and_explain() {
 
     assert_eq!(args.anchor.as_deref(), Some("label:gold"));
     assert!(args.explain);
+    assert!(args.resident_addr.is_none());
+    assert_eq!(args.max_hops, 32);
+}
+
+#[test]
+fn parse_kernel_answer_accepts_resident_and_bounded_hops() {
+    let parsed = super::parse_kernel_answer(&tokens([
+        "myvault",
+        "hello",
+        "--resident-addr",
+        "127.0.0.1:18190",
+        "--max-hops",
+        "8",
+    ]))
+    .unwrap();
+    let Subcommand::KernelAnswer(args) = parsed else {
+        panic!("expected kernel-answer subcommand");
+    };
+    assert_eq!(args.resident_addr, Some("127.0.0.1:18190".parse().unwrap()));
+    assert_eq!(args.max_hops, 8);
 }
 
 proptest! {

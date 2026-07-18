@@ -22,11 +22,20 @@
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cuda_strict::strict_cuda_requested;
+use crate::dependence_dispatch::{DependenceCudaStats, auto_cuda_at};
 use crate::special_fn::{normal_two_sided_p, student_t_two_sided_p};
+
+#[path = "rank_correlation/cuda.rs"]
+mod cuda;
+
+use self::cuda::rank_correlations_cuda_strict_with_stats_impl;
 
 /// Minimum paired observations for a defined rank-correlation test. Below 3 the
 /// Student-t `df = n−2` and the Kendall `n(n−1)(n−2)` variance term vanish.
 pub const MIN_RANK_CORR_SAMPLES: usize = 3;
+/// CUDA cutoff for exact pairwise rank/tie and concordance work.
+pub const RANK_CUDA_MIN_SAMPLES: usize = 4_096;
 
 /// Two-sided standard-normal 95% quantile, for the Fisher-z confidence interval.
 const Z_95: f64 = 1.959_963_984_540_054;
@@ -56,14 +65,35 @@ pub struct KendallReport {
     pub n_samples: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RankCorrelationCudaReport {
+    pub spearman: SpearmanReport,
+    pub kendall: KendallReport,
+    pub stats: DependenceCudaStats,
+}
+
 /// Spearman's ρ over paired samples (Pearson-on-mid-ranks, tie-correct).
 pub fn spearman_rho(x: &[f32], y: &[f32]) -> Result<SpearmanReport> {
-    let (xd, yd) = validate_pair("Spearman ρ", x, y)?;
-    let n = xd.len();
+    if strict_cuda_requested() || auto_cuda_at(x.len(), RANK_CUDA_MIN_SAMPLES) {
+        return spearman_rho_cuda_strict(x, y);
+    }
+    spearman_rho_cpu(x, y)
+}
 
+pub fn spearman_rho_cuda_strict(x: &[f32], y: &[f32]) -> Result<SpearmanReport> {
+    rank_correlations_cuda_strict(x, y).map(|report| report.spearman)
+}
+
+fn spearman_rho_cpu(x: &[f32], y: &[f32]) -> Result<SpearmanReport> {
+    let (xd, yd) = validate_pair("Spearman ρ", x, y)?;
     let rx = midranks(&xd);
     let ry = midranks(&yd);
-    let rho = pearson(&rx, &ry).ok_or_else(|| {
+    spearman_from_ranks(&rx, &ry)
+}
+
+fn spearman_from_ranks(rx: &[f64], ry: &[f64]) -> Result<SpearmanReport> {
+    let n = rx.len();
+    let rho = pearson(rx, ry).ok_or_else(|| {
         CalyxError::assay_degenerate_input(
             "Spearman ρ undefined: a column is constant (all ranks tied)",
         )
@@ -102,6 +132,22 @@ pub fn spearman_rho(x: &[f32], y: &[f32]) -> Result<SpearmanReport> {
 
 /// Kendall's τ-b over paired samples (tie-adjusted, Hollander–Wolfe variance).
 pub fn kendall_tau_b(x: &[f32], y: &[f32]) -> Result<KendallReport> {
+    if strict_cuda_requested() || auto_cuda_at(x.len(), RANK_CUDA_MIN_SAMPLES) {
+        return kendall_tau_b_cuda_strict(x, y);
+    }
+    kendall_tau_b_cpu(x, y)
+}
+
+pub fn kendall_tau_b_cuda_strict(x: &[f32], y: &[f32]) -> Result<KendallReport> {
+    rank_correlations_cuda_strict(x, y).map(|report| report.kendall)
+}
+
+pub fn rank_correlations_cuda_strict(x: &[f32], y: &[f32]) -> Result<RankCorrelationCudaReport> {
+    let (xd, yd) = validate_pair("rank correlation", x, y)?;
+    rank_correlations_cuda_strict_with_stats_impl(&xd, &yd)
+}
+
+fn kendall_tau_b_cpu(x: &[f32], y: &[f32]) -> Result<KendallReport> {
     let (xd, yd) = validate_pair("Kendall τ-b", x, y)?;
     let n = xd.len();
 
@@ -121,12 +167,21 @@ pub fn kendall_tau_b(x: &[f32], y: &[f32]) -> Result<KendallReport> {
             }
         }
     }
-    let s = concordant as i64 - discordant as i64;
-
-    let nf = n as f64;
-    let n0 = nf * (nf - 1.0) / 2.0;
     let tx = tie_group_sizes(&xd);
     let ty = tie_group_sizes(&yd);
+    kendall_from_counts(n, &tx, &ty, concordant, discordant)
+}
+
+fn kendall_from_counts(
+    n: usize,
+    tx: &[usize],
+    ty: &[usize],
+    concordant: u64,
+    discordant: u64,
+) -> Result<KendallReport> {
+    let s = concordant as i64 - discordant as i64;
+    let nf = n as f64;
+    let n0 = nf * (nf - 1.0) / 2.0;
     let n1: f64 = tx.iter().map(|&t| tie_pairs(t)).sum();
     let n2: f64 = ty.iter().map(|&t| tie_pairs(t)).sum();
 

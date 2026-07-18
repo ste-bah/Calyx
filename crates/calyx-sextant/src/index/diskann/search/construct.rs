@@ -8,7 +8,10 @@ use super::storage::{
     build_search_graph_raw_l2_with_backend, build_search_graph_with_backend_and_progress,
     default_raw_sidecar, read_distance_mode,
 };
-use super::{DiskAnnSearch, DiskAnnSearchParams, SearchBuildSidecars, prefetch_file_for_graph};
+use super::{
+    DiskAnnSearch, DiskAnnSearchParams, DiskAnnServing, SearchBuildSidecars,
+    prefetch_file_for_graph,
+};
 use crate::index::diskann::build::{DiskAnnBuildBackend, DiskAnnBuildParams, DiskAnnBuildProgress};
 use crate::index::diskann::pq::{DiskAnnPqIndex, default_pq_sidecar};
 
@@ -20,7 +23,62 @@ impl DiskAnnSearch {
         raw_sidecar: Option<PathBuf>,
         default_search: DiskAnnSearchParams,
     ) -> Result<Self> {
+        Self::open_with_serving(
+            slot,
+            graph_path.into(),
+            ids,
+            raw_sidecar,
+            default_search,
+            DiskAnnServing::CpuReference,
+        )
+    }
+
+    pub fn open_gpu_serving(
+        slot: SlotId,
+        graph_path: impl Into<PathBuf>,
+        ids: Vec<CxId>,
+        raw_sidecar: Option<PathBuf>,
+        default_search: DiskAnnSearchParams,
+    ) -> Result<Self> {
         let graph_path = graph_path.into();
+        if !crate::CUVS_COMPILED {
+            return Err(crate::error::sextant_error(
+                crate::error::CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE,
+                crate::cuvs_unavailable_reason("persisted DiskANN CUDA serving"),
+            ));
+        }
+        let asset = crate::index::diskann::cagra_sidecar_path(&graph_path);
+        if !asset.is_file()
+            || asset
+                .metadata()
+                .map_or(true, |metadata| metadata.len() == 0)
+        {
+            return Err(crate::error::sextant_error(
+                crate::error::CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE,
+                format!(
+                    "required dataset-inclusive CAGRA serving asset is missing or empty at {}; rebuild with cuvs-cagra",
+                    asset.display()
+                ),
+            ));
+        }
+        Self::open_with_serving(
+            slot,
+            graph_path,
+            ids,
+            raw_sidecar,
+            default_search,
+            DiskAnnServing::CudaRequired,
+        )
+    }
+
+    fn open_with_serving(
+        slot: SlotId,
+        graph_path: PathBuf,
+        ids: Vec<CxId>,
+        raw_sidecar: Option<PathBuf>,
+        default_search: DiskAnnSearchParams,
+        serving: DiskAnnServing,
+    ) -> Result<Self> {
         let reader = open_for_search(&graph_path)?;
         let header = *reader.header();
         let distance_mode = read_distance_mode(&graph_path)?;
@@ -56,6 +114,7 @@ impl DiskAnnSearch {
             ids,
             build_params,
             build_backend: DiskAnnBuildBackend::CpuVamana,
+            serving,
             default_search,
             built_at_seq: 0,
             base_seq: 0,
@@ -190,6 +249,10 @@ impl DiskAnnSearch {
             default_search,
         )?;
         search.build_backend = backend;
+        search.serving = match backend {
+            DiskAnnBuildBackend::CpuVamana => DiskAnnServing::CpuReference,
+            DiskAnnBuildBackend::CuvsCagra => DiskAnnServing::CudaRequired,
+        };
         Ok(search)
     }
 
@@ -240,9 +303,12 @@ impl DiskAnnSearch {
             sidecars.backend,
             progress,
         )?;
-        if let Some(pq_params) = sidecars.pq {
-            write_pq_sidecar(&graph_path, &dense_rows, pq_params)?;
-        }
+        let built_pq = sidecars
+            .pq
+            .map(|pq_params| {
+                write_pq_sidecar(&graph_path, &dense_rows, pq_params, sidecars.backend)
+            })
+            .transpose()?;
         let mut search = Self::open(
             slot,
             graph_path,
@@ -250,7 +316,14 @@ impl DiskAnnSearch {
             raw_sidecar,
             default_search,
         )?;
+        if let Some(pq) = built_pq {
+            search.pq = Some(pq);
+        }
         search.build_backend = sidecars.backend;
+        search.serving = match sidecars.backend {
+            DiskAnnBuildBackend::CpuVamana => DiskAnnServing::CpuReference,
+            DiskAnnBuildBackend::CuvsCagra => DiskAnnServing::CudaRequired,
+        };
         Ok(search)
     }
 
@@ -273,6 +346,7 @@ impl DiskAnnSearch {
                 alpha: 1.2,
             },
             build_backend: DiskAnnBuildBackend::CpuVamana,
+            serving: DiskAnnServing::CpuReference,
             default_search: DiskAnnSearchParams::default(),
             built_at_seq: 0,
             base_seq: 0,

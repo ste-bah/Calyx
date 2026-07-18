@@ -50,7 +50,7 @@ pub fn orphan_fsv(root: &Path) -> Value {
         "source_of_truth": {
             "vault": happy_dir.display().to_string(),
             "base_cf": "vault/cf/base",
-            "slot_cf": "vault/cf/slot_0000",
+            "slot_cf": "vault/cf/slot_00",
             "anneal_replay_cf": "vault/cf/anneal_replay",
             "ledger_cf": "vault/cf/ledger"
         },

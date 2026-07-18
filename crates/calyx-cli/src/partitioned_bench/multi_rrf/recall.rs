@@ -3,13 +3,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use calyx_core::SlotId;
 use serde_json::{Value, json};
 
+use super::exact_truth::ExactFallback;
 use super::fused_truth_db::DbFusedTruth;
 use super::ground_truth::PrecomputedTruth;
 use super::slot_truth::SlotTruth;
 use super::slot_truth_db::DbSlotTruth;
 use super::timeline;
-use super::{OpenSlot, fuse, fused_hit_ids, report, row_for_metric, slot_id, to_index_hits};
-use crate::partitioned_bench::brute_force::brute_force_topk_vecfile_ranked;
+use super::{OpenSlot, fuse, fused_hit_ids, row_for_metric, slot_id, to_index_hits};
+use crate::error::CliResult;
 
 const DISTANCE_TIE_EPSILON: f32 = 1.0e-6;
 const RRF_K: f32 = 60.0;
@@ -40,7 +41,20 @@ pub(super) struct RecallReadback {
     pub(super) ground_truth_source: Option<Value>,
 }
 
-pub(super) fn readback(req: Request<'_>) -> RecallReadback {
+pub(super) fn readback(req: Request<'_>) -> CliResult<RecallReadback> {
+    let exact_fallback = if req.precomputed_truth.is_none()
+        && req.db_fused_truth.is_none()
+        && req.slot_truth.is_none()
+        && req.db_slot_truth.is_none()
+    {
+        Some(ExactFallback::build(
+            req.slots,
+            req.truth_n,
+            req.truth_depth,
+        )?)
+    } else {
+        None
+    };
     let mut single_found: BTreeMap<SlotId, usize> = req
         .slots
         .iter()
@@ -53,7 +67,8 @@ pub(super) fn readback(req: Request<'_>) -> RecallReadback {
     let mut exact_fused_rows = Vec::with_capacity(req.truth_n);
     let mut truth_sets = Vec::with_capacity(req.truth_n);
     for query_idx in 0..req.truth_n {
-        let (exact_ids, exact_slot_rows) = exact_truth_for_query(&req, query_idx);
+        let (exact_ids, exact_slot_rows) =
+            exact_truth_for_query(&req, exact_fallback.as_ref(), query_idx);
         let truth = accepted_truth_for_query(&req, query_idx, &exact_ids);
         if sample_readback.len() < 3 {
             sample_readback.push(sample_row(&req, query_idx, &exact_ids, exact_slot_rows));
@@ -89,7 +104,7 @@ pub(super) fn readback(req: Request<'_>) -> RecallReadback {
         .iter()
         .map(|slot| slot_id(slot.spec.slot))
         .collect::<Vec<_>>();
-    RecallReadback {
+    Ok(RecallReadback {
         fused_recall: Some(fused_recall),
         per_slot_recall: per_slot,
         best_single: best,
@@ -104,11 +119,15 @@ pub(super) fn readback(req: Request<'_>) -> RecallReadback {
         sample_readback,
         per_query_recall,
         exact_fused_rows,
-        ground_truth_source: Some(ground_truth_source(&req)),
-    }
+        ground_truth_source: Some(ground_truth_source(&req, exact_fallback.as_ref())),
+    })
 }
 
-fn exact_truth_for_query(req: &Request<'_>, query_idx: usize) -> (Vec<u64>, Vec<Value>) {
+fn exact_truth_for_query(
+    req: &Request<'_>,
+    fallback: Option<&ExactFallback>,
+    query_idx: usize,
+) -> (Vec<u64>, Vec<Value>) {
     if let Some(precomputed) = req.precomputed_truth {
         return (
             precomputed.row_ids(query_idx).to_vec(),
@@ -127,30 +146,9 @@ fn exact_truth_for_query(req: &Request<'_>, query_idx: usize) -> (Vec<u64>, Vec<
     if let Some(slot_truth) = req.db_slot_truth {
         return fused_from_db_slot_truth(req, query_idx, slot_truth);
     }
-    let mut exact_per_slot = BTreeMap::new();
-    let mut exact_slot_rows = Vec::new();
-    for slot in req.slots {
-        let query = row_for_metric(
-            &slot.queries,
-            slot.query_row(query_idx),
-            slot.distance_metric,
-        );
-        let exact = brute_force_topk_vecfile_ranked(
-            &slot.corpus,
-            &[query],
-            req.truth_depth,
-            slot.distance_metric,
-        )
-        .pop()
-        .expect("one query");
-        exact_slot_rows.push(json!({
-            "slot": slot.spec.slot,
-            "exact_top_k": exact.iter().take(req.k).map(|(id, _)| *id).collect::<Vec<_>>(),
-        }));
-        exact_per_slot.insert(slot_id(slot.spec.slot), to_index_hits(exact));
-    }
-    let exact_fused = fuse(&exact_per_slot, req.k);
-    (fused_hit_ids(&exact_fused, req.k), exact_slot_rows)
+    fallback
+        .expect("generated exact truth is prepared when no persisted truth exists")
+        .fused_for_query(req.slots, query_idx, req.k)
 }
 
 fn fused_from_db_slot_truth(
@@ -441,25 +439,16 @@ fn ids_to_hits(ids: &[u64]) -> Vec<calyx_sextant::IndexSearchHit> {
     )
 }
 
-fn ground_truth_source(req: &Request<'_>) -> Value {
+fn ground_truth_source(req: &Request<'_>, fallback: Option<&ExactFallback>) -> Value {
     req.precomputed_truth
         .map(PrecomputedTruth::source)
         .or_else(|| req.db_fused_truth.map(DbFusedTruth::source))
         .or_else(|| req.slot_truth.map(SlotTruth::source))
         .or_else(|| req.db_slot_truth.map(DbSlotTruth::source))
         .unwrap_or_else(|| {
-            json!({
-                "mode": "cpu_bruteforce_slot_corpora",
-                "metric_class": report::METRIC_CLASS,
-                "metric_scope": report::METRIC_SCOPE,
-                "truth_reference_class": report::TRUTH_REFERENCE_CLASS,
-                "valid_real_outcome": false,
-                "grounded_phase_exit_eligible": false,
-                "scale_suitable": false,
-                "query_count": req.truth_n,
-                "truth_depth": req.truth_depth,
-                "note": "diagnostic exact path only; use precomputed fused truth for scale gates",
-            })
+            fallback
+                .expect("generated exact source is prepared")
+                .source(req.truth_n, req.truth_depth)
         })
 }
 

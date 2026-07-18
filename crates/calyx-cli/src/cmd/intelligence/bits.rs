@@ -22,8 +22,25 @@ pub(super) fn command(args: BitsArgs) -> CliResult {
     let anchor = parse_anchor(&args.anchor_kind)?;
     let label = anchor_label(&anchor);
     let key = assay_key(&label);
-    let report = calculate(&ctx.state.panel, &docs, &anchor, &label, args.explain, &key)?;
-    write_json_row(&ctx.vault, ColumnFamily::Assay, key, &report)?;
+    let report = match &anchor {
+        AnchorKind::Label(_) => super::bits_categorical::calculate(
+            &ctx.state.panel,
+            &docs,
+            &anchor,
+            &label,
+            args.explain,
+            &key,
+        )?,
+        _ => calculate(&ctx.state.panel, &docs, &anchor, &label, args.explain, &key)?,
+    };
+    write_json_row(&ctx.vault, ColumnFamily::Assay, key.clone(), &report)?;
+    let readback: BitsOut = super::core::read_json_row(&ctx.vault, ColumnFamily::Assay, &key)?
+        .ok_or_else(|| CliError::runtime("bits Assay CF row is absent after flush"))?;
+    if readback != report {
+        return Err(CliError::runtime(
+            "bits Assay CF row differs from the report after physical readback",
+        ));
+    }
     print_json(&report)
 }
 
@@ -64,16 +81,29 @@ pub(super) fn calculate(
     let total_bits = per_slot.iter().map(|slot| slot.bits).sum::<f64>();
     let dpi_ceiling = dpi_ceiling(observed.len());
     Ok(BitsOut {
+        schema_version: 1,
         anchor: label.to_string(),
         panel_sufficiency: clamp01(total_bits / dpi_ceiling.max(1e-9)),
         n: observed.len(),
         dpi_ceiling,
         per_slot,
+        population_n: observed.len(),
+        outcome_classes: BTreeMap::new(),
+        population_outcome_classes: BTreeMap::new(),
+        population_outcome_entropy_bits: dpi_ceiling,
+        sample_cx_ids: Vec::new(),
+        panel_bits: total_bits,
+        panel_ci: [0.0, total_bits],
+        sufficiency_passed: total_bits >= dpi_ceiling,
+        pairwise_redundancy: Vec::new(),
         explain: explain.then(|| BitsExplainOut {
             positive_anchor_count: positive.len(),
             comparison_count: comparison.len(),
             persisted_cf: "assay".to_string(),
             persisted_key_hex: hex(key),
+            outcome_mode: "anchor_presence_binary".to_string(),
+            sample_policy: "all_rows".to_string(),
+            strict_cuda_required: false,
         }),
     })
 }
@@ -107,9 +137,12 @@ fn slot_bits(
     SlotBitsOut {
         slot: slot.slot_id.get(),
         name: slot.slot_key.key().to_string(),
+        n,
         bits,
         ci: [(bits - margin).max(0.0), (bits + margin).min(1.0)],
         estimator: ESTIMATOR.to_string(),
+        representation: "dense_native".to_string(),
+        trust: "legacy_unclassified".to_string(),
         state: "active".to_string(),
         low_signal: bits < LOW_SIGNAL_BITS,
     }

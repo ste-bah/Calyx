@@ -6,8 +6,8 @@ use calyx_assay::PanelResourceBudget;
 use calyx_core::{FixedClock, Modality};
 use calyx_registry::{CapabilitySignalKind, CostMetrics, Registry};
 
-#[path = "support/propose_lens.rs"]
-mod support;
+// calyx-shared-module: path=support/propose_lens.rs alias=__calyx_shared_support_propose_lens_rs local=support visibility=private
+use crate::__calyx_shared_support_propose_lens_rs as support;
 use support::*;
 
 #[test]

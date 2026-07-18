@@ -101,6 +101,8 @@ pub(super) struct SearchReq {
     guard: Option<bool>,
     #[serde(default)]
     fusion: Option<String>,
+    #[serde(default)]
+    filter: Option<Value>,
 }
 
 /// Run the real Sextant search over the loaded vault and return ranked evidence
@@ -137,13 +139,27 @@ pub(super) async fn search(
     } else {
         GuardChoice::Off
     };
+    let filter = match req.filter.as_ref().map(serde_json::to_string).transpose() {
+        Ok(filter) => filter,
+        Err(error) => {
+            return ApiError::new(
+                ErrorCode::BadRequest,
+                format!("search filter is not valid JSON: {error}"),
+            )
+            .into_response();
+        }
+    };
+    if let Err(error) = calyx_search::filters::parse(filter.as_deref()) {
+        return ApiError::new(ErrorCode::BadRequest, error.message().to_string()).into_response();
+    }
 
-    // Idempotent for (query,k,guard,fusion) at a fixed vault state — serve a
+    // Idempotent for (query,k,guard,fusion,filter) at a fixed vault state — serve a
     // fresh cache hit byte-for-byte rather than re-running Sextant (#1898). The
     // \u{1f} (unit separator) cannot appear in the label/bool fields and so
     // keeps the composite key unambiguous across the free-text query.
     let cache_key = format!(
-        "search\u{1f}{k}\u{1f}{guard_on}\u{1f}{fusion_label}\u{1f}{}",
+        "search\u{1f}{k}\u{1f}{guard_on}\u{1f}{fusion_label}\u{1f}{}\u{1f}{}",
+        filter.as_deref().unwrap_or("-"),
         req.query
     );
     if let Some((body, age)) = ctx.cache.get(&cache_key) {
@@ -152,6 +168,7 @@ pub(super) async fn search(
 
     let work_ctx = Arc::clone(&ctx);
     let query = req.query;
+    let search_filter = filter;
     let body = match run_blocking("search", move || {
         let outcome = search_outcome(
             &work_ctx.vault,
@@ -161,7 +178,7 @@ pub(super) async fn search(
             k,
             fusion,
             guard,
-            None,
+            search_filter.as_deref(),
             false,
         )
         .map_err(|error| {
@@ -187,6 +204,7 @@ pub(super) async fn search(
             "query": query,
             "k": k,
             "guardTau": outcome.guard_tau,
+            "generation": outcome.generation,
             "hits": hits,
         }))
     })

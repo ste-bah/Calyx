@@ -96,6 +96,7 @@ mod tests {
         for (name, compiled) in [
             ("forge-cuda", true),
             ("registry-candle-cuda", true),
+            ("search-cuda", true),
             ("sextant-cuvs", cfg!(target_os = "linux")),
         ] {
             let expected = cuda_requested && compiled;

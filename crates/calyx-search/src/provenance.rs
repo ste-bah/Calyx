@@ -1,12 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
-use calyx_aster::ledger_view::read_ledger_seqs_traced;
+use calyx_aster::ledger_view::{AsterLedgerCfStore, read_ledger_seqs_traced};
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Constellation, CxId, LedgerRef};
-use calyx_ledger::{EntryKind, LedgerEntry, SubjectId, decode};
+use calyx_ledger::{EntryKind, LedgerCfStore, LedgerEntry, SubjectId, decode};
 use calyx_sextant::{
     CALYX_SEXTANT_PROVENANCE_MISSING, FreshnessTag, Hit, ProvenanceSource, sextant_error,
 };
@@ -52,110 +51,23 @@ pub(crate) fn attach_verified_provenance(
     hits: &mut [Hit],
     docs: &BTreeMap<CxId, Constellation>,
     vault_dir: &Path,
+    ledger_view: Option<&AsterLedgerCfStore>,
     freshness: FreshnessTag,
     trace: &mut crate::engine_trace::SearchTracer<'_>,
 ) -> CliResult {
-    let vault_key = crate::persisted::canonical_pin_vault_dir(vault_dir)?;
-    // Freeze each hit's memo decision NOW: verifying pending hits inserts
-    // into the bounded process-global memo, which can evict another hit's
-    // entry mid-loop. Re-querying the memo during the serve loop would then
-    // route that hit to a verifier that never loaded its ledger seqs — a
-    // spurious missing-ledger-seq failure (or a panic when nothing was
-    // pending). The verifier is opened for exactly the !memoized hits below.
-    let memoized = hits
-        .iter()
-        .map(|hit| {
-            docs.get(&hit.cx_id)
-                .is_some_and(|cx| ledger_memo_contains(&vault_key, hit.cx_id, &cx.provenance))
-        })
-        .collect::<Vec<_>>();
-    let pending = hits
-        .iter()
-        .zip(&memoized)
-        .filter(|(_, hit_memoized)| !**hit_memoized)
-        .map(|(hit, _)| hit.clone())
-        .collect::<Vec<_>>();
-    let mut ledger = if pending.is_empty() {
-        None
-    } else {
-        Some(TargetedLedgerVerifier::open(
-            vault_dir, &pending, docs, trace,
-        )?)
-    };
-    for (hit, hit_memoized) in hits.iter_mut().zip(memoized) {
+    let mut ledger = TargetedLedgerVerifier::open(vault_dir, ledger_view, hits, docs, trace)?;
+    for hit in hits.iter_mut() {
         let cx = docs.get(&hit.cx_id).ok_or_else(|| {
             missing_provenance(format!(
                 "stored constellation missing for hit {}",
                 hit.cx_id
             ))
         })?;
-        if hit_memoized {
-            // The exact (cx_id, ledger seq, entry hash) triple already passed
-            // the targeted ledger verification in this process; the ledger is
-            // append-only, so the verification result is immutable.
-            hit.provenance = cx.provenance.clone();
-        } else {
-            let verifier = ledger
-                .as_mut()
-                .expect("pending hits imply an opened ledger verifier");
-            hit.provenance = verifier.require_ref(hit.cx_id, cx.provenance.clone())?;
-            ledger_memo_insert(&vault_key, hit.cx_id, &cx.provenance);
-        }
+        hit.provenance = ledger.require_ref(hit.cx_id, cx.provenance.clone())?;
         hit.provenance_source = ProvenanceSource::Stored;
         hit.freshness = freshness.clone();
     }
     Ok(())
-}
-
-const MAX_MEMOIZED_LEDGER_REFS: usize = 8192;
-
-type LedgerRefKey = (String, CxId, u64, [u8; 32]);
-
-struct LedgerRefMemo {
-    verified: BTreeSet<LedgerRefKey>,
-    order: VecDeque<LedgerRefKey>,
-}
-
-fn ledger_memo() -> &'static Mutex<LedgerRefMemo> {
-    static MEMO: OnceLock<Mutex<LedgerRefMemo>> = OnceLock::new();
-    MEMO.get_or_init(|| {
-        Mutex::new(LedgerRefMemo {
-            verified: BTreeSet::new(),
-            order: VecDeque::new(),
-        })
-    })
-}
-
-fn ledger_memo_contains(vault_key: &str, cx_id: CxId, provenance: &LedgerRef) -> bool {
-    let key = (
-        vault_key.to_string(),
-        cx_id,
-        provenance.seq,
-        provenance.hash,
-    );
-    ledger_memo()
-        .lock()
-        .expect("ledger ref memo poisoned")
-        .verified
-        .contains(&key)
-}
-
-fn ledger_memo_insert(vault_key: &str, cx_id: CxId, provenance: &LedgerRef) {
-    let key = (
-        vault_key.to_string(),
-        cx_id,
-        provenance.seq,
-        provenance.hash,
-    );
-    let mut memo = ledger_memo().lock().expect("ledger ref memo poisoned");
-    if memo.verified.insert(key.clone()) {
-        memo.order.push_back(key);
-    }
-    while memo.order.len() > MAX_MEMOIZED_LEDGER_REFS {
-        if let Some(evicted) = memo.order.pop_front() {
-            memo.verified.remove(&evicted);
-        }
-    }
 }
 
 struct TargetedLedgerVerifier {
@@ -166,6 +78,7 @@ struct TargetedLedgerVerifier {
 impl TargetedLedgerVerifier {
     fn open(
         vault_dir: &Path,
+        ledger_view: Option<&AsterLedgerCfStore>,
         hits: &[Hit],
         docs: &BTreeMap<CxId, Constellation>,
         trace: &mut crate::engine_trace::SearchTracer<'_>,
@@ -183,21 +96,45 @@ impl TargetedLedgerVerifier {
                 required.insert(cx.provenance.seq - 1);
             }
         }
-        let (rows, point_read) = read_ledger_seqs_traced(vault_dir, &required)?;
-        // Structured tier attribution (#1112): one event per point-read tier
-        // so FSV can assert from the runtime log which tier resolved the
-        // targeted ledger seqs and that the complete-SST scan never ran.
-        for tier in &point_read.tiers {
-            trace.emit_detail(
-                "provenance.ledger_point_read.tier",
-                None,
-                Some(tier.resolved),
-                Some(format!(
-                    "tier={} wanted={} resolved={} files_opened={} tier_elapsed_ms={}",
-                    tier.tier, tier.wanted, tier.resolved, tier.files_opened, tier.elapsed_ms
-                )),
-            );
-        }
+        let rows = if let Some(ledger_view) = ledger_view {
+            let mut rows = BTreeMap::new();
+            for seq in &required {
+                if let Some(row) = ledger_view.read_seq(*seq)? {
+                    rows.insert(*seq, row);
+                }
+            }
+            rows
+        } else {
+            let (rows, point_read) = read_ledger_seqs_traced(vault_dir, &required)?;
+            for tier in &point_read.tiers {
+                trace.emit_detail(
+                    "provenance.ledger_point_read.tier",
+                    None,
+                    Some(tier.resolved),
+                    Some(format!(
+                        "tier={} wanted={} resolved={} files_opened={} tier_elapsed_ms={}",
+                        tier.tier, tier.wanted, tier.resolved, tier.files_opened, tier.elapsed_ms
+                    )),
+                );
+            }
+            rows
+        };
+        trace.emit_detail(
+            "provenance.ledger_snapshot_read.done",
+            None,
+            Some(rows.len()),
+            Some(format!(
+                "view={} wanted={} resolved={} physical_reopens={}",
+                if ledger_view.is_some() {
+                    "aster_ledger_cf_store_snapshot"
+                } else {
+                    "targeted_ledger_point_read"
+                },
+                required.len(),
+                rows.len(),
+                usize::from(ledger_view.is_none())
+            )),
+        );
         Ok(Self {
             rows,
             entries: BTreeMap::new(),

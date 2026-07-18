@@ -2,6 +2,7 @@ use super::super::{AnchorArgs, IngestArgs, MeasureArgs, Subcommand, value};
 use super::session::{IngestStatusArgs, validate_session_id};
 use super::types::IngestOutput;
 use crate::error::{CliError, CliResult};
+use calyx_aster::vault::IngestPrecondition;
 use std::net::{IpAddr, SocketAddr};
 
 pub(crate) fn parse_ingest(rest: &[String]) -> CliResult<Subcommand> {
@@ -18,6 +19,7 @@ pub(crate) fn parse_ingest(rest: &[String]) -> CliResult<Subcommand> {
     let mut resident_addr = None;
     let mut allow_cold_gpu_workers = false;
     let mut session_id = None;
+    let mut precondition = IngestPrecondition::default();
     let mut idx = 1;
     while idx < rest.len() {
         match rest[idx].as_str() {
@@ -67,6 +69,30 @@ pub(crate) fn parse_ingest(rest: &[String]) -> CliResult<Subcommand> {
                 validate_session_id(value)?;
                 session_id = Some(value.to_string());
             }
+            "--expect-durable-seq" => {
+                idx += 1;
+                set_once_u64(
+                    &mut precondition.expected_durable_seq,
+                    value(rest, idx, "--expect-durable-seq")?,
+                    "--expect-durable-seq",
+                )?;
+            }
+            "--expect-manifest-seq" => {
+                idx += 1;
+                set_once_u64(
+                    &mut precondition.expected_manifest_seq,
+                    value(rest, idx, "--expect-manifest-seq")?,
+                    "--expect-manifest-seq",
+                )?;
+            }
+            "--expect-base-count" => {
+                idx += 1;
+                set_once_u64(
+                    &mut precondition.expected_base_count,
+                    value(rest, idx, "--expect-base-count")?,
+                    "--expect-base-count",
+                )?;
+            }
             other => return Err(CliError::usage(format!("unexpected ingest flag {other}"))),
         }
         idx += 1;
@@ -89,6 +115,11 @@ pub(crate) fn parse_ingest(rest: &[String]) -> CliResult<Subcommand> {
     if session_id.is_some() && batch.is_none() {
         return Err(CliError::usage("--session-id is only valid with --batch"));
     }
+    if !precondition.is_empty() && batch.is_none() {
+        return Err(CliError::usage(
+            "ingest state preconditions are only valid with --batch",
+        ));
+    }
     if !idempotent {
         return Err(CliError::usage(
             "non-idempotent ingest is not supported by Calyx",
@@ -105,7 +136,19 @@ pub(crate) fn parse_ingest(rest: &[String]) -> CliResult<Subcommand> {
         resident_addr,
         allow_cold_gpu_workers,
         session_id,
+        precondition,
     }))
+}
+
+fn set_once_u64(target: &mut Option<u64>, raw: &str, flag: &str) -> CliResult<()> {
+    if target.is_some() {
+        return Err(CliError::usage(format!("duplicate ingest flag {flag}")));
+    }
+    *target = Some(
+        raw.parse::<u64>()
+            .map_err(|error| CliError::usage(format!("parse {flag} {raw}: {error}")))?,
+    );
+    Ok(())
 }
 
 pub(crate) fn parse_ingest_status(rest: &[String]) -> CliResult<Subcommand> {

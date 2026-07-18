@@ -2,6 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     AsterGrowthCf, GrowthCurve, IntelligenceReport, JTerms, JWeights, ReportAvailability,
     decode_growth_row,
@@ -9,11 +12,8 @@ use calyx_anneal::{
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::FixedClock;
-use serde_json::json;
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
 use fsv_support::{vault_id, write_json};
+use serde_json::json;
 
 const VAULT_SALT: &[u8] = b"calyx-anneal-intelligence-report";
 

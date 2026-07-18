@@ -1,4 +1,6 @@
-use super::*;
+use crate::error::CliResult;
+
+use super::{TemplateLensProgress, TemplateLensRef};
 
 pub(super) fn emit_progress(
     progress: &mut Option<&mut dyn FnMut(TemplateLensProgress) -> CliResult<()>>,

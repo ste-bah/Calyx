@@ -87,6 +87,156 @@ pub(crate) struct ResolvedVault {
     pub vault_id: VaultId,
 }
 
+const VAULT_IDENTITY_FILE: &str = "VAULT_IDENTITY.json";
+const VAULT_IDENTITY_MAGIC: &str = "calyx.vault_identity";
+const VAULT_IDENTITY_VERSION: u32 = 1;
+const VAULT_IDENTITY_REMEDIATION: &str = "open the vault through the CALYX_HOME index that created it, or restore its immutable VAULT_IDENTITY.json from verified creation evidence; never guess or rewrite a vault identity";
+
+/// Immutable physical namespace binding for content-derived Cx IDs.
+///
+/// Cx identity is salted by both the vault ID and canonical name. Keeping the
+/// name only in a caller-selected `CALYX_HOME` index lets the same physical
+/// vault acquire a different namespace when opened by an absolute path. The
+/// binding therefore travels with the vault and is validated before Aster is
+/// opened (issue #1794).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct VaultIdentity {
+    magic: String,
+    version: u32,
+    vault_id: VaultId,
+    canonical_name: String,
+    cx_namespace: String,
+}
+
+impl VaultIdentity {
+    fn new(vault_id: VaultId, canonical_name: &str) -> CliResult<Self> {
+        if canonical_name.is_empty() {
+            return Err(vault_identity_corrupt(
+                "canonical vault name must not be empty",
+            ));
+        }
+        Ok(Self {
+            magic: VAULT_IDENTITY_MAGIC.to_string(),
+            version: VAULT_IDENTITY_VERSION,
+            vault_id,
+            canonical_name: canonical_name.to_string(),
+            cx_namespace: vault_namespace(vault_id, canonical_name),
+        })
+    }
+
+    fn validate(&self, path: &Path) -> CliResult {
+        if self.magic != VAULT_IDENTITY_MAGIC {
+            return Err(vault_identity_corrupt(format!(
+                "{} has identity magic {:?}, expected {:?}",
+                path.display(),
+                self.magic,
+                VAULT_IDENTITY_MAGIC
+            )));
+        }
+        if self.version != VAULT_IDENTITY_VERSION {
+            return Err(vault_identity_corrupt(format!(
+                "{} has identity version {}, expected {}",
+                path.display(),
+                self.version,
+                VAULT_IDENTITY_VERSION
+            )));
+        }
+        if self.canonical_name.is_empty() {
+            return Err(vault_identity_corrupt(format!(
+                "{} has an empty canonical_name",
+                path.display()
+            )));
+        }
+        let expected = vault_namespace(self.vault_id, &self.canonical_name);
+        if self.cx_namespace != expected {
+            return Err(vault_identity_corrupt(format!(
+                "{} binds cx_namespace {:?}, expected {:?} from vault_id and canonical_name",
+                path.display(),
+                self.cx_namespace,
+                expected
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn vault_identity_path(vault: &Path) -> PathBuf {
+    vault.join(VAULT_IDENTITY_FILE)
+}
+
+fn write_vault_identity(vault: &Path, vault_id: VaultId, name: &str) -> CliResult {
+    let identity = VaultIdentity::new(vault_id, name)?;
+    let mut bytes = serde_json::to_vec_pretty(&identity)
+        .map_err(|error| CliError::runtime(format!("serialize vault identity: {error}")))?;
+    bytes.push(b'\n');
+    let path = vault_identity_path(vault);
+    crate::durable_write::write_bytes_atomic_new(&path, &bytes, "vault identity")?;
+    let readback = read_vault_identity(vault)?.ok_or_else(|| {
+        vault_identity_corrupt(format!(
+            "{} was absent immediately after immutable publication",
+            path.display()
+        ))
+    })?;
+    if readback != identity {
+        return Err(vault_identity_corrupt(format!(
+            "{} did not read back as the exact published identity",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_vault_identity(vault: &Path) -> CliResult<Option<VaultIdentity>> {
+    let path = vault_identity_path(vault);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::io(format!(
+                "read vault identity {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let identity = serde_json::from_slice::<VaultIdentity>(&bytes).map_err(|error| {
+        vault_identity_corrupt(format!("parse vault identity {}: {error}", path.display()))
+    })?;
+    identity.validate(&path)?;
+    Ok(Some(identity))
+}
+
+fn vault_identity_corrupt(message: impl Into<String>) -> CliError {
+    CalyxError {
+        code: "CALYX_VAULT_IDENTITY_CORRUPT",
+        message: message.into(),
+        remediation: VAULT_IDENTITY_REMEDIATION,
+    }
+    .into()
+}
+
+fn vault_identity_missing(vault: &Path, index: &Path) -> CliError {
+    CalyxError {
+        code: "CALYX_VAULT_IDENTITY_MISSING",
+        message: format!(
+            "vault {} has no immutable {} and is not bound by active index {}",
+            vault.display(),
+            VAULT_IDENTITY_FILE,
+            index.display()
+        ),
+        remediation: VAULT_IDENTITY_REMEDIATION,
+    }
+    .into()
+}
+
+fn vault_identity_mismatch(message: impl Into<String>) -> CliError {
+    CalyxError {
+        code: "CALYX_VAULT_IDENTITY_MISMATCH",
+        message: message.into(),
+        remediation: VAULT_IDENTITY_REMEDIATION,
+    }
+    .into()
+}
+
 #[derive(Clone, Copy)]
 enum LensStateAction {
     Retire,
@@ -135,6 +285,7 @@ fn create_vault(args: CreateVaultArgs) -> CliResult {
         vault_salt(vault_id, &args.name),
         options,
     )?;
+    write_vault_identity(&vault_dir, vault_id, &args.name)?;
     persist_vault_panel_state(&vault_dir, &prepared.panel, &prepared.registry)?;
     let registry_snapshot_written = true;
 
@@ -399,7 +550,11 @@ mod resolve;
 pub(crate) use resolve::{resolve_vault, resolve_vault_info};
 
 pub(crate) fn vault_salt(vault_id: VaultId, name: &str) -> Vec<u8> {
-    format!("calyx-cli-vault:{vault_id}:{name}").into_bytes()
+    vault_namespace(vault_id, name).into_bytes()
+}
+
+fn vault_namespace(vault_id: VaultId, name: &str) -> String {
+    format!("calyx-cli-vault:{vault_id}:{name}")
 }
 
 pub(crate) fn now_ms() -> u64 {

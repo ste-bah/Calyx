@@ -1,4 +1,5 @@
-mod support;
+// calyx-shared-module: path=support/mod.rs alias=__calyx_shared_support_mod_rs local=support visibility=private
+use crate::__calyx_shared_support_mod_rs as support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,11 @@ fn seed_summary_vault(dir: &Path) -> AsterVault {
         DEFAULT_ASTER_ASSOC_COLLECTION,
         &AsterAssocMetadata {
             retention_horizon: Some(1),
+            embedding_slot: None,
+            panel_version: None,
+            graph_source_seq: None,
+            knn: None,
+            edge_cos_threshold: None,
         },
     )
     .unwrap();

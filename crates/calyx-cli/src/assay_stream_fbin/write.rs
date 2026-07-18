@@ -428,6 +428,7 @@ fn write_plan(
                 "name": lens.name,
                 "lens_id": lens.lens_id,
                 "weights_sha256": lens.weights_sha256,
+                "runtime": lens.runtime,
                 "signal_kind": lens.signal_kind,
                 "bits_about": lens.bits_about,
                 "dim": lens.dim,

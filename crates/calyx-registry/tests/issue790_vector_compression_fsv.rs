@@ -1,23 +1,14 @@
-use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{
-    Asymmetry, Constellation, CxFlags, InputRef, LedgerRef, LensId, Modality, QuantPolicy, Slot,
-    SlotId, SlotKey, SlotShape, SlotState, SlotVector, VaultId, VaultStore,
-};
-use calyx_registry::frozen::{NormPolicy, sha256_digest};
+use calyx_core::{QuantPolicy, SlotId, SlotShape, VaultStore};
 use calyx_registry::{
-    CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, LensRuntime, LensSpec,
-    Registry, StoredSlotCodec, compress_slot_batch, decode_stored_slot_envelope,
-    matryoshka_truncate_renormalize, persist_vault_panel_state, write_compressed_slot_batch,
+    CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, Registry, StoredSlotCodec,
+    compress_slot_batch, decode_stored_slot_envelope, matryoshka_truncate_renormalize,
+    persist_vault_panel_state, write_compressed_slot_batch,
 };
 use serde_json::json;
-
-static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn turboquant_and_mxfp4_roundtrip_fixture_vectors() {
@@ -381,6 +372,6 @@ fn minimal_envelope(codec_code: u8, level_code: u8) -> Vec<u8> {
     envelope
 }
 
-#[path = "issue790_vector_compression_fsv/support.rs"]
-mod support;
+// calyx-shared-module: path=issue790_vector_compression_fsv/support.rs alias=__calyx_shared_issue790_vector_compression_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_issue790_vector_compression_fsv_support_rs as support;
 use support::*;

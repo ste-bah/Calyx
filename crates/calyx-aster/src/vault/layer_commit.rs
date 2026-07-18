@@ -3,6 +3,14 @@ use crate::cf::ColumnFamily;
 use calyx_core::{CalyxError, Clock, Result, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 
+/// One auditable ledger event to stage alongside a raw CF batch.
+pub struct CfLedgerEntry {
+    pub kind: EntryKind,
+    pub subject: SubjectId,
+    pub payload: Vec<u8>,
+    pub actor: ActorId,
+}
+
 impl<C> AsterVault<C>
 where
     C: Clock,
@@ -54,6 +62,50 @@ where
         })
     }
 
+    /// Commits raw rows and an ordered set of per-subject ledger events in one
+    /// durable batch. This is crate-internal because callers must decide how
+    /// individual data rows map to individual audit events.
+    pub(crate) fn write_cf_batch_with_ledger_entries_locked(
+        &self,
+        mut rows: Vec<encode::WriteRow>,
+        entries: Vec<CfLedgerEntry>,
+    ) -> Result<Seq> {
+        if rows.is_empty() && entries.is_empty() {
+            return Ok(self.latest_seq());
+        }
+        let drafts = entries
+            .into_iter()
+            .map(|entry| (entry.kind, entry.subject, entry.payload, entry.actor))
+            .collect::<Vec<_>>();
+
+        if let Some(hook) = &self.ledger_hook {
+            let mut hook = ledger_hook::lock_hook(hook)?;
+            let staged = hook.stage_many_with_checkpoints(drafts)?;
+            rows.extend(staged.iter().map(|row| encode::WriteRow {
+                cf: ColumnFamily::Ledger,
+                key: row.key().to_vec(),
+                value: row.value().to_vec(),
+            }));
+            let seq = self.commit_rows_locked(&rows)?;
+            ledger_hook::commit_staged(&mut hook, &staged)?;
+            return Ok(seq);
+        }
+
+        let mut transient = self.transient_ledger_hook()?;
+        let hook = transient
+            .get_mut()
+            .map_err(|_| CalyxError::ledger_group_commit_failed("transient hook poisoned"))?;
+        let staged = hook.stage_many_with_checkpoints(drafts)?;
+        rows.extend(staged.iter().map(|row| encode::WriteRow {
+            cf: ColumnFamily::Ledger,
+            key: row.key().to_vec(),
+            value: row.value().to_vec(),
+        }));
+        let seq = self.commit_rows_locked(&rows)?;
+        ledger_hook::commit_staged(hook, &staged)?;
+        Ok(seq)
+    }
+
     fn transient_ledger_hook(&self) -> Result<ledger_hook::AsterLedgerHook> {
         let ledger_rows = self
             .scan_cf_at(self.latest_seq(), ColumnFamily::Ledger)?
@@ -78,6 +130,7 @@ where
                 last_recovered_seq: self.latest_seq(),
                 wal_replay_floor_seq: 0,
                 derived_content_floor_seq: 0,
+                migrate_derived_content_model: false,
                 torn_tail: None,
                 temporal_policy: None,
                 dedup_policy: None,

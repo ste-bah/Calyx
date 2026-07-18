@@ -8,12 +8,16 @@
 mod consensus;
 mod hdbscan;
 mod lens_nav;
+mod skill_gpu;
 mod skills;
 mod traverse;
 
 pub use consensus::{ConsensusHit, ConsensusMode, ConsensusReport, SlotCosine, agree, disagree};
 pub use lens_nav::{LensComparison, compare_lenses, define, neighbors};
-pub use skills::{SkillNode, SkillParams, SkillTree, search_skill, skills};
+pub use skills::{
+    SkillExecutionBackend, SkillExecutionStats, SkillNode, SkillParams, SkillTree, search_skill,
+    skills,
+};
 pub use traverse::{
     MAX_TRAVERSE_HOPS, TraverseDirection, TraversePath, TraverseStep, traverse, traverse_graph,
 };

@@ -12,8 +12,9 @@ use fastembed_contract::{
 };
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
-use crate::runtime::candle::{CandlePoolingPolicy, CandlePrecision};
+use crate::runtime::candle::{self, CandlePoolingPolicy, CandlePrecision};
 use crate::runtime::common::DEFAULT_MAX_TOKENS;
+use crate::runtime::onnx::{custom_contract_corpus_hash, custom_pooling_from_config};
 use crate::{AlgorithmicEncoder, LensRuntime, LensSpec, MultimodalAdapterLens, Qwen3ModelFiles};
 
 const DEFAULT_COLBERT_ONNX: &str = "onnx/model_fp16.onnx";
@@ -21,7 +22,13 @@ const DEFAULT_QWEN3_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 const STATIC_LOOKUP_MAGIC: &[u8; 8] = b"CXLKUP1\0";
 const STATIC_LOOKUP_HEADER_LEN: usize = 24;
 
-pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<FrozenLensContract> {
+/// Derive the exact frozen runtime contract without constructing a model session.
+///
+/// This is intentionally public so content-addressed deployment records can
+/// snapshot and later compare the runtime identity before allocating a GPU or
+/// mutating a registry. Runtime-specific configuration files are still read and
+/// validated; callers must treat an error as a hard deployment failure.
+pub fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<FrozenLensContract> {
     match &spec.runtime {
         LensRuntime::Algorithmic { kind } => algorithmic_contract(spec, kind),
         LensRuntime::TeiHttp { endpoint } => tei_contract(spec, endpoint),
@@ -43,7 +50,8 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
             model_id,
             files,
             output,
-        } => fastembed_bgem3_contract(spec, model_id, files, *output),
+            engine,
+        } => fastembed_bgem3_contract(spec, model_id, files, *output, *engine),
         LensRuntime::FastembedReranker { model_id, files } => {
             fastembed_reranker_contract(spec, model_id, files)
         }
@@ -51,7 +59,8 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
             model_id,
             files,
             dtype,
-        } => qwen3_contract(spec, model_id, files, dtype),
+            max_tokens,
+        } => qwen3_contract(spec, model_id, files, dtype, *max_tokens),
         LensRuntime::StaticLookup {
             embeddings_file,
             tokenizer,
@@ -208,21 +217,18 @@ fn candle_contract(
     let dim = dense_hidden_size(config, "candle")?;
     let precision = CandlePrecision::parse(dtype)?;
     let pooling = CandlePoolingPolicy::parse(pooling)?;
-    let finite_replay_text = match precision {
-        CandlePrecision::F16 | CandlePrecision::BF16 => precision.as_str(),
-        CandlePrecision::F32 => "none",
-    };
-    let max_tokens = DEFAULT_MAX_TOKENS.to_string();
-    let norm_text = format!("{:?}", spec.norm_policy);
-    let corpus_hash = sha256_digest(&[
-        b"candle-local-bert-v2",
-        model_id.as_bytes(),
-        max_tokens.as_bytes(),
-        precision.as_str().as_bytes(),
-        pooling.as_str().as_bytes(),
-        norm_text.as_bytes(),
-        finite_replay_text.as_bytes(),
-    ]);
+    // Same formula and same warm-path device policy as CandleLens::from_lens_spec,
+    // so the session-free derivation is byte-identical to the runtime contract.
+    let finite_replay =
+        candle::contract_finite_replay_precision(candle::LENS_SPEC_DEVICE_POLICY, precision);
+    let corpus_hash = candle::contract_corpus_hash(
+        model_id,
+        DEFAULT_MAX_TOKENS,
+        precision,
+        pooling,
+        spec.norm_policy,
+        finite_replay,
+    );
     Ok(FrozenLensContract::new(
         spec.name.clone(),
         spec.weights_sha256,
@@ -243,17 +249,16 @@ fn onnx_contract(spec: &LensSpec, model_id: &str, files: &[PathBuf]) -> Result<F
     for path in files {
         ensure_file("ONNX contract artifact", path)?;
     }
-    let pooling = onnx_pooling_from_config(config)?;
-    let norm_text = format!("{:?}", spec.norm_policy);
+    // Same pooling parser and same corpus-hash formula as the custom ONNX
+    // runtime constructor. The sparse decision mirrors `output_from_session`:
+    // a custom ONNX lens is sparse if and only if its declared output shape is
+    // sparse (SPLADE-style lenses).
+    let pooling = custom_pooling_from_config(config)?;
+    let sparse = matches!(spec.output, SlotShape::Sparse(_));
     Ok(FrozenLensContract::new(
         spec.name.clone(),
         spec.weights_sha256,
-        sha256_digest(&[
-            b"onnx-custom-v1",
-            model_id.as_bytes(),
-            pooling.as_bytes(),
-            norm_text.as_bytes(),
-        ]),
+        custom_contract_corpus_hash(model_id, sparse, pooling, spec.norm_policy),
         spec.output,
         spec.modality,
         LensDType::F32,
@@ -295,14 +300,20 @@ fn qwen3_contract(
     model_id: &str,
     files: &[PathBuf],
     dtype: &str,
+    max_tokens: usize,
 ) -> Result<FrozenLensContract> {
+    if max_tokens == 0 {
+        return Err(lens_config_invalid(
+            "fastembed-qwen3 max_tokens must be > 0",
+        ));
+    }
     let model_id = qwen3_model_id(model_id)?;
     let files = Qwen3ModelFiles::from_paths(model_id.clone(), files.to_vec())?;
     for path in files.artifact_paths() {
         ensure_file("fastembed-qwen3 contract artifact", &path)?;
     }
     let precision = CandlePrecision::parse(dtype)?;
-    let max_tokens = "32768".to_string();
+    let max_tokens = max_tokens.to_string();
     let dim = dense_hidden_size(&files.config, "Qwen3")?;
     Ok(FrozenLensContract::new(
         spec.name.clone(),
@@ -408,25 +419,6 @@ fn dense_hidden_size(path: &Path, label: &str) -> Result<u32> {
         .and_then(Value::as_u64)
         .ok_or_else(|| lens_config_invalid(format!("{label} config missing hidden_size")))?;
     u32::try_from(hidden).map_err(|_| CalyxError::lens_dim_mismatch("hidden_size exceeds u32"))
-}
-
-fn onnx_pooling_from_config(path: &Path) -> Result<&'static str> {
-    let value = read_json(path, "ONNX")?;
-    let Some(raw) = value
-        .get("pooling")
-        .or_else(|| value.get("pooling_policy"))
-        .and_then(Value::as_str)
-    else {
-        return Ok("mean");
-    };
-    match raw {
-        "mean" => Ok("mean"),
-        "cls" => Ok("cls"),
-        "last_token" | "last-token" => Ok("last_token"),
-        other => Err(lens_config_invalid(format!(
-            "unsupported ONNX pooling {other}"
-        ))),
-    }
 }
 
 fn read_json(path: &Path, label: &str) -> Result<Value> {

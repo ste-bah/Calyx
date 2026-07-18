@@ -11,7 +11,7 @@ pub mod relational;
 pub mod retention_reclaimer;
 pub mod timeseries;
 
-pub use blob::{BlobId, BlobLayer, BlobManifest};
+pub use blob::{BlobId, BlobLayer, BlobManifest, BlobPutResult, BlobReadResult};
 pub use document::{DocId, DocumentLayer};
 pub use kv::KvLayer;
 pub use relational::{RecordKey, RecordValue, RelationalLayer, Row};

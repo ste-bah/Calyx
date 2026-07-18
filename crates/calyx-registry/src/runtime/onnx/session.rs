@@ -1,7 +1,7 @@
 use calyx_core::{CalyxError, Result};
 use ort::session::Session;
 
-use super::cpu_fallback_audit::{configured_audit_mode, profiling_file_path};
+use super::cpu_fallback_audit::{effective_audit_mode, profiling_file_path};
 use super::cuda_guard::CudaDropGuard;
 use super::green_context::GreenContextHandle;
 use super::{OnnxProviderPolicy, config_invalid};
@@ -59,6 +59,15 @@ pub(super) fn configured_cuda_device() -> Result<i32> {
         })
 }
 
+/// Whether to set ORT `session.disable_cpu_ep_fallback=1` at build time.
+///
+/// This is a zero-tolerance **opt-in** (`CALYX_ONNX_DISABLE_CPU_EP_FALLBACK=1`),
+/// no longer the `CudaFailLoud` default: real BERT/XLM-R exports always leave
+/// a few trivial `Shape`/`Gather` int64 nodes on the CPU EP, so the ORT knob
+/// refuses every real transformer lens at Initialize (#1487). `CudaFailLoud`
+/// without the opt-in is instead protected by the mandatory node-placement
+/// audit (`cpu_fallback_audit`), which fails loud on any heavy compute op
+/// assigned to CPU while tolerating — and logging — the trivial ones.
 pub(super) fn cpu_ep_fallback_disabled_for_policy(policy: OnnxProviderPolicy) -> Result<bool> {
     let env_requested = env_flag(DISABLE_CPU_EP_FALLBACK_ENV);
     if env_requested && policy == OnnxProviderPolicy::CpuExplicit {
@@ -67,10 +76,10 @@ pub(super) fn cpu_ep_fallback_disabled_for_policy(policy: OnnxProviderPolicy) ->
             message: format!(
                 "{DISABLE_CPU_EP_FALLBACK_ENV}=1 is invalid for an explicit CPU ONNX session"
             ),
-            remediation: "unset CALYX_ONNX_DISABLE_CPU_EP_FALLBACK for CPU-policy sessions, or use CudaFailLoud when every node must stay off CPU",
+            remediation: "unset CALYX_ONNX_DISABLE_CPU_EP_FALLBACK for CPU-policy sessions; it is the zero-tolerance opt-in for CudaFailLoud sessions only",
         });
     }
-    Ok(matches!(policy, OnnxProviderPolicy::CudaFailLoud) || env_requested)
+    Ok(env_requested)
 }
 
 pub(super) fn configured_cuda_graphs() -> Result<bool> {
@@ -104,7 +113,8 @@ pub(super) fn build_session(
                 policy.as_str()
             ))
         })?;
-    if cpu_ep_fallback_disabled_for_policy(policy)? {
+    let cpu_ep_fallback_disabled = cpu_ep_fallback_disabled_for_policy(policy)?;
+    if cpu_ep_fallback_disabled {
         builder = builder
             .with_config_entry("session.disable_cpu_ep_fallback", "1")
             .map_err(|err| {
@@ -113,7 +123,8 @@ pub(super) fn build_session(
                 ))
             })?;
     }
-    if configured_audit_mode()?.enabled() {
+    let gpu_policy = matches!(policy, OnnxProviderPolicy::CudaFailLoud);
+    if effective_audit_mode(gpu_policy, cpu_ep_fallback_disabled)?.enabled() {
         builder = builder
             .with_profiling(profiling_file_path(label))
             .map_err(|err| {

@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::a37_admission_store::{self, A37AdmissionDbReadback};
 
-use super::CODE_INVALID_CONFIG;
 use super::model::{LensEvidence, MultiAnchorReport, TargetSummary};
+use super::{CODE_A37_ADMISSION_NOT_AUTHORITATIVE, CODE_INVALID_CONFIG};
 
 const DEFAULT_ASSOCIATION_KEY: &str = "a37_multi_anchor_admission";
 const DEFAULT_LIMIT_LENSES: usize = 32;
@@ -28,8 +28,19 @@ pub(crate) fn load_report(
     cf_root: &Path,
     association_key: &str,
 ) -> Result<(MultiAnchorReport, A37AdmissionDbReadback), String> {
-    a37_admission_store::read::<MultiAnchorReport>(cf_root, association_key)
-        .map_err(|error| format!("{}: {}", error.code, error.message))
+    let (report, readback) =
+        a37_admission_store::read::<MultiAnchorReport>(cf_root, association_key)
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    if report.mode != "gate"
+        || report.status != calyx_assay::A37_DIVERSITY_GATE_PASSED
+        || !report.gate_passed
+    {
+        return Err(format!(
+            "{CODE_A37_ADMISSION_NOT_AUTHORITATIVE}: A37 admission row status={} mode={} gate_passed={} is diagnostic evidence, not gate authority",
+            report.status, report.mode, report.gate_passed
+        ));
+    }
+    Ok((report, readback))
 }
 
 fn render_readback(

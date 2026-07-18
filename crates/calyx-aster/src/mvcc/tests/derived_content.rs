@@ -1,7 +1,6 @@
 //! Issue #1100: the derived-content watermark advances only for commits that
-//! write CFs feeding derived search content, so content-neutral commits
-//! (idempotency-ledger appends + time-index sentinels) never mark persistent
-//! search indexes stale.
+//! write CFs consumed by the persistent search builder, so independent
+//! databases never mark immutable vector/filter artifacts stale.
 
 use super::*;
 use calyx_core::SystemClock;
@@ -10,6 +9,19 @@ fn ledger_only_rows() -> Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> {
     vec![
         (ColumnFamily::Ledger, b"lk".to_vec(), b"lv".to_vec()),
         (ColumnFamily::TimeIndex, b"tk".to_vec(), b"tv".to_vec()),
+    ]
+}
+
+fn independent_rows() -> Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> {
+    vec![
+        (ColumnFamily::Graph, b"gk".to_vec(), b"gv".to_vec()),
+        (ColumnFamily::Assay, b"ak".to_vec(), b"av".to_vec()),
+        (ColumnFamily::Kernel, b"kk".to_vec(), b"kv".to_vec()),
+        (
+            ColumnFamily::slot_raw(SlotId::new(3)),
+            b"rk".to_vec(),
+            b"rv".to_vec(),
+        ),
     ]
 }
 
@@ -43,17 +55,24 @@ fn content_neutral_commits_do_not_advance_derived_content_seq() {
         2,
         "trailing neutral commit must leave the watermark at the last content seq"
     );
+
+    let independent = store.commit_batch(independent_rows()).expect("independent");
+    assert_eq!(independent, 4);
+    assert_eq!(
+        store.derived_content_seq(),
+        2,
+        "Graph/Assay/Kernel/raw-slot rows do not regenerate persistent search artifacts"
+    );
 }
 
 #[test]
-fn every_non_exempt_cf_advances_derived_content_seq() {
-    // Fail-closed doctrine: only Ledger and TimeIndex are content-neutral.
+fn every_static_cf_has_an_explicit_persistent_search_classification() {
     for cf in ColumnFamily::STATIC {
         let store = VersionedCfStore::new(0);
         store
             .commit_batch(vec![(cf, b"k".to_vec(), b"v".to_vec())])
             .expect("commit");
-        let expected = if cf.feeds_derived_search_content() {
+        let expected = if cf.feeds_persistent_search_index() {
             1
         } else {
             0
@@ -65,9 +84,9 @@ fn every_non_exempt_cf_advances_derived_content_seq() {
             cf.name()
         );
         assert_eq!(
-            cf.feeds_derived_search_content(),
-            !matches!(cf, ColumnFamily::Ledger | ColumnFamily::TimeIndex),
-            "only Ledger and TimeIndex may be exempt; CF {} changed doctrine",
+            cf.feeds_persistent_search_index(),
+            matches!(cf, ColumnFamily::Base),
+            "only Base among static CFs feeds the persistent search builder; CF {} changed doctrine",
             cf.name()
         );
     }
@@ -80,6 +99,16 @@ fn every_non_exempt_cf_advances_derived_content_seq() {
         )])
         .expect("slot commit");
     assert_eq!(slot_store.derived_content_seq(), 1);
+
+    let raw_store = VersionedCfStore::new(0);
+    raw_store
+        .commit_batch(vec![(
+            ColumnFamily::slot_raw(SlotId::new(3)),
+            b"k".to_vec(),
+            b"v".to_vec(),
+        )])
+        .expect("raw slot commit");
+    assert_eq!(raw_store.derived_content_seq(), 0);
 }
 
 #[test]

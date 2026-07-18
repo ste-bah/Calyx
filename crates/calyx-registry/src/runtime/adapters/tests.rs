@@ -1,6 +1,8 @@
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use calyx_core::{Input, Lens, Modality};
@@ -10,6 +12,8 @@ use super::{
     default_multimodal_lens_specs,
 };
 use crate::LensHealth;
+
+const CPU_OVERRIDE_ENV: &str = "CALYX_MULTIMODAL_ALLOW_CPU_ADAPTER";
 
 #[test]
 fn adapter_requires_real_config_and_registers_loaded_contract() {
@@ -97,15 +101,10 @@ fn cuda_fail_loud_provider_loads_from_real_config() {
 }
 
 #[test]
-fn cuda_preferred_provider_loads_from_real_config() {
-    let fixture = adapter_fixture_with_provider(
-        "cuda-preferred-provider",
-        MultimodalAxis::Image,
-        128,
-        "cuda_preferred",
-    );
+fn missing_provider_defaults_to_cuda_fail_loud() {
+    let fixture = adapter_fixture_without_provider("missing-provider", MultimodalAxis::Image, 128);
     let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
-        "fixture-cuda-preferred-image",
+        "fixture-default-cuda-image",
         MultimodalAxis::Image,
         128,
         Some(fixture.config),
@@ -115,7 +114,33 @@ fn cuda_preferred_provider_loads_from_real_config() {
     .unwrap();
 
     assert!(lens.provider().is_gpu());
-    assert_eq!(lens.provider_detail(), "cuda:0,allow_cpu_fallback");
+    assert_eq!(
+        lens.provider_detail(),
+        "cuda:0,error_on_failure,no_cpu_fallback"
+    );
+    assert_eq!(lens.lens_spec().max_batch, Some(32));
+}
+
+#[test]
+fn cuda_preferred_provider_fails_closed() {
+    let fixture = adapter_fixture_with_provider(
+        "cuda-preferred-provider",
+        MultimodalAxis::Image,
+        128,
+        "cuda_preferred",
+    );
+    let error = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "fixture-cuda-preferred-image",
+        MultimodalAxis::Image,
+        128,
+        Some(fixture.config),
+        None,
+        false,
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code, "CALYX_LENS_CONFIG_INVALID");
+    assert!(error.message.contains("CPU fallback is forbidden"));
 }
 
 #[test]
@@ -207,6 +232,29 @@ fn malformed_inputs_return_typed_errors_before_helper_spawn() {
     }
 }
 
+#[test]
+fn cpu_provider_requires_audited_override_before_helper_spawn() {
+    let _guard = cpu_env_guard(None);
+    let fixture = adapter_fixture("cpu-no-override", MultimodalAxis::Protein, 4);
+    let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "cpu-no-override",
+        MultimodalAxis::Protein,
+        4,
+        Some(fixture.config),
+        None,
+        false,
+    ))
+    .unwrap();
+
+    let error = lens
+        .measure(&Input::new(Modality::Protein, b"ACDE".to_vec()))
+        .unwrap_err();
+
+    assert_eq!(error.code, "CALYX_MULTIMODAL_CPU_OVERRIDE_REQUIRED");
+    assert!(error.message.contains(CPU_OVERRIDE_ENV));
+    assert!(!fixture.marker.exists());
+}
+
 #[cfg_attr(
     windows,
     ignore = "Windows cleanup-job assignment can be denied in local test shells"
@@ -216,6 +264,7 @@ fn cpu_adapter_respawns_one_shot_helper_for_repeated_measurements() {
     if Command::new("python3").arg("--version").output().is_err() {
         return;
     }
+    let _guard = cpu_env_guard(Some("1"));
     let root = temp_root("one-shot-helper");
     let helper = root.join("helper.py");
     let model = root.join("model.onnx");
@@ -313,11 +362,24 @@ fn adapter_fixture(label: &str, axis: MultimodalAxis, dim: u32) -> AdapterFixtur
     adapter_fixture_with_provider(label, axis, dim, "cpu_explicit")
 }
 
+fn adapter_fixture_without_provider(label: &str, axis: MultimodalAxis, dim: u32) -> AdapterFixture {
+    write_adapter_fixture(label, axis, dim, None)
+}
+
 fn adapter_fixture_with_provider(
     label: &str,
     axis: MultimodalAxis,
     dim: u32,
     provider: &str,
+) -> AdapterFixture {
+    write_adapter_fixture(label, axis, dim, Some(provider))
+}
+
+fn write_adapter_fixture(
+    label: &str,
+    axis: MultimodalAxis,
+    dim: u32,
+    provider: Option<&str>,
 ) -> AdapterFixture {
     let root = temp_root(label);
     let helper = root.join("helper.py");
@@ -333,6 +395,9 @@ fn adapter_fixture_with_provider(
     let model = root.join("model.onnx");
     fs::write(&model, b"not-used-by-invalid-input-tests").unwrap();
     let config = root.join("adapter.json");
+    let provider_line = provider
+        .map(|value| format!(",\n  \"provider\": \"{value}\""))
+        .unwrap_or_default();
     fs::write(
         &config,
         format!(
@@ -345,18 +410,51 @@ fn adapter_fixture_with_provider(
   "dim": {},
   "python": "python3",
   "helper": "helper.py",
-  "model_file": "model.onnx",
-  "provider": "{}"
+  "model_file": "model.onnx"{}
 }}"#,
             axis.as_str(),
             axis.as_str(),
             axis.as_str(),
             dim,
-            provider
+            provider_line
         ),
     )
     .unwrap();
     AdapterFixture { config, marker }
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+fn cpu_env_guard(value: Option<&str>) -> EnvGuard {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let previous = std::env::var_os(CPU_OVERRIDE_ENV);
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(CPU_OVERRIDE_ENV, value),
+            None => std::env::remove_var(CPU_OVERRIDE_ENV),
+        }
+    }
+    EnvGuard {
+        key: CPU_OVERRIDE_ENV,
+        previous,
+        _lock: lock,
+    }
 }
 
 fn adapter_spec(

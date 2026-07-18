@@ -14,8 +14,8 @@ use calyx_poly::{
 use sha2::{Digest, Sha256};
 
 #[allow(dead_code)]
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use support::{named_fsv_root, reset_dir};
 

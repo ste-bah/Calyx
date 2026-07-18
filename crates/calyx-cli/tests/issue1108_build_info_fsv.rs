@@ -92,6 +92,7 @@ fn build_info_reports_the_checkout_head() {
 const EXPECTED_CAPABILITIES: &[(&str, bool)] = &[
     ("forge-cuda", calyx_forge::CUDA_COMPILED),
     ("registry-candle-cuda", calyx_registry::CANDLE_CUDA_COMPILED),
+    ("search-cuda", calyx_search::CUDA_COMPILED),
     ("sextant-cuvs", calyx_sextant::CUVS_COMPILED),
 ];
 

@@ -56,7 +56,8 @@ impl CudaGraphRunConfig {
         let next_id = u32::try_from(self.graph_ids.len()).map_err(|_| CalyxError {
             code: "CALYX_ONNX_CUDA_GRAPH_ID_OVERFLOW",
             message: format!("{label} exhausted CUDA graph ids"),
-            remediation: "lower CALYX_ONNX_MAX_DISTINCT_SHAPES or disable CUDA graphs for this session",
+            remediation:
+                "lower CALYX_ONNX_MAX_DISTINCT_SHAPES or disable CUDA graphs for this session",
         })?;
         let graph_id = *self.graph_ids.entry(shape).or_insert(next_id);
         options
@@ -84,6 +85,7 @@ impl CudaGraphRunConfig {
         session: &mut Session,
         request: CudaGraphRunRequest<'_>,
         inputs: Vec<(String, Tensor<i64>)>,
+        copy_outputs_to_host: bool,
         extract: impl FnOnce(&SessionOutputs<'_>) -> Result<R>,
     ) -> Result<R> {
         let label = request.label;
@@ -111,7 +113,16 @@ impl CudaGraphRunConfig {
                 shape.0, shape.1
             ))
         })?;
-        copy_outputs_to_cpu(label, &mut outputs)?;
+        if copy_outputs_to_host {
+            copy_outputs_to_cpu(label, &mut outputs)?;
+        } else {
+            binding.binding.synchronize_outputs().map_err(|err| {
+                config_invalid(format!(
+                    "ONNX CUDA graph output synchronize failed for {label} batch={} seq={}: {err}",
+                    shape.0, shape.1
+                ))
+            })?;
+        }
         let result = extract(&outputs)?;
         drop(outputs);
         Ok(result)
@@ -256,7 +267,8 @@ fn copy_outputs_to_cpu(label: &str, outputs: &mut SessionOutputs<'_>) -> Result<
         let output = outputs.get_mut(&name).ok_or_else(|| CalyxError {
             code: "CALYX_ONNX_CUDA_GRAPH_OUTPUT_MISSING",
             message: format!("{label} CUDA graph run lost output named {name} during CPU copy"),
-            remediation: "rerun with CALYX_ONNX_CUDA_GRAPHS unset and verify the ONNX model output schema",
+            remediation:
+                "rerun with CALYX_ONNX_CUDA_GRAPHS unset and verify the ONNX model output schema",
         })?;
         *output = cpu_output;
     }

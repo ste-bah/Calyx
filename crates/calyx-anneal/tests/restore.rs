@@ -16,7 +16,9 @@ use calyx_core::{CxId, FixedClock};
 use calyx_ledger::{ActorId, LedgerAppender, MemoryLedgerStore};
 use proptest::prelude::*;
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::vault_id;
 
 const TEST_TS: u64 = 1_785_600_403;

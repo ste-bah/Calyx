@@ -1,7 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CALYX_TEMPORAL_AP60_VIOLATION, CxFlags, CxId, DecayFunction,
     InputRef, LedgerRef, Modality, SlotId, VaultId,
@@ -14,6 +12,7 @@ use calyx_sextant::{
 };
 use proptest::prelude::*;
 use sextant_support::{cx_u8_fill as cx, dense};
+use std::collections::{BTreeMap, BTreeSet};
 
 const CONTENT_SLOT: SlotId = SlotId::new(8);
 const EMPTY_PRIMARY_SLOT: SlotId = SlotId::new(9);

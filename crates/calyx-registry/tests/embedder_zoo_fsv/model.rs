@@ -18,8 +18,8 @@ use calyx_registry::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::fsv_io::vault_id;
 use super::{FSV_TS, ROWS};
-use crate::fsv_io::vault_id;
 
 #[derive(Clone, Copy)]
 pub struct Target {

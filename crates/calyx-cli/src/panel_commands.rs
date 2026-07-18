@@ -13,6 +13,9 @@ mod template_store;
 mod templates;
 mod warm;
 
+pub(crate) use resident::ResidentMeasuredInput;
+#[cfg(test)]
+pub(crate) use resident::ResidentSlotMeasure;
 pub(crate) use resident::measure_batch_at as measure_resident_batch_at;
 pub(crate) use resident::ready_value_at as resident_ready_value_at;
 pub(crate) use resident::{ResidentDiscovery, read_resident_discovery, resident_discovery_path};

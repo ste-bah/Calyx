@@ -3,7 +3,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use calyx_aster::ledger_head::read_head_anchor;
-use calyx_aster::ledger_view::{read_ledger_seq, read_ledger_seqs};
+use calyx_aster::ledger_view::{AsterLedgerCfStore, read_ledger_seq, read_ledger_seqs};
+use calyx_aster::manifest::recover_vault;
 use calyx_core::CalyxError;
 use calyx_ledger::{StreamingChainVerifier, StreamingStart, VerifyResult};
 use serde::Serialize;
@@ -121,15 +122,11 @@ pub(crate) fn run_verify_chain(args: VerifyChainArgs) -> CliResult {
     let resolved = resolve_verify_vault(&args.vault)?;
     let anchor = read_head_anchor(&resolved.path)?;
     let from = args.from.unwrap_or(0);
-    let to = args
-        .to
-        .or_else(|| anchor.as_ref().map(|anchor| anchor.height))
-        .ok_or_else(|| {
-            CalyxError::ledger_corrupt(format!(
-                "verify-chain {} requires --to because the vault has no ledger head anchor",
-                resolved.path.display()
-            ))
-        })?;
+    let to = match (args.to, anchor.as_ref()) {
+        (Some(to), _) => to,
+        (None, Some(anchor)) => anchor.height,
+        (None, None) => verify_initialized_empty_chain(&resolved.path)?,
+    };
     if from > to {
         return Err(CliError::usage(format!(
             "verify-chain --from {from} must be <= --to {to}"
@@ -155,6 +152,33 @@ pub(crate) fn run_verify_chain(args: VerifyChainArgs) -> CliResult {
         &mut progress,
     )?;
     emit_result(from, result, &deadline, &mut progress)
+}
+
+fn verify_initialized_empty_chain(vault: &Path) -> CliResult<u64> {
+    // A missing head is valid only for a physically empty initialized vault.
+    // Loading recovery state verifies CURRENT, the immutable manifest refs,
+    // the WAL framing/checksums, and torn-tail status independently of the
+    // absent head. Any durable or replayed commit means state exists and the
+    // missing head must remain a hard corruption error.
+    let recovery = recover_vault(vault)?;
+    if let Some(torn) = recovery.torn_tail {
+        return Err(torn.error().into());
+    }
+    if recovery.manifest.durable_seq != 0 || !recovery.wal_records.is_empty() {
+        return Err(CalyxError::ledger_corrupt(format!(
+            "verify-chain {} found no ledger head but durable state is non-empty: manifest_durable_seq={} wal_records={} last_recovered_seq={}",
+            vault.display(),
+            recovery.manifest.durable_seq,
+            recovery.wal_records.len(),
+            recovery.last_recovered_seq
+        ))
+        .into());
+    }
+    // The ledger view independently scans Ledger SSTs and WAL rows. It catches
+    // nonempty router-only state that is not represented by a commit-domain
+    // manifest sequence and refuses rows without a head anchor.
+    AsterLedgerCfStore::open(vault)?;
+    Ok(0)
 }
 
 fn verify_vault_streaming(

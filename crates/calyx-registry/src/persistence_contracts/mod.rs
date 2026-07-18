@@ -1,6 +1,7 @@
 mod repair_all;
 mod runtime;
 mod static_contract;
+pub use static_contract::derive_runtime_contract_from_spec;
 #[cfg(test)]
 mod tests;
 
@@ -14,7 +15,6 @@ pub use repair_all::{
     VaultRegistryContractRepairAllWrite, repair_vault_registry_contracts_from_specs,
 };
 pub(crate) use runtime::load_runtime_lens_from_spec;
-use static_contract::derive_runtime_contract_from_spec;
 
 use crate::frozen::FrozenLensContract;
 use crate::persistence::{

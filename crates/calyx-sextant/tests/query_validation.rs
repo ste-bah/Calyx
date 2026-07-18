@@ -1,11 +1,10 @@
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{AnchorKind, AnchorValue, CxId, SlotId, SlotVector};
 use calyx_sextant::{
     AnchorPredicate, CALYX_SEXTANT_QUERY_SHAPE, HnswIndex, MetadataPredicate, Query, QueryFilters,
     ScalarOp, ScalarPredicate, SearchEngine, SlotIndexMap,
 };
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
 use sextant_support::dense;
 
 #[test]

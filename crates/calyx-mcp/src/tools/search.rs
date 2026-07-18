@@ -8,13 +8,13 @@ mod extension_guard_measurement_tests;
 #[cfg(test)]
 mod extension_tests;
 mod extensions;
-mod ledger_provenance;
 mod output;
+mod runtime_cache;
 #[cfg(test)]
 mod tests;
 
 use calyx_core::{AnchorKind, CalyxError, CxId, SlotId};
-use calyx_sextant::{FreshnessRequirement, FusionStrategy, RrfProfile};
+use calyx_sextant::RrfProfile;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -61,6 +61,7 @@ impl Tool for SearchTool {
                 ),
                 ("guard", enum_string(&["off", "in_region"]), false),
                 ("explain", boolean_schema(), false),
+                ("rerank", boolean_schema(), false),
                 ("fresh", boolean_schema(), false),
                 ("filter", json!({ "type": "object" }), false),
             ]),
@@ -73,6 +74,7 @@ impl Tool for SearchTool {
         let outcome = engine::search(&request)?;
         let mut response =
             json!({ "hits": output::render_hits(&outcome.hits, request.explain, None) });
+        response["execution"] = json!(&outcome.execution);
         if request.guard == SearchGuard::InRegion {
             response["dropped_guard_hits"] = json!(outcome.dropped_guard_hits);
         }
@@ -110,8 +112,10 @@ impl Tool for KernelAnswerTool {
             fusion: SearchFusion::KernelFirst,
             guard: SearchGuard::Off,
             explain: args.explain.unwrap_or(false),
-            freshness: FreshnessRequirement::FreshDerived,
+            rerank: false,
+            freshness: calyx_search::SearchFreshness::Fresh,
             filter: None,
+            include_all_docs: true,
         };
         let outcome = engine::search(&search)?;
         serde_json::to_value(engine::kernel_report(
@@ -161,6 +165,7 @@ struct SearchArgs {
     fusion: Option<String>,
     guard: Option<String>,
     explain: Option<bool>,
+    rerank: Option<bool>,
     fresh: Option<bool>,
     filter: Option<Value>,
 }
@@ -188,8 +193,10 @@ pub(super) struct SearchRequest {
     pub(super) fusion: SearchFusion,
     pub(super) guard: SearchGuard,
     pub(super) explain: bool,
-    pub(super) freshness: FreshnessRequirement,
+    pub(super) rerank: bool,
+    pub(super) freshness: calyx_search::SearchFreshness,
     pub(super) filter: Option<Value>,
+    pub(super) include_all_docs: bool,
 }
 
 pub(super) struct NeighborsRequest {
@@ -220,18 +227,22 @@ impl SearchRequest {
         if args.filter.as_ref().is_some_and(|value| !value.is_object()) {
             return Err(ToolError::invalid_params("filter must be a JSON object"));
         }
+        let fusion = SearchFusion::parse(args.fusion.as_deref())?;
+        let rerank = args.rerank.unwrap_or(false);
         Ok(Self {
             vault: args.vault,
             query: args.query,
             k: parse_k(args.k)?,
-            fusion: SearchFusion::parse(args.fusion.as_deref())?,
+            fusion,
             guard: SearchGuard::parse(args.guard.as_deref())?,
             explain: args.explain.unwrap_or(false),
+            rerank,
             freshness: match args.fresh {
-                Some(false) => FreshnessRequirement::StaleOk { seq_lag: u64::MAX },
-                Some(true) | None => FreshnessRequirement::FreshDerived,
+                Some(false) => calyx_search::SearchFreshness::StaleOk,
+                Some(true) | None => calyx_search::SearchFreshness::Fresh,
             },
             filter: args.filter,
+            include_all_docs: false,
         })
     }
 }
@@ -261,23 +272,24 @@ impl SearchFusion {
         }
     }
 
-    pub(super) fn to_strategy(self, slots: &[SlotId]) -> ToolResult<FusionStrategy> {
+    pub(super) fn to_choice(self) -> calyx_search::FusionChoice {
         match self {
-            Self::Rrf => Ok(FusionStrategy::Rrf),
-            Self::WeightedRrf => Ok(FusionStrategy::WeightedRrf {
-                profile: RrfProfile::General,
-            }),
-            Self::SingleLens => slots
-                .first()
-                .copied()
-                .map(|slot| FusionStrategy::SingleLens { slot })
-                .ok_or_else(|| {
-                    ToolError::invalid_params("single_lens search has no active lens slot")
-                }),
-            Self::KernelFirst => Ok(FusionStrategy::WeightedRrf {
-                profile: RrfProfile::Kernel,
-            }),
-            Self::Pipeline => Ok(FusionStrategy::Pipeline),
+            Self::Rrf => calyx_search::FusionChoice::Rrf,
+            Self::WeightedRrf => {
+                calyx_search::FusionChoice::WeightedRrfProfile(RrfProfile::General)
+            }
+            Self::SingleLens => calyx_search::FusionChoice::SingleLens,
+            Self::KernelFirst => calyx_search::FusionChoice::WeightedRrfProfile(RrfProfile::Kernel),
+            Self::Pipeline => calyx_search::FusionChoice::Pipeline,
+        }
+    }
+}
+
+impl SearchGuard {
+    pub(super) fn to_choice(self) -> calyx_search::GuardChoice {
+        match self {
+            Self::Off => calyx_search::GuardChoice::Off,
+            Self::InRegion => calyx_search::GuardChoice::InRegion,
         }
     }
 }

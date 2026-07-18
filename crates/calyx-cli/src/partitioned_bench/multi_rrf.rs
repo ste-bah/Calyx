@@ -26,6 +26,8 @@ mod a37_admission;
 mod args;
 #[path = "multi_rrf/ensemble.rs"]
 mod ensemble;
+#[path = "multi_rrf/exact_truth.rs"]
+mod exact_truth;
 #[path = "multi_rrf/fused_truth_db.rs"]
 mod fused_truth_db;
 #[path = "multi_rrf/ground_truth.rs"]
@@ -286,7 +288,7 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
             db_fused_truth: db_fused_truth.as_ref(),
             slot_truth: slot_truth.as_ref(),
             db_slot_truth: db_slot_truth.as_ref(),
-        })
+        })?
     } else {
         recall::RecallReadback::default()
     };

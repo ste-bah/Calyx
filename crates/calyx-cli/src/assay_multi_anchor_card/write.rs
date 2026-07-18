@@ -15,7 +15,7 @@ pub(crate) struct Evidence {
     pub(crate) out_dir: String,
     pub(crate) cf_root: String,
     pub(crate) association_key: String,
-    pub(crate) db_readback: A37AdmissionDbReadback,
+    pub(crate) db_readback: Option<A37AdmissionDbReadback>,
     pub(crate) report_path: String,
     pub(crate) lens_values_path: String,
     pub(crate) target_summary_path: String,
@@ -37,16 +37,23 @@ pub(crate) fn write_outputs(
     report: &MultiAnchorReport,
 ) -> Result<Evidence, String> {
     request.ensure_fresh_output()?;
-    let db_readback =
-        a37_admission_store::write(&request.cf_root, &request.association_key, report)
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    let db_readback = if request.mode.requires_gate() && report.gate_passed {
+        Some(
+            a37_admission_store::write(&request.cf_root, &request.association_key, report)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?,
+        )
+    } else {
+        None
+    };
 
     let mut report_path = String::new();
     let mut lens_values_path = String::new();
     let mut target_summary_path = String::new();
     let mut report_sha256 = String::new();
     let mut readback_sha256 = String::new();
-    let mut readback_matches = db_readback.readback_matches;
+    let mut readback_matches = db_readback
+        .as_ref()
+        .is_none_or(|readback| readback.readback_matches);
     if request.emit_artifacts {
         fs::create_dir_all(&request.out_dir)
             .map_err(|error| format!("create {}: {error}", request.out_dir.display()))?;
@@ -112,21 +119,18 @@ pub(crate) fn format_evidence(evidence: &Evidence) -> String {
     out.push_str(&format!("cf_root={}\n", evidence.cf_root));
     out.push_str(&format!("association_key={}\n", evidence.association_key));
     out.push_str(&format!(
-        "row_key_sha256={}\n",
-        evidence.db_readback.row_key_sha256
+        "db_admission_written={}\n",
+        evidence.db_readback.is_some()
     ));
-    out.push_str(&format!(
-        "value_bytes={}\n",
-        evidence.db_readback.value_bytes
-    ));
-    out.push_str(&format!(
-        "value_sha256={}\n",
-        evidence.db_readback.value_sha256
-    ));
-    out.push_str(&format!(
-        "db_readback_matches={}\n",
-        evidence.db_readback.readback_matches
-    ));
+    if let Some(readback) = &evidence.db_readback {
+        out.push_str(&format!("row_key_sha256={}\n", readback.row_key_sha256));
+        out.push_str(&format!("value_bytes={}\n", readback.value_bytes));
+        out.push_str(&format!("value_sha256={}\n", readback.value_sha256));
+        out.push_str(&format!(
+            "db_readback_matches={}\n",
+            readback.readback_matches
+        ));
+    }
     out.push_str(&format!("readback_matches={}\n", evidence.readback_matches));
     out.push_str(&format!(
         "status={} gate_passed={}\n",

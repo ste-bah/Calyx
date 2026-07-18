@@ -20,7 +20,7 @@ fn defaults_apply_when_only_vault_given() {
     assert_eq!(args.vault, "corpus");
     assert_eq!(args.content_slot, None);
     assert_eq!(args.knn, DEFAULT_KNN);
-    assert_eq!(args.edge_cos_threshold, DEFAULT_EDGE_COS_THRESHOLD);
+    assert_eq!(args.edge_score_threshold, DEFAULT_EDGE_SCORE_THRESHOLD);
     assert_eq!(
         args.max_groundedness_distance,
         DEFAULT_MAX_GROUNDEDNESS_DISTANCE
@@ -60,7 +60,7 @@ fn all_flags_parse() {
     .unwrap();
     assert_eq!(args.content_slot, Some(8));
     assert_eq!(args.knn, 24);
-    assert!((args.edge_cos_threshold - 0.7).abs() < 1e-6);
+    assert!((args.edge_score_threshold - 0.7).abs() < 1e-6);
     assert_eq!(args.max_groundedness_distance, 4);
     assert_eq!(args.batch, 1000);
     assert_eq!(args.limit, 50);

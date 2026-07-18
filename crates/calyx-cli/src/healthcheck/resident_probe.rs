@@ -137,7 +137,7 @@ mod tests {
             assert!(line.contains("\"ready\""));
             let mut stream = stream;
             stream
-                .write_all(b"{\"ready\":false,\"schema\":\"calyx-panel-resident-readiness-v1\"}\n")
+                .write_all(b"{\"ready\":false,\"schema\":\"calyx-panel-resident-readiness-v2\"}\n")
                 .unwrap();
         });
         let check = check_resident_parallelism(addr);

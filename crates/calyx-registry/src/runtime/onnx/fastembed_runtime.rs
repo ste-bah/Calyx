@@ -164,6 +164,16 @@ pub fn execution_providers(
     execution_providers_on_device(policy, 0)
 }
 
+pub(super) fn device_postprocess_unavailable(runtime: &str) -> CalyxError {
+    CalyxError {
+        code: "CALYX_LENS_DEVICE_POSTPROCESS_UNAVAILABLE",
+        message: format!(
+            "{runtime} uses FastEmbed 5.16 host-owned outputs; CudaFailLoud requires Calyx-owned ONNX output binding and device postprocess"
+        ),
+        remediation: "register this lens through a Calyx-owned ONNX runtime or implement a FastEmbed wrapper that exposes CUDA output buffers",
+    }
+}
+
 pub fn execution_providers_on_device(
     policy: OnnxProviderPolicy,
     device_id: i32,

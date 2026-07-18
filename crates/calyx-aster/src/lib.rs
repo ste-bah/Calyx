@@ -4,6 +4,8 @@ pub mod base_page_index;
 pub mod cf;
 pub mod collection;
 pub mod compaction;
+#[cfg(feature = "cuda")]
+mod cuda_olap;
 pub mod dedup;
 pub mod erase;
 mod file_lock;

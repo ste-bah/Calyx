@@ -1,11 +1,14 @@
-mod support;
+// calyx-shared-module: path=support/mod.rs alias=__calyx_shared_support_mod_rs local=support visibility=private
+use crate::__calyx_shared_support_mod_rs as support;
 
+use calyx_aster::cf::ColumnFamily;
+use calyx_aster::manifest::recover_vault;
 use calyx_aster::manifest::{ManifestStore, is_quarantined};
 use calyx_aster::sst::{SstEntry, SstReader, write_sst};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
-    Constellation, CxFlags, CxId, FixedClock, InputRef, LedgerRef, Modality, SlotId, SlotVector,
-    VaultId, VaultStore,
+    Constellation, CxFlags, CxId, FixedClock, InputRef, LedgerRef, Modality, Panel, SlotId,
+    SlotVector, VaultId, VaultStore,
 };
 use calyx_ledger::{ActorId, DirectoryLedgerStore, EntryKind, LedgerAppender, SubjectId};
 use std::collections::BTreeMap;
@@ -117,6 +120,66 @@ fn verify_chain_vault_range_resolves_registered_name() {
         "stderr: {}",
         stderr(&missing)
     );
+    cleanup(root);
+}
+
+#[test]
+fn verify_chain_accepts_only_a_physically_empty_initialized_vault_without_a_head() {
+    let root = test_dir("empty-initialized");
+    reset_dir(&root);
+    let vault = write_initialized_empty_vault(&root);
+    let before_seq = vault.latest_seq();
+    let before_base = vault
+        .scan_cf_at(before_seq, ColumnFamily::Base)
+        .expect("scan empty Base before verify");
+    let before_ledger = vault
+        .scan_cf_at(before_seq, ColumnFamily::Ledger)
+        .expect("scan empty Ledger before verify");
+    drop(vault);
+    let before_recovery = recover_vault(&root).expect("recover empty vault before verify");
+
+    let verified = run(["verify-chain", "--vault"], &root, []);
+
+    assert_success(&verified);
+    assert_json_ok_checked(&verified, 0);
+    assert_eq!(before_seq, 0);
+    assert!(before_base.is_empty());
+    assert!(before_ledger.is_empty());
+    assert_eq!(before_recovery.manifest.durable_seq, 0);
+    assert!(before_recovery.wal_records.is_empty());
+    let after_recovery = recover_vault(&root).expect("recover empty vault after verify");
+    assert_eq!(after_recovery, before_recovery);
+    cleanup(root);
+}
+
+#[test]
+fn verify_chain_rejects_nonempty_base_state_without_a_head_and_does_not_mutate_it() {
+    let root = test_dir("nonempty-no-head");
+    reset_dir(&root);
+    let vault = write_initialized_empty_vault(&root);
+    vault
+        .write_cf(
+            ColumnFamily::Base,
+            b"orphan-base".to_vec(),
+            b"present".to_vec(),
+        )
+        .expect("persist real Base row without ledger head");
+    vault.flush().expect("checkpoint nonempty Base state");
+    let before = vault
+        .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)
+        .expect("scan Base before refused verify");
+    drop(vault);
+
+    let refused = run(["verify-chain", "--vault"], &root, []);
+
+    assert!(!refused.status.success());
+    assert_stderr_code_and_message(&refused, "CALYX_LEDGER_CORRUPT", "state is non-empty");
+    let reopened = AsterVault::open(&root, vault_id(), b"salt".to_vec(), VaultOptions::default())
+        .expect("reopen refused vault");
+    let after = reopened
+        .scan_cf_at(reopened.latest_seq(), ColumnFamily::Base)
+        .expect("scan Base after refused verify");
+    assert_eq!(after, before);
     cleanup(root);
 }
 
@@ -275,6 +338,26 @@ fn write_vault(dir: &Path, count: usize) -> AsterVault {
             .expect("put");
     }
     vault
+}
+
+fn write_initialized_empty_vault(dir: &Path) -> AsterVault {
+    let panel = Panel {
+        version: 1,
+        slots: Vec::new(),
+        created_at: 1,
+        kernel_ref: None,
+        guard_ref: None,
+    };
+    AsterVault::new_durable(
+        dir,
+        vault_id(),
+        b"salt".to_vec(),
+        VaultOptions {
+            panel: Some(panel),
+            ..VaultOptions::default()
+        },
+    )
+    .expect("create initialized empty vault")
 }
 
 fn sample_constellation(vault: &AsterVault, seed: u16) -> Constellation {

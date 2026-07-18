@@ -4,6 +4,55 @@
 use super::super::super::*;
 use super::{anchor_kind_name, push_opt};
 
+pub(super) fn citation_overlay_tokens(
+    args: &citation_overlay::MaterializeCitationOverlayArgs,
+) -> Vec<String> {
+    let mut out = vec![
+        "materialize-citation-overlay".to_string(),
+        args.vault.clone(),
+        "--idmap".to_string(),
+        args.idmap.to_string_lossy().into_owned(),
+        "--citations".to_string(),
+        args.citations.to_string_lossy().into_owned(),
+    ];
+    push_opt(&mut out, "--collection", args.collection.as_deref());
+    push_opt(
+        &mut out,
+        "--skip-report",
+        args.skip_report.as_ref().and_then(|p| p.to_str()),
+    );
+    push_opt(
+        &mut out,
+        "--report",
+        args.report.as_ref().and_then(|p| p.to_str()),
+    );
+    push_opt(
+        &mut out,
+        "--home",
+        args.home.as_ref().and_then(|p| p.to_str()),
+    );
+    out
+}
+
+#[test]
+fn citation_overlay_round_trips_through_tokens() {
+    let command =
+        Subcommand::MaterializeCitationOverlay(citation_overlay::MaterializeCitationOverlayArgs {
+            vault: "legal-cuyahoga".to_string(),
+            idmap: "/fsv/idmap.csv".into(),
+            citations: "/fsv/citations_cuyahoga.csv".into(),
+            collection: Some("legal-citations-v1".to_string()),
+            skip_report: Some("/fsv/skips.json".into()),
+            report: Some("/fsv/readback.json".into()),
+            home: Some("/home/calyx".into()),
+        });
+    let tokens = citation_overlay_tokens(match &command {
+        Subcommand::MaterializeCitationOverlay(args) => args,
+        _ => unreachable!(),
+    });
+    assert_eq!(parse(&tokens).unwrap(), command);
+}
+
 pub(super) fn probe_matrix_tokens(args: &probe_matrix::ProbeMatrixArgs) -> Vec<String> {
     let mut out = vec![
         "probe-matrix".to_string(),

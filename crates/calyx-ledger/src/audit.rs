@@ -12,8 +12,12 @@ use crate::codec::decode;
 use crate::entry::{ActorId, LedgerEntry, SubjectId};
 use crate::kind::EntryKind;
 use crate::reproduce::FusionWeights;
+use crate::verify::DecodedLedgerSnapshot;
 
+mod links;
 mod mentions;
+use links::*;
+pub use mentions::entry_cx_mentions;
 use mentions::entry_mentions_cx;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,7 +68,7 @@ pub struct QuarantineSet {
 
 impl QuarantineSet {
     pub fn from_ranges(ranges: impl IntoIterator<Item = Range<u64>>) -> Result<Self> {
-        let ranges = ranges.into_iter().collect::<Vec<_>>();
+        let mut ranges = ranges.into_iter().collect::<Vec<_>>();
         for range in &ranges {
             if range.start >= range.end {
                 return Err(CalyxError::ledger_chain_broken(
@@ -72,16 +76,30 @@ impl QuarantineSet {
                 ));
             }
         }
-        Ok(Self { ranges })
+        ranges.sort_by_key(|range| (range.start, range.end));
+        let mut merged: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        Ok(Self { ranges: merged })
     }
 }
 
 impl QuarantineLookup for QuarantineSet {
     fn contains_quarantined(&self, range: Range<u64>) -> Result<bool> {
+        let candidate = self
+            .ranges
+            .partition_point(|quarantine| quarantine.end <= range.start);
         Ok(self
             .ranges
-            .iter()
-            .any(|quarantine| ranges_overlap(quarantine, &range)))
+            .get(candidate)
+            .is_some_and(|quarantine| ranges_overlap(quarantine, &range)))
     }
 }
 
@@ -99,12 +117,45 @@ pub fn get_provenance(
     Ok(out)
 }
 
+/// Returns the entries mentioning `cx_id` from an already decoded, coherent
+/// ledger snapshot. This avoids reacquiring and cloning a store view when a
+/// request needs more than one ledger projection.
+pub fn get_provenance_from_snapshot(
+    snapshot: &DecodedLedgerSnapshot,
+    quarantine: &dyn QuarantineLookup,
+    cx_id: CxId,
+) -> Result<Vec<LedgerEntry>> {
+    Ok(decode_entries_from_snapshot(snapshot, quarantine)?
+        .into_iter()
+        .filter(|entry| entry_mentions_cx(entry, cx_id))
+        .collect())
+}
+
 pub fn get_answer_trace(
     cf_reader: &impl LedgerCfStore,
     quarantine: &dyn QuarantineLookup,
     answer_id: &[u8],
 ) -> Result<AnswerTrace> {
     let entries = decode_entries(cf_reader, quarantine)?;
+    answer_trace_from_entries(&entries, quarantine, answer_id)
+}
+
+/// Derives an answer trace from entries already decoded for chain
+/// verification, avoiding a second ledger scan and decode pass.
+pub fn get_answer_trace_from_snapshot(
+    snapshot: &DecodedLedgerSnapshot,
+    quarantine: &dyn QuarantineLookup,
+    answer_id: &[u8],
+) -> Result<AnswerTrace> {
+    let entries = decode_entries_from_snapshot(snapshot, quarantine)?;
+    answer_trace_from_entries(&entries, quarantine, answer_id)
+}
+
+pub fn answer_trace_from_entries(
+    entries: &[LedgerEntry],
+    quarantine: &dyn QuarantineLookup,
+    answer_id: &[u8],
+) -> Result<AnswerTrace> {
     let mut answers = entries
         .iter()
         .filter(|&entry| {
@@ -151,14 +202,14 @@ pub fn get_answer_trace(
     path.sort_by_key(|hop| hop.hop);
 
     let kernel_entry = linked_entry(
-        &entries,
+        entries,
         payload,
         EntryKind::Kernel,
         &["kernel_id"],
         "kernel_ref",
     );
     let guard_entry = linked_entry(
-        &entries,
+        entries,
         payload,
         EntryKind::Guard,
         &["guard_id"],
@@ -244,6 +295,31 @@ fn decode_entries(
     for row in cf_reader.scan()? {
         ensure_seq_not_quarantined(quarantine, row.seq)?;
         entries.push(decode_physical_row(&row)?);
+    }
+    Ok(entries)
+}
+
+fn decode_entries_from_snapshot(
+    snapshot: &DecodedLedgerSnapshot,
+    quarantine: &dyn QuarantineLookup,
+) -> Result<Vec<LedgerEntry>> {
+    let mut entries = Vec::with_capacity(snapshot.len());
+    for (seq, decoded) in snapshot.rows() {
+        ensure_seq_not_quarantined(quarantine, *seq)?;
+        let entry = decoded.clone()?;
+        if entry.seq != *seq {
+            return Err(CalyxError::ledger_chain_broken(format!(
+                "ledger row key {seq} does not match encoded seq {}",
+                entry.seq
+            )));
+        }
+        if !entry.verify() {
+            return Err(CalyxError::ledger_corrupt(format!(
+                "ledger entry seq {} hash mismatch",
+                entry.seq
+            )));
+        }
+        entries.push(entry);
     }
     Ok(entries)
 }
@@ -359,115 +435,6 @@ fn trace_hop(seq: u64, value: &Value) -> Result<AnswerTraceHop> {
         lens_id,
         ledger_seq,
     })
-}
-
-fn parse_cx_field(value: &Value, field: &str) -> Option<Result<CxId>> {
-    value.get(field).and_then(Value::as_str).map(|raw| {
-        CxId::from_str(raw).map_err(|error| CalyxError::ledger_corrupt(error.to_string()))
-    })
-}
-
-fn parse_lens_field(value: &Value, field: &str) -> Option<Result<LensId>> {
-    value.get(field).and_then(Value::as_str).map(|raw| {
-        LensId::from_str(raw).map_err(|error| CalyxError::ledger_corrupt(error.to_string()))
-    })
-}
-
-fn expected_hops_match(payload: &Value, path_len: usize) -> bool {
-    payload
-        .get("expected_hops")
-        .or_else(|| payload.get("hop_count"))
-        .or_else(|| payload.get("path_len"))
-        .and_then(Value::as_u64)
-        .is_none_or(|expected| expected as usize == path_len)
-}
-
-fn linked_entry(
-    entries: &[LedgerEntry],
-    payload: &Value,
-    kind: EntryKind,
-    id_fields: &[&str],
-    ref_field: &str,
-) -> Option<LedgerEntry> {
-    if let Some(entry) = linked_entry_by_ref(entries, payload, kind, ref_field) {
-        return Some(entry.clone());
-    }
-    let ids = id_fields
-        .iter()
-        .filter_map(|field| payload.get(*field).and_then(Value::as_str))
-        .flat_map(identifier_variants)
-        .collect::<Vec<_>>();
-    entries
-        .iter()
-        .find(|entry| entry.kind == kind && subject_bytes_match(&entry.subject, &ids))
-        .cloned()
-}
-
-fn linked_entry_by_ref<'a>(
-    entries: &'a [LedgerEntry],
-    payload: &Value,
-    kind: EntryKind,
-    ref_field: &str,
-) -> Option<&'a LedgerEntry> {
-    let reference = payload.get(ref_field)?;
-    let seq = reference.get("seq").and_then(Value::as_u64)?;
-    entries.iter().find(|entry| {
-        entry.kind == kind
-            && entry.seq == seq
-            && reference
-                .get("hash")
-                .and_then(Value::as_str)
-                .is_none_or(|hash| hash.eq_ignore_ascii_case(&hex(&entry.entry_hash)))
-    })
-}
-
-fn linked_payload_present(payload: &Value, id_fields: &[&str], ref_field: &str) -> bool {
-    payload.get(ref_field).is_some()
-        || id_fields
-            .iter()
-            .any(|field| payload.get(*field).and_then(Value::as_str).is_some())
-}
-
-fn subject_bytes_match(subject: &SubjectId, candidates: &[Vec<u8>]) -> bool {
-    let bytes: &[u8] = match subject {
-        SubjectId::Kernel(bytes) | SubjectId::Guard(bytes) | SubjectId::Query(bytes) => bytes,
-        SubjectId::Cx(id) => id.as_bytes(),
-        SubjectId::Lens(id) => id.as_bytes(),
-    };
-    candidates.iter().any(|candidate| candidate == bytes)
-}
-
-fn identifier_variants(raw: &str) -> Vec<Vec<u8>> {
-    let mut out = vec![raw.as_bytes().to_vec()];
-    if let Ok(id) = CxId::from_str(raw) {
-        out.push(id.as_bytes().to_vec());
-    }
-    if raw.len().is_multiple_of(2)
-        && raw.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && let Some(bytes) = decode_hex(raw)
-    {
-        out.push(bytes);
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|chunk| Some((hex_value(chunk[0])? << 4) | hex_value(chunk[1])?))
-        .collect()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {

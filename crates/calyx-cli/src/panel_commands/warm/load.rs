@@ -10,6 +10,7 @@ pub(super) struct WarmLensTask {
     pub(super) template_idx: usize,
     pub(super) position: usize,
     pub(super) total: usize,
+    pub(super) template_id: String,
     pub(super) lens: template_store::TemplateLensRef,
 }
 
@@ -27,14 +28,15 @@ pub(super) fn register_and_prime_warm_lenses_parallel(
     load_limit: &WarmLoadLimit,
     load_parallelism: usize,
 ) -> CliResult<usize> {
-    let tasks = warm_lens_tasks(template);
+    let tasks = warm_lens_tasks(template)?;
     let prepared =
         prepare_warm_lenses_parallel(tasks, selector, load_limit, load_parallelism, progress_log)?;
     register_prepared_warm_lenses(registry, template, prepared, selector, progress_log)
 }
 
-fn warm_lens_tasks(template: &template_store::SavedPanelTemplate) -> Vec<WarmLensTask> {
+fn warm_lens_tasks(template: &template_store::SavedPanelTemplate) -> CliResult<Vec<WarmLensTask>> {
     let total = template.lenses.len();
+    let template_id = template_store::id_for_loaded(template)?;
     let mut tasks = template
         .lenses
         .iter()
@@ -44,6 +46,7 @@ fn warm_lens_tasks(template: &template_store::SavedPanelTemplate) -> Vec<WarmLen
             template_idx,
             position: template_idx + 1,
             total,
+            template_id: template_id.clone(),
             lens,
         })
         .collect::<Vec<_>>();
@@ -52,7 +55,7 @@ fn warm_lens_tasks(template: &template_store::SavedPanelTemplate) -> Vec<WarmLen
             .cmp(&warm_prepare_weight(&left.lens))
             .then_with(|| left.lens.slot_key.cmp(&right.lens.slot_key))
     });
-    tasks
+    Ok(tasks)
 }
 
 fn warm_prepare_weight(lens: &template_store::TemplateLensRef) -> (u8, u64) {
@@ -149,23 +152,39 @@ fn prepare_warm_lens(
     )?;
     let started = Instant::now();
     let result = (|| {
-        let spec = lens_spec_from_manifest_path(Path::new(&task.lens.manifest))?;
-        let spec_lens_id = spec.lens_id();
-        if spec_lens_id != task.lens.lens_id {
-            return Err(template_store::template_error(
-                template_store::TEMPLATE_INVALID,
-                format!(
-                    "manifest {} no longer resolves to {}",
-                    task.lens.manifest, task.lens.lens_id
-                ),
-                "rebuild the template from the current frozen lens manifest",
-            ));
-        }
+        let spec = task.lens.verified_materialization_spec(&task.template_id)?;
         let mut start = task_progress_record(selector, "runtime_prepare_start", &task);
         start.runtime = Some(runtime_name(&spec.runtime).to_string());
         start.runtime_detail = Some(runtime_detail(&spec.runtime));
         append_shared_progress(progress_log, &start)?;
-        prepare_manifest_runtime(spec).map_err(CliError::from)
+        let prepared = prepare_manifest_runtime(spec).map_err(|error| {
+            task.lens
+                .materialization_error(&task.template_id, "warm_runtime_prepare", error)
+        })?;
+        let expected_contract = task.lens.expected_runtime_contract().ok_or_else(|| {
+            template_store::template_error(
+                template_store::TEMPLATE_INVALID,
+                format!(
+                    "template {} lens {} is missing its frozen runtime contract",
+                    task.template_id, task.lens.lens_name
+                ),
+                "explicitly refresh the template from verified commissioned artifacts",
+            )
+        })?;
+        if &prepared.contract != expected_contract {
+            return Err(template_store::template_error(
+                template_store::TEMPLATE_INVALID,
+                format!(
+                    "template {} lens {} warm runtime contract conflict: prepared={} expected={}",
+                    task.template_id,
+                    task.lens.lens_name,
+                    prepared.contract.lens_id(),
+                    expected_contract.lens_id()
+                ),
+                "recommission the lens and explicitly save a new template version; never reinterpret the existing object",
+            ));
+        }
+        Ok(prepared)
     })();
     match result {
         Ok(prepared) => {
@@ -287,6 +306,27 @@ fn prime_prepared_warm_lens(
 }
 
 fn register_prepared_warm_lenses(
+    registry: &mut Registry,
+    template: &mut template_store::SavedPanelTemplate,
+    prepared: Vec<WarmPreparedLens>,
+    selector: &str,
+    progress_log: &SharedProgressLog,
+) -> CliResult<usize> {
+    let mut staged_registry = registry.clone();
+    let mut staged_template = template.clone();
+    let added = register_prepared_warm_lenses_staged(
+        &mut staged_registry,
+        &mut staged_template,
+        prepared,
+        selector,
+        progress_log,
+    )?;
+    *registry = staged_registry;
+    *template = staged_template;
+    Ok(added)
+}
+
+fn register_prepared_warm_lenses_staged(
     registry: &mut Registry,
     template: &mut template_store::SavedPanelTemplate,
     prepared: Vec<WarmPreparedLens>,

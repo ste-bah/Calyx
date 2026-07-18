@@ -209,8 +209,32 @@ fn execute_grouped_gemm_with_blas(
         let (b_base, _b_guard) = plan.b_slab.device_ptr(&stream);
         let (c_base, _c_guard) = plan.c_slab.device_ptr_mut(&stream);
         let launch = LaunchData::new(&plan.active, a_base, b_base, c_base)?;
+        // cuBLAS grouped GEMM consumes Aarray/Barray/Carray from device
+        // memory.  The per-group shape/scalar arrays remain host-resident.
+        // Passing Rust Vec backing storage here makes cuBLAS interpret a host
+        // address as a device pointer array and poisons the CUDA context with
+        // an illegal memory access at synchronization.
+        let a_ptrs = stream.clone_htod(launch.a_ptrs()).map_err(|err| {
+            device_unavailable(ctx, format!("copy grouped A pointer array failed: {err}"))
+        })?;
+        let b_ptrs = stream.clone_htod(launch.b_ptrs()).map_err(|err| {
+            device_unavailable(ctx, format!("copy grouped B pointer array failed: {err}"))
+        })?;
+        let c_ptrs = stream.clone_htod(launch.c_ptrs()).map_err(|err| {
+            device_unavailable(ctx, format!("copy grouped C pointer array failed: {err}"))
+        })?;
+        let (a_array, _a_array_guard) = a_ptrs.device_ptr(&stream);
+        let (b_array, _b_array_guard) = b_ptrs.device_ptr(&stream);
+        let (c_array, _c_array_guard) = c_ptrs.device_ptr(&stream);
         let group_count = to_i32(launch.group_count(), "group_count")?;
-        let grouped = launch_grouped(*blas.handle(), &launch, group_count);
+        let grouped = launch_grouped(
+            *blas.handle(),
+            &launch,
+            a_array as *const *const f32,
+            b_array as *const *const f32,
+            c_array as *const *mut f32,
+            group_count,
+        );
         if let Err(err) = grouped {
             if err.0 != sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED {
                 return Err(cublas_error(format!(

@@ -195,6 +195,7 @@ pub fn seed_summary_graph(vault: &AsterVault<StepClock>, clock: &StepClock, node
         COLLECTION,
         &AsterAssocMetadata {
             retention_horizon: Some(SUMMARY_HORIZON),
+            ..Default::default()
         },
     )
     .unwrap();

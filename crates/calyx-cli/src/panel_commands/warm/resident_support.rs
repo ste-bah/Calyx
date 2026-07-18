@@ -1,3 +1,4 @@
+use super::resident_vram::vault_resident_vram_preflight;
 use super::*;
 use crate::path_identity::vault_template_source;
 
@@ -27,7 +28,7 @@ pub(in crate::panel_commands) struct ResidentWarmState {
     pub(in crate::panel_commands) ready_out: Option<PathBuf>,
     pub(in crate::panel_commands) max_resident_vram_mib: u64,
     pub(in crate::panel_commands) declared_template_vram_mib: u64,
-    pub(in crate::panel_commands) resident_overhead_multiplier: f32,
+    pub(in crate::panel_commands) resident_overhead_multiplier_milli: u64,
     pub(in crate::panel_commands) estimated_resident_vram_mib: u64,
     pub(in crate::panel_commands) max_load_secs: u64,
     pub(in crate::panel_commands) load_parallelism: usize,
@@ -36,6 +37,7 @@ pub(in crate::panel_commands) struct ResidentWarmState {
     pub(in crate::panel_commands) warmed_lens_count: usize,
     pub(in crate::panel_commands) content_lens_count: usize,
     pub(in crate::panel_commands) gpu_content_lens_count: usize,
+    pub(in crate::panel_commands) cpu_excluded_slots: Vec<String>,
 }
 
 pub(in crate::panel_commands) fn load_resident_warm_state(
@@ -104,7 +106,7 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
         ready_out: options.ready_out,
         max_resident_vram_mib: options.max_resident_vram_mib,
         declared_template_vram_mib: preflight.declared_template_vram_mib,
-        resident_overhead_multiplier: multiplier_to_f32(options.resident_overhead_multiplier_milli),
+        resident_overhead_multiplier_milli: options.resident_overhead_multiplier_milli,
         estimated_resident_vram_mib: preflight.estimated_resident_vram_mib,
         max_load_secs: options.max_load_secs,
         load_parallelism,
@@ -113,6 +115,7 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
         warmed_lens_count: probes.len(),
         content_lens_count,
         gpu_content_lens_count,
+        cpu_excluded_slots: Vec::new(),
     })
 }
 
@@ -149,7 +152,16 @@ fn load_vault_resident_warm_state(
         record.lens_count = Some(slot_scope.len());
         log.append(&record)?;
     }
-    require_gpu_content_slots(&selector, &panel.slots)?;
+    let cpu_excluded_slots =
+        exclude_cpu_content_slots(&selector, &mut panel, progress_log.as_ref())?;
+    let preflight = vault_resident_vram_preflight(
+        &selector,
+        &panel,
+        &state.registry,
+        options.max_resident_vram_mib,
+        options.resident_overhead_multiplier_milli,
+        progress_log.as_ref(),
+    )?;
     let build = SavedTemplatePanelBuild {
         template_id: format!("vault:{}", vault.display()),
         template_name: vault
@@ -187,9 +199,9 @@ fn load_vault_resident_warm_state(
         template_selector: selector,
         ready_out: options.ready_out,
         max_resident_vram_mib: options.max_resident_vram_mib,
-        declared_template_vram_mib: 0,
-        resident_overhead_multiplier: multiplier_to_f32(options.resident_overhead_multiplier_milli),
-        estimated_resident_vram_mib: 0,
+        declared_template_vram_mib: preflight.declared_template_vram_mib,
+        resident_overhead_multiplier_milli: options.resident_overhead_multiplier_milli,
+        estimated_resident_vram_mib: preflight.estimated_resident_vram_mib,
         max_load_secs: options.max_load_secs,
         load_parallelism: 1,
         load_ms,
@@ -197,6 +209,7 @@ fn load_vault_resident_warm_state(
         warmed_lens_count: probes.len(),
         content_lens_count,
         gpu_content_lens_count,
+        cpu_excluded_slots,
     })
 }
 
@@ -308,15 +321,25 @@ fn resident_slot_scope_error(selector: &str, detail: String) -> CliError {
     })
 }
 
-fn require_gpu_content_slots(selector: &str, slots: &[Slot]) -> CliResult {
-    let cpu_lenses = slots
+/// Exclude active CPU/non-GPU content slots from the resident's warm roster
+/// (#1490). The resident is GPU-only by design (#1066); search and ingest
+/// measure CPU-placed slots locally in-process, so serving a vault must not
+/// deadlock on them. The exclusion is LOUD — structured stderr line, progress
+/// record, and the ready payload lists every excluded slot — and a panel with
+/// no GPU content slot at all is still refused (a CPU-only panel needs no
+/// resident).
+fn exclude_cpu_content_slots(
+    selector: &str,
+    panel: &mut Panel,
+    progress_log: Option<&WarmProgressLog>,
+) -> CliResult<Vec<String>> {
+    let is_active_content = |slot: &Slot| {
+        slot.state == SlotState::Active && !slot.retrieval_only && !slot.excluded_from_dedup
+    };
+    let excluded = panel
+        .slots
         .iter()
-        .filter(|slot| {
-            slot.state == SlotState::Active
-                && !slot.retrieval_only
-                && !slot.excluded_from_dedup
-                && slot.resource.placement != Placement::Gpu
-        })
+        .filter(|slot| is_active_content(slot) && slot.resource.placement != Placement::Gpu)
         .map(|slot| {
             format!(
                 "slot={} key={} lens={} placement={:?}",
@@ -327,18 +350,43 @@ fn require_gpu_content_slots(selector: &str, slots: &[Slot]) -> CliResult {
             )
         })
         .collect::<Vec<_>>();
-    if cpu_lenses.is_empty() {
-        return Ok(());
+    if excluded.is_empty() {
+        return Ok(excluded);
     }
-    Err(CliError::from(CalyxError {
-        code: RESIDENT_CPU_LENS_REFUSED,
-        message: format!(
-            "resident vault {selector} refuses {} CPU/non-GPU content lenses: {}",
-            cpu_lenses.len(),
-            cpu_lenses.join(", ")
-        ),
-        remediation: "pass --modality to select a GPU-only modality or replace every content lens with a GPU resident runtime",
-    }))
+    let gpu_remaining = panel
+        .slots
+        .iter()
+        .filter(|slot| is_active_content(slot) && slot.resource.placement == Placement::Gpu)
+        .count();
+    if gpu_remaining == 0 {
+        return Err(CliError::from(CalyxError {
+            code: RESIDENT_CPU_LENS_REFUSED,
+            message: format!(
+                "resident vault {selector} has no GPU content lenses to serve; all {} content lenses are CPU/non-GPU placed: {}",
+                excluded.len(),
+                excluded.join(", ")
+            ),
+            remediation: "a CPU-only panel needs no resident: run search without --resident-addr, or replace the content lenses with GPU resident runtimes",
+        }));
+    }
+    panel
+        .slots
+        .retain(|slot| !(is_active_content(slot) && slot.resource.placement != Placement::Gpu));
+    eprintln!(
+        "CALYX_PANEL_RESIDENT_RUNTIME phase=resident_cpu_lens_excluded selector={selector} gpu_content_lenses={gpu_remaining} cpu_excluded={} slots=[{}]",
+        excluded.len(),
+        excluded.join(", ")
+    );
+    if let Some(log) = progress_log {
+        let mut record = run_progress_record(selector, "resident_cpu_lens_excluded");
+        record.lens_count = Some(excluded.len());
+        record.remediation = Some(
+            "CPU-placed content lenses are excluded from the GPU resident and measured in-process at ingest/search time (#1490)"
+                .to_string(),
+        );
+        log.append(&record)?;
+    }
+    Ok(excluded)
 }
 
 fn require_gpu_content_lenses(

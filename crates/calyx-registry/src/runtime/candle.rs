@@ -14,6 +14,47 @@ use crate::spec::{LensRuntime, LensSpec};
 
 pub const DEFAULT_CANDLE_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
+/// Device policy used whenever a candle lens is rehydrated from a persisted
+/// `LensSpec` (panel warm path). The static contract derivation in
+/// `persistence_contracts::static_contract` MUST use this same policy so that
+/// session-free audits reconstruct the exact contract the warm path builds.
+pub(crate) const LENS_SPEC_DEVICE_POLICY: CandleDevicePolicy =
+    CandleDevicePolicy::CudaFailLoud { ordinal: 0 };
+
+/// Single source of truth for the finite-replay precision recorded in the
+/// frozen contract: CUDA half-precision models replay non-finite rows at F32.
+pub(crate) fn contract_finite_replay_precision(
+    device_policy: CandleDevicePolicy,
+    precision: CandlePrecision,
+) -> Option<CandlePrecision> {
+    needs_f32_finite_replay(device_policy, precision).then_some(CandlePrecision::F32)
+}
+
+/// Single source of truth for the candle frozen-contract corpus hash, used by
+/// both the runtime constructor (`CandleLens::from_files`) and the static
+/// derivation (`derive_runtime_contract_from_spec`).
+pub(crate) fn contract_corpus_hash(
+    model_id: &str,
+    max_tokens: usize,
+    precision: CandlePrecision,
+    pooling: CandlePoolingPolicy,
+    norm_policy: NormPolicy,
+    finite_replay: Option<CandlePrecision>,
+) -> [u8; 32] {
+    let max_tokens_text = max_tokens.to_string();
+    let norm_text = format!("{norm_policy:?}");
+    let finite_replay_text = finite_replay.map(CandlePrecision::as_str).unwrap_or("none");
+    sha256_digest(&[
+        b"candle-local-bert-v2",
+        model_id.as_bytes(),
+        max_tokens_text.as_bytes(),
+        precision.as_str().as_bytes(),
+        pooling.as_str().as_bytes(),
+        norm_text.as_bytes(),
+        finite_replay_text.as_bytes(),
+    ])
+}
+
 mod load;
 mod options;
 mod pooling;
@@ -168,20 +209,18 @@ impl CandleLens {
         }
         let tokenizer = read_tokenizer(&spec.tokenizer, spec.max_tokens)?;
         let model = read_model(&spec.weights, &config, spec.device_policy, spec.precision)?;
-        let (finite_replay_model, finite_replay_precision) =
-            if needs_f32_finite_replay(spec.device_policy, spec.precision) {
-                (
-                    Some(Mutex::new(read_model(
-                        &spec.weights,
-                        &config,
-                        spec.device_policy,
-                        CandlePrecision::F32,
-                    )?)),
-                    Some(CandlePrecision::F32),
-                )
-            } else {
-                (None, None)
-            };
+        let finite_replay_precision =
+            contract_finite_replay_precision(spec.device_policy, spec.precision);
+        let finite_replay_model = finite_replay_precision
+            .map(|replay_precision| {
+                Ok::<_, CalyxError>(Mutex::new(read_model(
+                    &spec.weights,
+                    &config,
+                    spec.device_policy,
+                    replay_precision,
+                )?))
+            })
+            .transpose()?;
         let files = CandleModelFiles {
             cache_dir: spec.cache_dir,
             model_id: spec.model_id,
@@ -190,20 +229,14 @@ impl CandleLens {
             weights: spec.weights,
             contract_paths,
         };
-        let max_tokens_text = spec.max_tokens.to_string();
-        let norm_text = format!("{:?}", spec.norm_policy);
-        let finite_replay_text = finite_replay_precision
-            .map(CandlePrecision::as_str)
-            .unwrap_or("none");
-        let corpus_hash = sha256_digest(&[
-            b"candle-local-bert-v2",
-            files.model_id.as_bytes(),
-            max_tokens_text.as_bytes(),
-            spec.precision.as_str().as_bytes(),
-            spec.pooling.as_str().as_bytes(),
-            norm_text.as_bytes(),
-            finite_replay_text.as_bytes(),
-        ]);
+        let corpus_hash = contract_corpus_hash(
+            &files.model_id,
+            spec.max_tokens,
+            spec.precision,
+            spec.pooling,
+            spec.norm_policy,
+            finite_replay_precision,
+        );
         let contract = FrozenLensContract::new(
             spec.name,
             weights_sha256,
@@ -262,7 +295,7 @@ impl CandleLens {
             tokenizer: tokenizer.clone(),
             weights: weights.clone(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            device_policy: CandleDevicePolicy::CudaFailLoud { ordinal: 0 },
+            device_policy: LENS_SPEC_DEVICE_POLICY,
             precision: CandlePrecision::parse(dtype)?,
             pooling: CandlePoolingPolicy::parse(pooling)?,
             norm_policy: spec.norm_policy,

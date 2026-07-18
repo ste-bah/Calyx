@@ -3,7 +3,7 @@ use std::io::{Cursor, Write};
 use calyx_core::Placement;
 
 use super::codec::{decode_binary, encode_binary, read_frame, write_frame};
-use super::server::resolve_home_with;
+use super::server::{resolve_home_with, serve_loop_with};
 use super::*;
 
 fn resident_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -22,6 +22,136 @@ fn provided_home_does_not_evaluate_env_fallback() {
     .unwrap();
 
     assert_eq!(resolved, home);
+}
+
+#[test]
+fn readiness_multiplier_is_canonical_across_file_and_client_readback() {
+    fn response(bind: std::net::SocketAddr) -> ReadyResponse {
+        ReadyResponse {
+            schema: READY_SCHEMA.to_string(),
+            ready: true,
+            residency_scope: "resident_service_process",
+            process_id: 42,
+            bind,
+            uptime_ms: 7,
+            source_of_truth: "vault MANIFEST panel_ref registry_ref:test".to_string(),
+            home: PathBuf::from("/calyx"),
+            template_selector: "vault:test".to_string(),
+            template_source: "vault:test".to_string(),
+            ready_out: Some(PathBuf::from("/calyx/ready.json")),
+            max_resident_vram_mib: 10_509,
+            declared_template_vram_mib: 5_005,
+            resident_overhead_multiplier_milli: 2_100,
+            estimated_resident_vram_mib: 10_509,
+            max_load_secs: 120,
+            load_parallelism: 1,
+            load_ms: 6_517,
+            probe_ms: 302,
+            max_runtime_batch: 4,
+            capacity_probe_input_count: 256,
+            capacity_probe_ms: 16_551,
+            capacity_probe_modalities: vec![Modality::Text],
+            onnx_configured_shape_limit: Some(64),
+            onnx_required_shape_count: Some(30),
+            onnx_sequence_bucket_count: Some(10),
+            onnx_batch_bucket_count: Some(3),
+            slot_count: 10,
+            slot_scope: (0..10).collect(),
+            content_lens_count: 10,
+            registry_lens_count: 10,
+            warmed_lens_count: 10,
+            gpu_content_lens_count: 10,
+            cpu_content_lens_count: 0,
+            cpu_excluded_slots: Vec::new(),
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let file_value: serde_json::Value =
+        serde_json::from_slice(&serde_json::to_vec_pretty(&response(addr)).unwrap()).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert_eq!(request, "{\"op\":\"ready\"}\n");
+        serde_json::to_writer(&mut stream, &serde_json::json!(response(addr))).unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+
+    let client_value = client::ready_value_at(addr).unwrap();
+    server.join().unwrap();
+    assert_eq!(file_value, client_value);
+    assert_eq!(client_value["resident_overhead_multiplier_milli"], 2_100);
+    assert!(client_value.get("resident_overhead_multiplier").is_none());
+}
+
+#[test]
+fn disconnecting_client_does_not_terminate_resident_accept_loop() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let (disconnect_tx, disconnect_rx) = std::sync::mpsc::channel();
+    let (request_read_tx, request_read_rx) = std::sync::mpsc::channel();
+    let (client_dropped_tx, client_dropped_rx) = std::sync::mpsc::channel();
+    let server_running = Arc::clone(&running);
+    let server = std::thread::spawn(move || {
+        let mut connection_index = 0_usize;
+        serve_loop_with(listener, server_running, move |mut stream, running| {
+            let mut request = String::new();
+            BufReader::new(stream.try_clone()?)
+                .read_line(&mut request)
+                .map_err(|error| CliError::io(format!("read test resident request: {error}")))?;
+            assert_eq!(request, "{\"op\":\"ready\"}\n");
+            if connection_index == 0 {
+                connection_index += 1;
+                request_read_tx.send(()).unwrap();
+                client_dropped_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                // The peer has shut down both directions. Exceeding the real
+                // socket send buffer makes the OS surface that disconnect at
+                // this exact response-write boundary instead of accepting a
+                // small buffered write after the FIN/RST race.
+                let response = vec![b'x'; 8 * 1024 * 1024];
+                let write = stream.write_all(&response);
+                disconnect_tx.send(write.is_err()).unwrap();
+                write.map_err(|error| {
+                    CliError::io(format!("write disconnected resident client: {error}"))
+                })?;
+                return Ok(());
+            }
+
+            serde_json::to_writer(&mut stream, &json!({"schema": READY_SCHEMA, "ready": true}))
+                .map_err(|error| CliError::runtime(format!("write readiness JSON: {error}")))?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+            running.store(false, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+
+    let socket = socket2::Socket::from(TcpStream::connect(addr).unwrap());
+    socket.set_linger(Some(Duration::ZERO)).unwrap();
+    let mut disconnected: TcpStream = socket.into();
+    disconnected.write_all(b"{\"op\":\"ready\"}\n").unwrap();
+    request_read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    drop(disconnected);
+    client_dropped_tx.send(()).unwrap();
+    assert!(
+        disconnect_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "the real socket must report the disconnected response write"
+    );
+
+    let ready = client::ready_value_at(addr).unwrap();
+    assert_eq!(ready["schema"], READY_SCHEMA);
+    assert_eq!(ready["ready"], true);
+    server.join().unwrap().unwrap();
+    assert!(!running.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -232,6 +362,106 @@ fn resident_measure_window_env_fails_closed_on_invalid_values() {
             None => std::env::remove_var(stream::MEASURE_WINDOW_ENV),
         }
     }
+}
+
+#[test]
+fn resident_runtime_batch_admission_is_bounded_by_probed_maximum() {
+    assert_eq!(stream::admit_runtime_batch_limit(4, None).unwrap(), 4);
+    assert_eq!(stream::admit_runtime_batch_limit(4, Some(1)).unwrap(), 1);
+    assert_eq!(stream::admit_runtime_batch_limit(4, Some(4)).unwrap(), 4);
+
+    for requested in [0, 5, usize::MAX] {
+        let error = stream::admit_runtime_batch_limit(4, Some(requested)).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "CALYX_PANEL_RESIDENT_RUNTIME_BATCH_LIMIT_EXCEEDED"
+        );
+        assert!(
+            error
+                .message()
+                .contains(&format!("runtime_batch_limit={requested}"))
+        );
+        assert!(error.message().contains("capacity-probed maximum 4"));
+    }
+}
+
+#[test]
+fn resident_empty_input_is_rejected_before_measurement() {
+    let error = stream::validate_measure_inputs(Modality::Text, &[b"valid".to_vec(), Vec::new()])
+        .unwrap_err();
+
+    assert_eq!(error.code(), "CALYX_PANEL_RESIDENT_EMPTY_INPUT");
+    assert!(error.message().contains("input 1"));
+    assert!(error.message().contains("Text"));
+}
+
+#[test]
+fn resident_remote_error_envelope_is_preserved_verbatim() {
+    let error = client::remote_stream_error(
+        "CALYX_PANEL_RESIDENT_EMPTY_INPUT",
+        "resident measure input 1 is empty",
+        stream::EMPTY_INPUT_REMEDIATION,
+    );
+
+    assert_eq!(error.code(), "CALYX_PANEL_RESIDENT_EMPTY_INPUT");
+    assert_eq!(error.message(), "resident measure input 1 is empty");
+    assert_eq!(error.remediation(), stream::EMPTY_INPUT_REMEDIATION);
+}
+
+#[test]
+fn resident_remote_error_rejects_undeclared_or_tampered_envelopes() {
+    for (code, remediation) in [
+        ("CALYX_FUTURE_UNDECLARED", "do something"),
+        (
+            "CALYX_PANEL_RESIDENT_EMPTY_INPUT",
+            "silently accept the empty row",
+        ),
+    ] {
+        let error = client::remote_stream_error(code, "synthetic failure", remediation);
+        assert_eq!(error.code(), "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH");
+        assert!(error.message().contains(code));
+        assert!(error.message().contains(remediation));
+    }
+}
+
+#[test]
+fn resident_json_error_response_becomes_a_failing_cli_error() {
+    let addr = "127.0.0.1:8787".parse().unwrap();
+    let response = format!(
+        r#"{{"ok":false,"code":"CALYX_PANEL_RESIDENT_EMPTY_INPUT","message":"resident measure input 0 for modality Text is empty","remediation":{}}}"#,
+        serde_json::to_string(stream::EMPTY_INPUT_REMEDIATION).unwrap()
+    );
+
+    let error = client::decode_json_response(addr, &response).unwrap_err();
+    assert_eq!(error.code(), "CALYX_PANEL_RESIDENT_EMPTY_INPUT");
+    assert_eq!(
+        error.message(),
+        "resident measure input 0 for modality Text is empty"
+    );
+    assert_eq!(error.remediation(), stream::EMPTY_INPUT_REMEDIATION);
+}
+
+#[test]
+fn resident_json_response_schema_is_validated_before_success() {
+    let addr = "127.0.0.1:8787".parse().unwrap();
+    let malformed = client::decode_json_response(
+        addr,
+        r#"{"ok":false,"code":"CALYX_PANEL_RESIDENT_EMPTY_INPUT","message":"empty"}"#,
+    )
+    .unwrap_err();
+    assert_eq!(malformed.code(), "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH");
+    assert!(malformed.message().contains("remediation"));
+
+    let non_boolean =
+        client::decode_json_response(addr, r#"{"ok":"false","ready":false}"#).unwrap_err();
+    assert_eq!(non_boolean.code(), "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH");
+
+    let ready = client::decode_json_response(
+        addr,
+        r#"{"schema":"calyx-panel-resident-readiness-v2","ready":true}"#,
+    )
+    .unwrap();
+    assert_eq!(ready["ready"], true);
 }
 
 /// #1153/#1154 — the parallel fan-out and the never-sequential invariant.

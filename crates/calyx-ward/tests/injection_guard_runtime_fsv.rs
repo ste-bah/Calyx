@@ -14,7 +14,7 @@
 //!
 //! manual GPU fixture (real model + real corpus, no mocks):
 //!   CALYX_INJECTION_GUARD_FSV_DIR=/var/lib/calyx/data/fsv-issue697-... \
-//!   cargo test -p calyx-ward --test injection_guard_runtime_fsv -- --ignored --nocapture
+//!   cargo test -p calyx-ward --test __calyx_integration_suite_1 injection_guard_runtime_fsv -- --ignored --nocapture
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -457,7 +457,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn fsv_root(root: &Path) -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "readme-assets-contract", || {
         root.join("target")
             .join("fsv")
             .join("readme-assets-contract")

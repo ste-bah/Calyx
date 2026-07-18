@@ -4,16 +4,26 @@
 //! `TC(Phi) = sum_k H(slot_k) - H(Phi)`. It complements the cheap pairwise
 //! differentiation gate; it does not replace that first-pass admission filter.
 
+mod cuda;
+mod provisional;
+
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
 use calyx_core::{CalyxError, Clock, Result, Ts};
 
+use crate::cuda_strict::strict_cuda_requested;
 use crate::estimate::TrustTag;
 use crate::ksg::{MIN_ASSAY_SAMPLES, ksg_mi_continuous_point};
 use crate::samples::validate_rectangular_finite;
 use crate::subsample::{m_out_of_n_size, sample_paired_values_without_replacement};
+
+use self::cuda::{
+    interaction_information_with_config_cuda_strict_impl,
+    total_correlation_with_config_cuda_strict_impl,
+};
+use self::provisional::{provisional_ii, provisional_tc};
 
 pub type SlotVectors = [Vec<f32>];
 
@@ -87,6 +97,9 @@ pub fn total_correlation_with_config(
     clock: &dyn Clock,
     config: &TotalCorrelationConfig,
 ) -> Result<TCResult> {
+    if strict_cuda_requested() {
+        return total_correlation_with_config_cuda_strict(slots, clock, config);
+    }
     validate_config(config)?;
     let n_samples = validate_panel(slots)?;
     let slot_count = slots.len();
@@ -113,6 +126,14 @@ pub fn total_correlation_with_config(
         trust: TrustTag::Provisional,
         computed_at: clock.now(),
     })
+}
+
+pub fn total_correlation_with_config_cuda_strict(
+    slots: &SlotVectors,
+    clock: &dyn Clock,
+    config: &TotalCorrelationConfig,
+) -> Result<TCResult> {
+    total_correlation_with_config_cuda_strict_impl(slots, clock, config)
 }
 
 pub fn n_eff_from_tc(slot_count: usize, tc: f32, sum_marginal_entropy: f32) -> f32 {
@@ -153,6 +174,11 @@ pub fn interaction_information_with_config(
     clock: &dyn Clock,
     config: &TotalCorrelationConfig,
 ) -> Result<IIResult> {
+    if strict_cuda_requested() {
+        return interaction_information_with_config_cuda_strict(
+            slot_a, slot_b, slot_c, clock, config,
+        );
+    }
     validate_config(config)?;
     let n_samples = validate_triple(slot_a, slot_b, slot_c)?;
     if n_samples < MIN_QUORUM_TC_PER_SLOT * 3 || n_samples < MIN_ASSAY_SAMPLES {
@@ -178,6 +204,16 @@ pub fn interaction_information_with_config(
         trust: TrustTag::Provisional,
         computed_at: clock.now(),
     })
+}
+
+pub fn interaction_information_with_config_cuda_strict(
+    slot_a: &[f32],
+    slot_b: &[f32],
+    slot_c: &[f32],
+    clock: &dyn Clock,
+    config: &TotalCorrelationConfig,
+) -> Result<IIResult> {
+    interaction_information_with_config_cuda_strict_impl(slot_a, slot_b, slot_c, clock, config)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -379,35 +415,6 @@ fn seed_for_inputs(config: &TotalCorrelationConfig, domain: &[u8], inputs: &[&[f
     }
     let hash = hasher.finalize();
     u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("8 hash bytes"))
-}
-
-fn provisional_tc(slot_count: usize, n_samples: usize, clock: &dyn Clock) -> TCResult {
-    TCResult {
-        tc: 0.0,
-        n_eff: slot_count as f32,
-        ci_95: (0.0, 0.0),
-        n_samples,
-        slot_count,
-        sum_marginal_entropy: 0.0,
-        joint_entropy: 0.0,
-        provisional: true,
-        error_code: Some(CALYX_TC_INSUFFICIENT_SAMPLES.to_string()),
-        trust: TrustTag::Provisional,
-        computed_at: clock.now(),
-    }
-}
-
-fn provisional_ii(n_samples: usize, clock: &dyn Clock) -> IIResult {
-    IIResult {
-        ii: 0.0,
-        sign: IISign::Unclear,
-        ci_95: (0.0, 0.0),
-        n_samples,
-        provisional: true,
-        error_code: Some(CALYX_TC_INSUFFICIENT_SAMPLES.to_string()),
-        trust: TrustTag::Provisional,
-        computed_at: clock.now(),
-    }
 }
 
 fn one_dim(slot: &[f32]) -> Vec<Vec<f32>> {

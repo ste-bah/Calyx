@@ -23,6 +23,8 @@ use crate::tools::test_support::ENV_LOCK;
 
 mod support;
 use support::*;
+#[path = "tests/generation_tests.rs"]
+mod generation_tests;
 #[test]
 fn minimal_search_returns_provenanced_hits() {
     let _env = TestEnv::new("minimal");
@@ -43,12 +45,13 @@ fn minimal_search_returns_provenanced_hits() {
 }
 
 #[test]
-fn repeated_search_reuses_snapshot_index_cache() {
+fn repeated_search_reuses_bounded_persisted_slot_cache() {
     let _env = TestEnv::new("cache-reuse");
-    super::engine::reset_index_cache_for_tests();
+    super::engine::reset_slot_cache_for_tests();
     let server = server();
     vault_with_algorithmic_data(&server, "v");
 
+    let mut results = Vec::new();
     for id in 20..=21 {
         let result = call_ok(
             &server,
@@ -57,18 +60,46 @@ fn repeated_search_reuses_snapshot_index_cache() {
             json!({"vault": "v", "query": "alpha"}),
         );
         assert!(!result["hits"].as_array().unwrap().is_empty());
+        assert_eq!(result["execution"]["executor"], "calyx-search/persisted");
+        assert_eq!(result["execution"]["request_index_builds"], 0);
+        assert_eq!(result["execution"]["slot_cache_enabled"], true);
+        assert_eq!(result["execution"]["cache_after"]["max_entries"], 128);
+        results.push(result);
     }
 
-    let (builds, hits) = super::engine::index_cache_stats_for_tests();
-    assert_eq!(builds, 1);
-    assert!(hits >= 1, "cache hits={hits}");
-    let prepared = super::engine::index_cache_prepared_counts_for_tests();
-    assert!(
-        prepared.iter().any(|(_, count)| *count > 0),
-        "prepared counts={prepared:?}"
+    assert_eq!(
+        results[0]["execution"]["generation"],
+        results[1]["execution"]["generation"]
     );
+    assert!(
+        results[0]["execution"]["persisted_slot_searches"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        results[1]["execution"]["persisted_slot_cache_hits"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let misses_before = results[0]["execution"]["cache_before"]["miss_count"]
+        .as_u64()
+        .unwrap();
+    let misses_after = results[0]["execution"]["cache_after"]["miss_count"]
+        .as_u64()
+        .unwrap();
+    let hits_before = results[1]["execution"]["cache_before"]["hit_count"]
+        .as_u64()
+        .unwrap();
+    let hits_after = results[1]["execution"]["cache_after"]["hit_count"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(misses_after, misses_before + 1);
+    assert_eq!(hits_after, hits_before + 1);
     println!(
-        "mcp_search_index_cache_turboquant PASSED builds={builds} hits={hits} prepared={prepared:?}"
+        "mcp_persisted_search_cache PASSED generation={} misses={} hits={}",
+        results[1]["execution"]["generation"]["manifest_sha256"], misses_after, hits_after
     );
 }
 
@@ -100,10 +131,7 @@ fn search_fails_closed_when_ledger_chain_is_tampered() {
     );
 
     assert_eq!(error.code, -32000);
-    assert_eq!(
-        error.data.unwrap()["calyx_code"],
-        "CALYX_LEDGER_CHAIN_BROKEN"
-    );
+    assert_eq!(error.data.unwrap()["calyx_code"], "CALYX_LEDGER_CORRUPT");
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::time::Duration;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::collection::CollectionMode;
 use calyx_aster::index::btree::btree_range_at;
-use calyx_aster::layers::blob::{BLOB_CHUNK_SIZE, BlobId};
+use calyx_aster::layers::blob::BLOB_CHUNK_SIZE;
 use calyx_aster::layers::relational::{decode_record_value, record_key};
 use calyx_aster::layers::{BlobLayer, KvLayer, RelationalLayer, TimeSeriesLayer};
 use calyx_core::{Ts, VaultStore};
@@ -392,26 +392,19 @@ impl Engine {
             CollectionMode::Blob,
             params.collection,
         )?;
-        let content_hash = blake3::hash(&data);
-        let mut id = [0_u8; 16];
-        id.copy_from_slice(&content_hash.as_bytes()[..16]);
-        let blob_id = BlobId::from_bytes(id);
         let layer = BlobLayer::new(&handle.vault);
-        let seq = layer.blob_put(&col, blob_id, &data)?;
-        let manifest = layer
-            .blob_manifest(&col, blob_id)?
-            .expect("manifest just written");
+        let result = layer.blob_put_content_addressed(&col, &data)?;
         handle.flush_after_write(&flush_policy)?;
         Ok(json!({
             "status": "put",
             "vault_ref": handle.vault_ref.as_str(),
             "collection_name": col.name,
-            "blob_id": hex(blob_id.as_bytes()),
-            "content_hash": hex(content_hash.as_bytes()),
-            "total_bytes": manifest.total_bytes,
-            "chunk_count": manifest.chunk_count,
+            "blob_id": hex(result.blob_id.as_bytes()),
+            "content_hash": hex(&result.manifest.content_hash),
+            "total_bytes": result.manifest.total_bytes,
+            "chunk_count": result.manifest.chunk_count,
             "chunk_size": BLOB_CHUNK_SIZE,
-            "seq": seq,
+            "seq": result.seq,
             "latest_seq": handle.vault.latest_seq()
         }))
     }
@@ -422,11 +415,13 @@ impl Engine {
         let col = require_collection(handle, &params.collection_name, CollectionMode::Blob)?;
         let blob_id = blob_id_from_hex(&params.blob_id)?;
         let layer = BlobLayer::new(&handle.vault);
-        let manifest = layer.blob_manifest(&col, blob_id)?;
-        let data = if params.include_data && manifest.is_some() {
-            layer.blob_get(&col, blob_id)?
+        let (manifest, data) = if params.include_data {
+            match layer.blob_read(&col, blob_id)? {
+                Some(result) => (Some(result.manifest), Some(result.data)),
+                None => (None, None),
+            }
         } else {
-            None
+            (layer.blob_manifest(&col, blob_id)?, None)
         };
         Ok(json!({
             "status": if manifest.is_some() { "found" } else { "absent" },

@@ -8,6 +8,7 @@ use calyx_registry::{
 };
 use serde::Serialize;
 
+use crate::cmd::vault::{home_dir, resolve_vault};
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
 
@@ -59,11 +60,11 @@ struct RegistryRepairChangeReport {
 }
 
 struct RegistryAuditFlags {
-    vault: PathBuf,
+    vault: String,
 }
 
 struct RegistryRepairFlags {
-    vault: PathBuf,
+    vault: String,
     target: RegistryRepairTarget,
 }
 
@@ -74,7 +75,8 @@ enum RegistryRepairTarget {
 
 pub(super) fn registry_audit(args: &[String]) -> CliResult {
     let flags = RegistryAuditFlags::parse(args)?;
-    let audit = audit_vault_registry_contracts(&flags.vault)?;
+    let vault = resolve_registry_vault(&flags.vault)?;
+    let audit = audit_vault_registry_contracts(&vault)?;
     let valid = audit.valid;
     let checked_count = audit.checked_count;
     let diff_count = audit.diffs.len();
@@ -86,7 +88,7 @@ pub(super) fn registry_audit(args: &[String]) -> CliResult {
         },
         mode: "audit",
         source_of_truth: "vault MANIFEST registry_ref plus manifest-backed registry asset read from disk",
-        vault: flags.vault,
+        vault,
         checked_count,
         valid,
         diff_count,
@@ -107,17 +109,18 @@ pub(super) fn registry_audit(args: &[String]) -> CliResult {
 
 pub(super) fn registry_repair(args: &[String]) -> CliResult {
     let flags = RegistryRepairFlags::parse(args)?;
-    let before_audit = audit_vault_registry_contracts(&flags.vault)?;
+    let vault = resolve_registry_vault(&flags.vault)?;
+    let before_audit = audit_vault_registry_contracts(&vault)?;
     let write = match flags.target {
-        RegistryRepairTarget::Slot(slot) => RegistryRepairReportInput::Slot(
-            repair_vault_registry_slot_from_spec(&flags.vault, slot)?,
-        ),
-        RegistryRepairTarget::All => RegistryRepairReportInput::All(
-            repair_vault_registry_contracts_from_specs(&flags.vault)?,
-        ),
+        RegistryRepairTarget::Slot(slot) => {
+            RegistryRepairReportInput::Slot(repair_vault_registry_slot_from_spec(&vault, slot)?)
+        }
+        RegistryRepairTarget::All => {
+            RegistryRepairReportInput::All(repair_vault_registry_contracts_from_specs(&vault)?)
+        }
     };
-    let after_audit = audit_vault_registry_contracts(&flags.vault)?;
-    let changes = verify_registry_repair_write(&flags.vault, write.changes())?;
+    let after_audit = audit_vault_registry_contracts(&vault)?;
+    let changes = verify_registry_repair_write(&vault, write.changes())?;
     let valid = after_audit.valid;
     print_json(&RegistryRepairReport {
         status: if write.wrote_manifest() {
@@ -127,7 +130,7 @@ pub(super) fn registry_repair(args: &[String]) -> CliResult {
         },
         mode: write.mode(),
         source_of_truth: "vault MANIFEST panel_ref and registry_ref plus manifest-backed JSON assets reloaded from disk",
-        vault: flags.vault,
+        vault,
         manifest_seq: write.manifest_seq(),
         durable_seq: write.durable_seq(),
         panel_ref: write.panel_ref().logical_path.clone(),
@@ -148,6 +151,17 @@ pub(super) fn registry_repair(args: &[String]) -> CliResult {
             remediation: "inspect the remaining per-lens diffs and repair each affected slot before search or probe",
         }))
     }
+}
+
+fn resolve_registry_vault(reference: &str) -> CliResult<PathBuf> {
+    let home = home_dir()?;
+    let resolved = resolve_vault(&home, reference)?;
+    resolved.canonicalize().map_err(|error| {
+        CliError::io(format!(
+            "canonicalize panel registry vault {}: {error}",
+            resolved.display()
+        ))
+    })
 }
 
 enum RegistryRepairReportInput {
@@ -299,7 +313,7 @@ impl RegistryAuditFlags {
             match args[idx].as_str() {
                 "--vault" => {
                     idx += 1;
-                    vault = Some(super::value(args, idx, "--vault")?.into());
+                    vault = Some(super::value(args, idx, "--vault")?.to_string());
                 }
                 other => {
                     return Err(CliError::usage(format!(
@@ -324,7 +338,7 @@ impl RegistryRepairFlags {
             match args[idx].as_str() {
                 "--vault" => {
                     idx += 1;
-                    vault = Some(super::value(args, idx, "--vault")?.into());
+                    vault = Some(super::value(args, idx, "--vault")?.to_string());
                 }
                 "--slot" => {
                     idx += 1;

@@ -12,10 +12,13 @@ use serde_json::json;
 
 #[test]
 fn issue171_snapshot_identity_fsv() {
-    let report_path = repo_root()
-        .join("target")
-        .join("fsv")
-        .join("issue171_snapshot_identity")
+    let report_path =
+        calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue171-snapshot-identity", || {
+            repo_root()
+                .join("target")
+                .join("fsv")
+                .join("issue171_snapshot_identity")
+        })
         .join("readback-report.json");
     let vault_path = report_path.parent().unwrap().join("vault-source-of-truth");
     let before = file_state(&report_path);

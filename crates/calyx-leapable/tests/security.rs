@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 
 use storage_support::{TestRoot, assert_no_json_on_stderr, json_lines, request, run_engine};
 
-mod storage_support;
+// calyx-shared-module: path=storage_support/mod.rs alias=__calyx_shared_storage_support_mod_rs local=storage_support visibility=private
+
+use crate::__calyx_shared_storage_support_mod_rs as storage_support;
 
 const MARKER: &str = "CALYX_LEAPABLE_AT_REST_MARKER_1352";
 

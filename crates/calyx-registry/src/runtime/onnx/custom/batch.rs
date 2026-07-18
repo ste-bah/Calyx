@@ -142,7 +142,7 @@ fn build_batches_from_groups(
 /// capped at `max_batch`. Ragged batch sizes otherwise multiply the distinct
 /// (batch, seq) shapes the ORT CUDA BFC arena retains allocations for, which
 /// grows device memory monotonically on long streams.
-fn padded_batch_len(len: usize, max_batch: usize) -> Result<usize> {
+pub(in crate::runtime::onnx) fn padded_batch_len(len: usize, max_batch: usize) -> Result<usize> {
     if len == 0 || len > max_batch {
         return Err(CalyxError::lens_dim_mismatch(format!(
             "custom ONNX batch bucket: chunk of {len} rows violates max_batch {max_batch}"
@@ -154,7 +154,7 @@ fn padded_batch_len(len: usize, max_batch: usize) -> Result<usize> {
         .min(max_batch))
 }
 
-fn stable_seq_len(len: usize, max_tokens: usize) -> Result<usize> {
+pub(in crate::runtime::onnx) fn stable_seq_len(len: usize, max_tokens: usize) -> Result<usize> {
     let max_tokens = max_tokens.max(1);
     let len = len.clamp(1, max_tokens);
     let bucket = len.next_power_of_two().min(max_tokens);
@@ -164,6 +164,18 @@ fn stable_seq_len(len: usize, max_tokens: usize) -> Result<usize> {
         ));
     }
     Ok(bucket)
+}
+
+/// Count every value the stable power-of-two bucket function can emit for
+/// inputs in `1..=maximum`. Non-power-of-two maxima are their own final bucket
+/// because both sequence and batch bucketing cap the next power of two at the
+/// configured maximum.
+pub(in crate::runtime::onnx) fn stable_bucket_count(maximum: usize) -> Result<usize> {
+    if maximum == 0 {
+        return Err(config_invalid("stable ONNX bucket maximum must be > 0"));
+    }
+    let power_buckets = usize::BITS as usize - maximum.leading_zeros() as usize;
+    Ok(power_buckets + usize::from(!maximum.is_power_of_two()))
 }
 
 fn build_batch(encoded: &[EncodedInput], padded_batch: usize) -> Result<TokenBatch> {
@@ -279,6 +291,15 @@ mod tests {
         assert_eq!(stable_seq_len(9, 512).unwrap(), 16);
         assert_eq!(stable_seq_len(257, 512).unwrap(), 512);
         assert_eq!(stable_seq_len(700, 512).unwrap(), 512);
+    }
+
+    #[test]
+    fn stable_bucket_count_includes_non_power_of_two_cap() {
+        assert_eq!(stable_bucket_count(1).unwrap(), 1);
+        assert_eq!(stable_bucket_count(4).unwrap(), 3);
+        assert_eq!(stable_bucket_count(5).unwrap(), 4);
+        assert_eq!(stable_bucket_count(512).unwrap(), 10);
+        assert!(stable_bucket_count(0).is_err());
     }
 
     #[test]

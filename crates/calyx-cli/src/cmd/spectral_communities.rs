@@ -13,14 +13,20 @@ use sha2::{Digest, Sha256};
 
 use super::vault::{home_dir, resolve_vault_info};
 use super::{Subcommand, value};
+use crate::durable_write::write_bytes_atomic_new;
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
+
+const DEFAULT_CLI_COMMUNITIES: usize = 15;
+const DEFAULT_CLI_EIGEN_K: usize = 16;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SpectralCommunitiesArgs {
     pub vault: String,
     pub eigen_k: usize,
     pub eigen_max_iter: usize,
+    pub community_count: usize,
+    pub cluster_max_iter: usize,
     pub centrality_max_iter: usize,
     pub centrality_tol: f32,
     pub max_bridge_candidates: usize,
@@ -33,8 +39,10 @@ impl Default for SpectralCommunitiesArgs {
         let params = SpectralCommunityParams::default();
         Self {
             vault: String::new(),
-            eigen_k: params.eigen_k,
+            eigen_k: DEFAULT_CLI_EIGEN_K,
             eigen_max_iter: params.eigen_max_iter,
+            community_count: DEFAULT_CLI_COMMUNITIES,
+            cluster_max_iter: params.cluster_max_iter,
             centrality_max_iter: params.centrality_max_iter,
             centrality_tol: params.centrality_tol,
             max_bridge_candidates: params.max_bridge_candidates,
@@ -64,6 +72,7 @@ pub(crate) fn run_spectral_communities_with_home(
     home: &Path,
     args: SpectralCommunitiesArgs,
 ) -> CliResult {
+    preflight_explicit_report(args.out.as_deref())?;
     let started = Instant::now();
     let resolved = resolve_vault_info(home, &args.vault)?;
     eprintln!(
@@ -75,11 +84,13 @@ pub(crate) fn run_spectral_communities_with_home(
     let store = PhysicalAsterAssocSnapshot::latest(&resolved.path, DEFAULT_ASTER_ASSOC_COLLECTION)?;
     let graph = store.full_graph()?;
     eprintln!(
-        "spectral-communities: computing report nodes={} edges={} eigen_k={} eigen_max_iter={} rayon_threads={}",
+        "spectral-communities: computing report nodes={} edges={} communities={} eigen_k={} eigen_max_iter={} cluster_max_iter={} rayon_threads={}",
         graph.node_count(),
         graph.edge_count(),
+        args.community_count,
         args.eigen_k,
         args.eigen_max_iter,
+        args.cluster_max_iter,
         rayon::current_num_threads()
     );
     let report = spectral_community_report(
@@ -87,6 +98,8 @@ pub(crate) fn run_spectral_communities_with_home(
         &SpectralCommunityParams {
             eigen_k: args.eigen_k,
             eigen_max_iter: args.eigen_max_iter,
+            community_count: args.community_count,
+            cluster_max_iter: args.cluster_max_iter,
             centrality_max_iter: args.centrality_max_iter,
             centrality_tol: args.centrality_tol,
             max_bridge_candidates: args.max_bridge_candidates,
@@ -109,6 +122,8 @@ pub(crate) fn run_spectral_communities_with_home(
         "params": {
             "eigen_k": args.eigen_k,
             "eigen_max_iter": args.eigen_max_iter,
+            "community_count": args.community_count,
+            "cluster_max_iter": args.cluster_max_iter,
             "centrality_max_iter": args.centrality_max_iter,
             "centrality_tol": args.centrality_tol,
             "max_bridge_candidates": args.max_bridge_candidates,
@@ -126,6 +141,21 @@ pub(crate) fn run_spectral_communities_with_home(
             }
         }
     }))
+}
+
+fn preflight_explicit_report(path: Option<&Path>) -> CliResult {
+    let Some(path) = path else { return Ok(()) };
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(CliError::usage(format!(
+            "spectral report destination {} already exists; evidence is immutable",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CliError::io(format!(
+            "inspect spectral report destination {} before graph computation failed: {error}",
+            path.display()
+        ))),
+    }
 }
 
 pub(crate) fn parse_spectral_communities(rest: &[String]) -> CliResult<Subcommand> {
@@ -148,6 +178,19 @@ pub(crate) fn parse_spectral_communities(rest: &[String]) -> CliResult<Subcomman
                 idx += 1;
                 args.eigen_max_iter =
                     parse_usize(value(rest, idx, "--eigen-max-iter")?, "--eigen-max-iter", 1)?;
+            }
+            "--communities" => {
+                idx += 1;
+                args.community_count =
+                    parse_usize(value(rest, idx, "--communities")?, "--communities", 2)?;
+            }
+            "--cluster-max-iter" => {
+                idx += 1;
+                args.cluster_max_iter = parse_usize(
+                    value(rest, idx, "--cluster-max-iter")?,
+                    "--cluster-max-iter",
+                    1,
+                )?;
             }
             "--centrality-max-iter" => {
                 idx += 1;
@@ -190,13 +233,25 @@ pub(crate) fn parse_spectral_communities(rest: &[String]) -> CliResult<Subcomman
         }
         idx += 1;
     }
+    if args.community_count > usize::from(u8::MAX) + 1 {
+        return Err(CliError::usage("--communities must be at most 256"));
+    }
+    if args.eigen_k < args.community_count {
+        return Err(CliError::usage(
+            "--eigen-k must be greater than or equal to --communities",
+        ));
+    }
     Ok(Subcommand::SpectralCommunities(args))
 }
 
 fn ensure_useful_report(report: &SpectralCommunityReport) -> CliResult {
-    if report.communities.len() < 2 {
+    if report.communities.len() != report.requested_communities {
         return Err(LodestarError::KernelInvalidParams {
-            detail: "spectral report produced fewer than two communities".to_string(),
+            detail: format!(
+                "spectral report produced {} communities but {} were requested",
+                report.communities.len(),
+                report.requested_communities
+            ),
         }
         .into());
     }
@@ -230,26 +285,52 @@ fn persist_report(
             .join(report_id)
             .join("report.json")
     });
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if path.exists() {
-        let existing = fs::read(&path)?;
-        if existing != bytes {
+    match fs::symlink_metadata(&path) {
+        Ok(_) if explicit.is_some() => {
             return Err(CliError::usage(format!(
-                "refusing to overwrite existing different spectral community report {}",
+                "spectral report destination {} appeared during graph computation; refusing to replace immutable evidence",
                 path.display()
             )));
         }
-    } else {
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, &bytes)?;
-        fs::rename(&tmp, &path)?;
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(CliError::usage(format!(
+                    "content-addressed spectral report is not a plain file: {}",
+                    path.display()
+                )));
+            }
+            let existing = fs::read(&path).map_err(|error| {
+                CliError::io(format!(
+                    "read existing content-addressed spectral report {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if existing != bytes {
+                return Err(CliError::runtime(format!(
+                    "content-addressed spectral report digest collision at {}",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_bytes_atomic_new(&path, &bytes, "spectral community report")?;
+        }
+        Err(error) => {
+            return Err(CliError::io(format!(
+                "inspect spectral report destination {} failed: {error}",
+                path.display()
+            )));
+        }
     }
-    let readback = fs::read(&path)?;
-    if readback != bytes {
-        return Err(CliError::usage(format!(
-            "spectral community report readback mismatch at {}",
+    let readback = fs::read(&path).map_err(|error| {
+        CliError::io(format!(
+            "read back spectral community report {}: {error}",
+            path.display()
+        ))
+    })?;
+    if readback != bytes || sha256_hex(&readback) != sha256_hex(&bytes) {
+        return Err(CliError::runtime(format!(
+            "spectral community report physical readback mismatch at {}",
             path.display()
         )));
     }

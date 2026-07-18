@@ -39,7 +39,11 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) fn new(count: u8) -> Self {
-        let panel = panel(count);
+        Self::new_with_dim(count, 2)
+    }
+
+    pub(super) fn new_with_dim(count: u8, dim: usize) -> Self {
+        let panel = panel(count, dim);
         let cx = constellation(&panel, absent_slots(&panel));
         Self {
             panel,
@@ -149,6 +153,28 @@ impl MapRegion {
         }
         Self { members }
     }
+
+    pub(super) fn deterministic(panel: &Panel, member_count: usize, dim: usize) -> Self {
+        let members = panel
+            .slots
+            .iter()
+            .map(|slot| {
+                let salt = usize::from(slot.slot_id.0);
+                let rows = (0..member_count)
+                    .map(|row| {
+                        (0..dim)
+                            .map(|feature| {
+                                let phase = ((row * 17 + feature * 13 + salt * 29) % 1009) as f32;
+                                (phase * 0.006_227).sin() + 0.01
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                (slot.lens_id, rows)
+            })
+            .collect();
+        Self { members }
+    }
 }
 
 impl CompletionRegion for MapRegion {
@@ -220,10 +246,10 @@ impl AnnealConfig for FixedAnneal {
     }
 }
 
-fn panel(count: u8) -> Panel {
+fn panel(count: u8, dim: usize) -> Panel {
     Panel {
         version: 1,
-        slots: (1..=count).map(slot).collect(),
+        slots: (1..=count).map(|index| slot(index, dim)).collect(),
         created_at: 1,
         kernel_ref: None,
         guard_ref: None,
@@ -245,12 +271,12 @@ fn absent_slots(panel: &Panel) -> BTreeMap<SlotId, SlotVector> {
         .collect()
 }
 
-fn slot(index: u8) -> Slot {
+fn slot(index: u8, dim: usize) -> Slot {
     Slot {
         slot_id: SlotId::new(index as u16),
         slot_key: SlotId::new(index as u16).with_key(format!("slot-{index}")),
         lens_id: lens(index),
-        shape: SlotShape::Dense(2),
+        shape: SlotShape::Dense(u32::try_from(dim).expect("test dimension fits u32")),
         modality: Modality::Text,
         asymmetry: Asymmetry::None,
         quant: QuantPolicy::None,

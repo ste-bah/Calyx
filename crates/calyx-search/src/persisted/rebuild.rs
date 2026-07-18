@@ -1,7 +1,7 @@
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::encode::{decode_constellation_base, decode_slot_vector};
-use calyx_core::{CalyxError, CxId, SlotId};
+use calyx_core::{CalyxError, CxId, SlotId, SlotState};
 use rayon::prelude::*;
 
 use super::*;
@@ -46,6 +46,7 @@ impl<'a> RebuildProgress<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn slot_detail(phase: &'static str, slot: SlotId, detail: String) -> Self {
         Self {
             detail: Some(detail),
@@ -69,6 +70,14 @@ pub fn rebuild_for_vault(vault_dir: &Path, vault: &AsterVault) -> CliResult {
     rebuild_for_vault_with_progress(vault_dir, vault, |_| {})
 }
 
+pub fn rebuild_for_vault_with_panel_state(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    state: &calyx_registry::VaultPanelState,
+) -> CliResult {
+    rebuild_for_vault_with_panel_state_progress(vault_dir, vault, state, |_| {})
+}
+
 pub fn rebuild_for_vault_with_progress<F>(
     vault_dir: &Path,
     vault: &AsterVault,
@@ -78,6 +87,21 @@ where
     F: FnMut(RebuildProgress<'_>) + Send,
 {
     rebuild_for_vault_with_fallible_progress(vault_dir, vault, |event| {
+        progress(event);
+        Ok(())
+    })
+}
+
+pub fn rebuild_for_vault_with_panel_state_progress<F>(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    state: &calyx_registry::VaultPanelState,
+    mut progress: F,
+) -> CliResult
+where
+    F: FnMut(RebuildProgress<'_>) + Send,
+{
+    rebuild_for_vault_with_panel_state_fallible_progress(vault_dir, vault, state, |event| {
         progress(event);
         Ok(())
     })
@@ -94,6 +118,34 @@ where
     super::rebuild_stream::rebuild_for_vault_with_progress(vault_dir, vault, progress)
 }
 
+pub fn rebuild_for_vault_with_panel_state_fallible_progress<F>(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    state: &calyx_registry::VaultPanelState,
+    progress: F,
+) -> CliResult
+where
+    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+{
+    let active_slots = active_panel_slots(state);
+    super::rebuild_stream::rebuild_for_vault_with_active_slots_progress(
+        vault_dir,
+        vault,
+        &active_slots,
+        progress,
+    )
+}
+
+fn active_panel_slots(state: &calyx_registry::VaultPanelState) -> BTreeSet<SlotId> {
+    state
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotState::Active)
+        .map(|slot| slot.slot_id)
+        .collect()
+}
+
 #[cfg(test)]
 pub(super) fn rebuild_from_docs(
     vault_dir: &Path,
@@ -103,12 +155,21 @@ pub(super) fn rebuild_from_docs(
     let root = vault_dir.join(INDEX_ROOT);
     fs::create_dir_all(&root)?;
     let previous_manifest = previous_manifest(vault_dir)?;
+    let build_policy = super::rebuild_plan::cpu_reference_policy_for_tests();
     let mut entries = Vec::new();
     let mut total_rows = 0usize;
     for slot in dense::slots(docs) {
         let rows = dense::collect_slot(docs, slot)?;
         total_rows += rows.len();
-        entries.push(dense::write(vault_dir, &root, slot, rows, base_seq)?);
+        entries.push(dense::write_with_progress(
+            vault_dir,
+            &root,
+            slot,
+            rows,
+            base_seq,
+            build_policy,
+            |_| Ok(()),
+        )?);
     }
     for (slot, rows) in sparse::collect(docs)? {
         total_rows += rows.len();
@@ -130,9 +191,14 @@ pub(super) fn rebuild_from_docs(
         )?);
     }
     entries.sort_by_key(|entry| entry.slot);
+    let (backend, backend_source, cuvs_compiled) =
+        super::rebuild_plan::manifest_backend(build_policy);
     let manifest = SearchIndexManifest {
         format: MANIFEST_FORMAT.to_string(),
         base_seq,
+        diskann_build_backend: Some(backend),
+        diskann_build_backend_source: Some(backend_source),
+        sextant_cuvs_compiled: Some(cuvs_compiled),
         filter: Some(filter::write(vault_dir, &root, docs, base_seq)?),
         slots: entries,
     };

@@ -9,8 +9,8 @@ use serde_json::json;
 mod issue096_static;
 #[path = "issue096/support.rs"]
 mod issue096_support;
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use issue096_support::{
     edge_forbidden_trading_instruction_refuses_without_admitted_row,

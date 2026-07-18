@@ -13,7 +13,8 @@ use calyx_loom::{CrossTermKind, LoomStore, MaterializationAction};
 use serde_json::json;
 
 #[allow(dead_code)]
-mod stage5_helpers;
+// calyx-shared-module: path=stage5_helpers/mod.rs alias=__calyx_shared_stage5_helpers_mod_rs local=stage5_helpers visibility=private
+use crate::__calyx_shared_stage5_helpers_mod_rs as stage5_helpers;
 use stage5_helpers::{assay_vault, complementary_pair_samples, slot};
 
 type SampleSlots = Vec<(CxId, BTreeMap<SlotId, Vec<f32>>)>;

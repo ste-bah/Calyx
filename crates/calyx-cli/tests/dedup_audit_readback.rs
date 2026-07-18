@@ -14,8 +14,8 @@ use calyx_core::{CxId, Modality, SlotId, SlotVector, VaultId};
 use calyx_ledger::decode as decode_ledger;
 use serde_json::{Value, json};
 
-#[path = "support/dedup_fsv_io.rs"]
-mod dedup_fsv_io;
+// calyx-shared-module: path=support/dedup_fsv_io.rs alias=__calyx_shared_support_dedup_fsv_io_rs local=dedup_fsv_io visibility=private
+use crate::__calyx_shared_support_dedup_fsv_io_rs as dedup_fsv_io;
 
 use dedup_fsv_io::{fsv_root, list_dir_files as list_files, reset_dir, write_blake3_sums};
 

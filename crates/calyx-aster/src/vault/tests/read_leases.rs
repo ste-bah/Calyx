@@ -150,3 +150,133 @@ fn seq_paged_scan_pins_versions_until_every_page_completes() {
     assert_eq!(after_scan_gc.safe_point_seq, 2);
     assert_eq!(after_scan_gc.versions_reclaimed, 3);
 }
+
+#[test]
+fn renewing_latest_scan_renews_expired_windows_between_real_pages() {
+    let clock = MutableClock::new(10_000);
+    let vault = AsterVault::with_clock(vault_id(), b"renewing-pages".to_vec(), clock.clone());
+    let snapshot = vault
+        .write_cf_batch([
+            (ColumnFamily::Anchors, b"a".to_vec(), b"anchor-a".to_vec()),
+            (ColumnFamily::Anchors, b"b".to_vec(), b"anchor-b".to_vec()),
+            (ColumnFamily::Anchors, b"c".to_vec(), b"anchor-c".to_vec()),
+        ])
+        .unwrap();
+    let mut pages = Vec::new();
+
+    vault
+        .scan_cf_pages_at_renewing_latest(
+            snapshot,
+            ColumnFamily::Anchors,
+            1,
+            |page| -> calyx_core::Result<()> {
+                pages.push(page);
+                clock.set(clock.now().saturating_add(DEFAULT_LEASE_MS + 1));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    let rows = pages.into_iter().flatten().collect::<Vec<_>>();
+    println!(
+        "ASTER_RENEWING_LATEST_SCAN_FSV {}",
+        serde_json::json!({
+            "source_of_truth": "physical Anchors CF rows read across independently renewed bounded leases",
+            "snapshot": snapshot,
+            "rows": rows,
+            "clock_after": clock.now(),
+        })
+    );
+    assert_eq!(
+        rows,
+        vec![
+            (b"a".to_vec(), b"anchor-a".to_vec()),
+            (b"b".to_vec(), b"anchor-b".to_vec()),
+            (b"c".to_vec(), b"anchor-c".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn renewing_latest_scan_fails_closed_when_callback_advances_sequence() {
+    let clock = MutableClock::new(20_000);
+    let vault = AsterVault::with_clock(vault_id(), b"renewing-drift".to_vec(), clock);
+    let snapshot = vault
+        .write_cf_batch([
+            (ColumnFamily::Anchors, b"a".to_vec(), b"anchor-a".to_vec()),
+            (ColumnFamily::Anchors, b"b".to_vec(), b"anchor-b".to_vec()),
+        ])
+        .unwrap();
+    let mut pages = 0_usize;
+
+    let error = vault
+        .scan_cf_pages_at_renewing_latest(
+            snapshot,
+            ColumnFamily::Anchors,
+            1,
+            |_| -> calyx_core::Result<()> {
+                pages += 1;
+                vault.write_cf(ColumnFamily::Anchors, b"c".to_vec(), b"anchor-c".to_vec())?;
+                Ok(())
+            },
+        )
+        .expect_err("sequence drift must stop a renewing latest scan");
+    let physical_after = vault
+        .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+        .unwrap();
+
+    println!(
+        "ASTER_RENEWING_LATEST_DRIFT_FSV {}",
+        serde_json::json!({
+            "source_of_truth": "latest Aster sequence and physical Anchors CF after callback write",
+            "snapshot_before": snapshot,
+            "snapshot_after": vault.snapshot(),
+            "pages_emitted": pages,
+            "error_code": error.code,
+            "physical_rows_after": physical_after,
+        })
+    );
+    assert_eq!(error.code, "CALYX_STALE_DERIVED");
+    assert_eq!(pages, 1);
+    assert_eq!(vault.snapshot(), snapshot + 1);
+    assert_eq!(physical_after.len(), 3);
+}
+
+#[test]
+fn renewing_latest_scan_zero_limit_is_exact_noop() {
+    let clock = MutableClock::new(30_000);
+    let vault = AsterVault::with_clock(vault_id(), b"renewing-zero".to_vec(), clock);
+    let snapshot = vault
+        .write_cf(ColumnFamily::Anchors, b"a".to_vec(), b"anchor-a".to_vec())
+        .unwrap();
+    let mut callbacks = 0_usize;
+
+    vault
+        .scan_cf_pages_at_renewing_latest(
+            snapshot,
+            ColumnFamily::Anchors,
+            0,
+            |_| -> calyx_core::Result<()> {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let physical_after = vault
+        .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+        .unwrap();
+
+    println!(
+        "ASTER_RENEWING_LATEST_ZERO_FSV {}",
+        serde_json::json!({
+            "source_of_truth": "latest Aster sequence and physical Anchors CF after zero-limit scan",
+            "snapshot_before": snapshot,
+            "snapshot_after": vault.snapshot(),
+            "callbacks": callbacks,
+            "physical_rows_after": physical_after,
+        })
+    );
+    assert_eq!(callbacks, 0);
+    assert_eq!(vault.snapshot(), snapshot);
+    assert_eq!(physical_after, vec![(b"a".to_vec(), b"anchor-a".to_vec())]);
+}

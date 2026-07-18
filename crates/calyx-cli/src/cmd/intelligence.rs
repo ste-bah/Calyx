@@ -1,5 +1,6 @@
 mod abundance;
 mod bits;
+mod bits_categorical;
 mod core;
 mod guard;
 mod kernel;

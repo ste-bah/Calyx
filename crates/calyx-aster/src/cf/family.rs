@@ -207,29 +207,33 @@ impl ColumnFamily {
         })
     }
 
-    /// Returns true when writes to this CF change inputs from which derived
-    /// search content (persistent search indexes, in-memory search engines)
-    /// is built, and must therefore advance the vault's derived-content
-    /// watermark (issue #1100).
+    /// Returns true when writes to this CF change an input consumed by the
+    /// persistent search-index builder and must therefore advance the
+    /// vault's derived-content watermark (issues #1100 and #1808).
     ///
     /// The match is exhaustive on purpose: adding a CF forces an explicit
-    /// decision here. Fail-closed doctrine: a CF is exempt only when it
-    /// provably never feeds derived search content. `Ledger` rows are
-    /// hash-chained provenance appends (idempotent-replay markers, audit
-    /// records); `TimeIndex` rows are the per-commit `millis -> seqno`
-    /// sentinels stamped into every group commit. Neither is read by any
-    /// search-index rebuild or search-time hydration path.
-    pub const fn feeds_derived_search_content(&self) -> bool {
+    /// decision here. The builder reads Base metadata and quantized Slot
+    /// vectors only (`calyx-search::persisted::rebuild_scan`). All other CFs
+    /// are independent databases or live query-time inputs and do not require
+    /// regenerating the persistent vector/filter artifacts. Raw Slot
+    /// sidecars are cold-tier rescore/re-quantization inputs, not index rows.
+    pub const fn feeds_persistent_search_index(&self) -> bool {
         match self {
-            Self::Ledger | Self::TimeIndex => false,
             Self::Base
-            | Self::Collections
+            | Self::Slot {
+                kind: SlotFamilyKind::Quantized,
+                ..
+            } => true,
+            Self::Collections
             | Self::Relational
             | Self::Document
             | Self::Kv
             | Self::TimeSeries
             | Self::Blob
-            | Self::Slot { .. }
+            | Self::Slot {
+                kind: SlotFamilyKind::Raw,
+                ..
+            }
             | Self::XTerm
             | Self::TemporalXTerm
             | Self::Scalars
@@ -254,7 +258,9 @@ impl ColumnFamily {
             | Self::AnnealGrowth
             | Self::AnnealOperators
             | Self::IndexBtree
-            | Self::IndexInverted => true,
+            | Self::IndexInverted
+            | Self::Ledger
+            | Self::TimeIndex => false,
         }
     }
 

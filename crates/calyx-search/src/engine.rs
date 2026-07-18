@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use calyx_aster::ledger_view::AsterLedgerCfStore;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{SlotId, SlotVector};
 
@@ -23,12 +24,14 @@ mod budget;
 mod guard;
 mod hydration;
 mod hydration_cache;
+mod rerank;
 mod search;
 mod support;
 mod types;
 pub use budget::SearchBudget;
 #[cfg(test)]
 use guard::prefilter_in_region_candidates;
+pub use rerank::{RERANK_CANDIDATE_FLOOR, SearchRerankReport, rerank_search_outcome};
 use search::search_outcome_with_measured_slots;
 #[cfg(test)]
 use support::{apply_in_region_guard, cosine};
@@ -159,6 +162,7 @@ pub fn search_outcome_with_slots_traced(
         vault,
         vault_dir,
         &query_vectors,
+        None,
         k,
         fusion,
         guard,
@@ -169,6 +173,7 @@ pub fn search_outcome_with_slots_traced(
         allowed_slots,
         freshness,
         SearchBudget::disabled(),
+        None,
         None,
         Some(&mut trace),
     )
@@ -264,6 +269,128 @@ pub fn search_outcome_with_query_vectors_freshness_cached(
     slot_cache: Option<&mut SearchSlotCache>,
     trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
 ) -> CliResult<SearchOutcome> {
+    search_outcome_with_query_vectors_freshness_cached_ledger_view(
+        vault,
+        vault_dir,
+        query_vectors,
+        k,
+        fusion,
+        guard,
+        guard_tau,
+        guard_panel_version,
+        filter,
+        explain,
+        freshness,
+        budget,
+        slot_cache,
+        None,
+        trace_sink,
+    )
+}
+
+/// Generation-bound variant for resident services that already hold a fully
+/// conflict-checked physical Ledger view. Direct callers keep the targeted
+/// point-read path; MCP can bind this view to its exact vault/head cache key.
+#[allow(clippy::too_many_arguments)]
+pub fn search_outcome_with_query_vectors_freshness_cached_ledger_view(
+    vault: &AsterVault,
+    vault_dir: &Path,
+    query_vectors: &[(SlotId, SlotVector)],
+    k: usize,
+    fusion: FusionChoice,
+    guard: GuardChoice,
+    guard_tau: Option<f32>,
+    guard_panel_version: Option<u64>,
+    filter: Option<&str>,
+    explain: bool,
+    freshness: SearchFreshness,
+    budget: SearchBudget<'_>,
+    slot_cache: Option<&mut SearchSlotCache>,
+    ledger_view: Option<&AsterLedgerCfStore>,
+    trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
+) -> CliResult<SearchOutcome> {
+    search_outcome_with_query_vectors_freshness_cached_ledger_view_impl(
+        vault,
+        vault_dir,
+        query_vectors,
+        None,
+        k,
+        fusion,
+        guard,
+        guard_tau,
+        guard_panel_version,
+        filter,
+        explain,
+        freshness,
+        budget,
+        slot_cache,
+        ledger_view,
+        trace_sink,
+    )
+}
+
+/// Generation-bound search that also recalls the highest-specificity exact
+/// legal metadata matches from the persisted filter sidecar. This is the
+/// candidate-generation half of the explicit MCP rerank path; ordinary vector
+/// search remains unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn search_outcome_with_query_vectors_freshness_cached_ledger_view_exact_metadata(
+    vault: &AsterVault,
+    vault_dir: &Path,
+    query_vectors: &[(SlotId, SlotVector)],
+    metadata_query: &str,
+    k: usize,
+    fusion: FusionChoice,
+    guard: GuardChoice,
+    guard_tau: Option<f32>,
+    guard_panel_version: Option<u64>,
+    filter: Option<&str>,
+    explain: bool,
+    freshness: SearchFreshness,
+    budget: SearchBudget<'_>,
+    slot_cache: Option<&mut SearchSlotCache>,
+    ledger_view: Option<&AsterLedgerCfStore>,
+    trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
+) -> CliResult<SearchOutcome> {
+    search_outcome_with_query_vectors_freshness_cached_ledger_view_impl(
+        vault,
+        vault_dir,
+        query_vectors,
+        Some(metadata_query),
+        k,
+        fusion,
+        guard,
+        guard_tau,
+        guard_panel_version,
+        filter,
+        explain,
+        freshness,
+        budget,
+        slot_cache,
+        ledger_view,
+        trace_sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_outcome_with_query_vectors_freshness_cached_ledger_view_impl(
+    vault: &AsterVault,
+    vault_dir: &Path,
+    query_vectors: &[(SlotId, SlotVector)],
+    metadata_query: Option<&str>,
+    k: usize,
+    fusion: FusionChoice,
+    guard: GuardChoice,
+    guard_tau: Option<f32>,
+    guard_panel_version: Option<u64>,
+    filter: Option<&str>,
+    explain: bool,
+    freshness: SearchFreshness,
+    budget: SearchBudget<'_>,
+    slot_cache: Option<&mut SearchSlotCache>,
+    ledger_view: Option<&AsterLedgerCfStore>,
+    trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
+) -> CliResult<SearchOutcome> {
     let allowed_slots = query_vectors
         .iter()
         .map(|(slot, _)| *slot)
@@ -273,6 +400,7 @@ pub fn search_outcome_with_query_vectors_freshness_cached(
         vault,
         vault_dir,
         query_vectors,
+        metadata_query,
         k,
         fusion,
         guard,
@@ -284,6 +412,7 @@ pub fn search_outcome_with_query_vectors_freshness_cached(
         freshness,
         budget,
         slot_cache,
+        ledger_view,
         Some(&mut trace),
     )
 }

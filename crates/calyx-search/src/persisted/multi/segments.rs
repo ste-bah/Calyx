@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 use crate::persisted::RebuildProgress;
 
 #[path = "segments/path.rs"]
@@ -10,13 +11,26 @@ mod manifest;
 use manifest::validate_segments_manifest_shape;
 #[path = "segments/bounds.rs"]
 mod bounds;
+#[cfg(test)]
 #[path = "segments/reuse.rs"]
 mod reuse;
 #[path = "segments/search.rs"]
 mod search;
+#[cfg(test)]
+#[path = "segments/summary.rs"]
+mod summary;
+#[path = "segments/writer.rs"]
+mod writer;
 pub(super) use bounds::ensure_entry_bounded;
+pub(in crate::persisted) use bounds::ensure_streaming_row_bounded;
+#[cfg(test)]
 use reuse::reusable_segments;
 pub(super) use search::search_segments;
+#[cfg(feature = "cuda")]
+pub(crate) use search::take_maxsim_cuda_detail;
+#[cfg(test)]
+use summary::summarize_segment_files;
+pub(in crate::persisted) use writer::{SegmentFlush, StreamingSegmentsWriter};
 
 const MULTI_SEGMENTS_FORMAT: &str = "calyx-search-multi-maxsim-segments-v1";
 
@@ -42,6 +56,7 @@ pub(super) struct MultiSegmentRef {
     pub(super) ids: Vec<CxId>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ReusedMultiSegments {
     refs: Vec<MultiSegmentRef>,
@@ -57,6 +72,13 @@ struct SegmentManifestBuild {
     segments: Vec<MultiSegmentRef>,
 }
 
+pub(super) struct EncodedMultiRow {
+    pub(super) cx_id: CxId,
+    pub(super) token_count: u32,
+    pub(super) bytes: Vec<u8>,
+}
+
+#[cfg(test)]
 pub(in crate::persisted) fn write(
     vault_dir: &Path,
     root: &Path,
@@ -158,6 +180,7 @@ pub(super) fn referenced_segment_artifacts(
         .collect()
 }
 
+#[cfg(test)]
 fn write_binary_segments(
     vault_dir: &Path,
     root: &Path,
@@ -184,6 +207,7 @@ fn write_binary_segments(
         .collect()
 }
 
+#[cfg(test)]
 fn write_binary_segment(
     vault_dir: &Path,
     root: &Path,
@@ -207,6 +231,37 @@ fn write_binary_segment(
         row_count: rows.len(),
         token_count,
         ids: rows.iter().map(|(cx_id, _)| *cx_id).collect(),
+    })
+}
+
+fn write_encoded_binary_segment(
+    vault_dir: &Path,
+    root: &Path,
+    slot: SlotId,
+    token_dim: u32,
+    rows: &[EncodedMultiRow],
+    base_seq: u64,
+    ordinal: usize,
+) -> CliResult<MultiSegmentRef> {
+    let path = root.join(format!(
+        "slot_{:05}_seq_{base_seq:020}_seg_{ordinal:05}_n_{:010}.multi.bin",
+        slot.get(),
+        rows.len()
+    ));
+    let token_count = rows.iter().try_fold(0usize, |total, row| {
+        total
+            .checked_add(row.token_count as usize)
+            .ok_or_else(|| stale("streaming multi segment token_count overflow"))
+    })?;
+    let sha256 =
+        binary::write_encoded_binary_atomic_hashed(&path, slot, token_dim, rows, base_seq)?;
+    Ok(MultiSegmentRef {
+        index_rel: rel(vault_dir, &path)?,
+        sha256,
+        base_seq,
+        row_count: rows.len(),
+        token_count,
+        ids: rows.iter().map(|row| row.cx_id).collect(),
     })
 }
 
@@ -303,50 +358,6 @@ pub(super) fn validate_segment_files(
                 segment.index_rel
             )));
         }
-        files.push(super::pinned::BoundedSegmentFile {
-            path,
-            index_rel: segment.index_rel.clone(),
-            expected_bytes: expected,
-        });
-    }
-    Ok(files)
-}
-
-fn summarize_segment_files(
-    vault_dir: &Path,
-    slot: SlotId,
-    token_dim: u32,
-    manifest: &MultiSegmentsManifest,
-    verify_binary: bool,
-) -> CliResult<ReusedMultiSegments> {
-    let mut ids = BTreeSet::new();
-    let mut token_count = 0usize;
-    let mut refs = Vec::with_capacity(manifest.segments.len());
-    for segment in &manifest.segments {
-        let path = checked_segment_path(vault_dir, &segment.index_rel, slot)?;
-        let mut segment_ref = segment.clone();
-        if !verify_binary && !segment.ids.is_empty() {
-            if segment.ids.len() != segment.row_count {
-                return Err(stale(format!(
-                    "persistent segmented multi manifest {} id count {} != row_count {}; rebuild the vault search indexes",
-                    segment.index_rel,
-                    segment.ids.len(),
-                    segment.row_count
-                )));
-            }
-            for cx_id in &segment.ids {
-                if !ids.insert(*cx_id) {
-                    return Err(stale(format!(
-                        "persistent segmented multi sidecars repeat {cx_id}; rebuild the vault search indexes"
-                    )));
-                }
-            }
-            token_count = token_count
-                .checked_add(segment.token_count)
-                .ok_or_else(|| stale("persistent segmented multi sidecar token_count overflow"))?;
-            refs.push(segment_ref);
-            continue;
-        }
         let summary = binary::summarize_binary_path(
             &path,
             &segment.sha256,
@@ -357,39 +368,22 @@ fn summarize_segment_files(
         )?;
         if summary.base_seq != segment.base_seq {
             return Err(stale(format!(
-                "persistent segmented multi sidecar {} seq {} != segment manifest seq {}; rebuild the vault search indexes",
+                "persistent segmented multi sidecar {} has base_seq {}, expected {}; rebuild the vault search indexes",
                 segment.index_rel, summary.base_seq, segment.base_seq
             )));
         }
-        segment_ref.ids = summary.ids.iter().copied().collect();
-        for cx_id in summary.ids {
-            if !ids.insert(cx_id) {
-                return Err(stale(format!(
-                    "persistent segmented multi sidecars repeat {cx_id}; rebuild the vault search indexes"
-                )));
-            }
+        let expected_ids = segment.ids.iter().copied().collect::<BTreeSet<_>>();
+        if summary.ids != expected_ids {
+            return Err(stale(format!(
+                "persistent segmented multi sidecar {} IDs do not match its manifest; rebuild the vault search indexes",
+                segment.index_rel
+            )));
         }
-        token_count = token_count
-            .checked_add(segment.token_count)
-            .ok_or_else(|| stale("persistent segmented multi sidecar token_count overflow"))?;
-        refs.push(segment_ref);
+        files.push(super::pinned::BoundedSegmentFile {
+            path,
+            index_rel: segment.index_rel.clone(),
+            expected_bytes: expected,
+        });
     }
-    if ids.len() != manifest.row_count {
-        return Err(stale(format!(
-            "persistent segmented multi manifest row_count {} != unique row count {}; rebuild the vault search indexes",
-            manifest.row_count,
-            ids.len()
-        )));
-    }
-    if token_count != manifest.token_count {
-        return Err(stale(format!(
-            "persistent segmented multi manifest token_count {} != sidecar token count {token_count}; rebuild the vault search indexes",
-            manifest.token_count
-        )));
-    }
-    Ok(ReusedMultiSegments {
-        refs,
-        ids,
-        token_count,
-    })
+    Ok(files)
 }

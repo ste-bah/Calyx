@@ -8,7 +8,9 @@ use storage_support::{
     storage_dir, wal_files,
 };
 
-mod storage_support;
+// calyx-shared-module: path=storage_support/mod.rs alias=__calyx_shared_storage_support_mod_rs local=storage_support visibility=private
+
+use crate::__calyx_shared_storage_support_mod_rs as storage_support;
 
 #[test]
 fn storage_layers_round_trip_and_txn_rolls_back_staged_writes() {
