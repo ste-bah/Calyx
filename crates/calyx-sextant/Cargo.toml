@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "calyx-sextant"
 version.workspace = true
 edition.workspace = true
@@ -15,7 +16,7 @@ default = []
 # runtime stubs fail closed naming the platform limitation. The resolved truth
 # is exported as `CUVS_COMPILED` for build-info capability readback — deploy
 # gates must assert that, never the feature name.
-cuda = ["dep:cudarc", "dep:cuvs-sys"]
+cuda = ["dep:cudarc", "dep:cuvs-sys", "calyx-forge/cuda"]
 
 [dependencies]
 bincode.workspace = true
@@ -37,7 +38,7 @@ zeroize = "1"
 zstd.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cudarc = { workspace = true, optional = true, features = ["std", "driver", "dynamic-linking", "cuda-13030"] }
+cudarc = { workspace = true, optional = true, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-13030"] }
 cuvs-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -53,3 +54,19 @@ sha2.workspace = true
 [[bench]]
 name = "bench_diskann_1e6"
 harness = false
+
+# BEGIN generated integration harnesses (issue #1546)
+
+[[test]]
+name = "__calyx_integration_process_0"
+path = "tests/__calyx_integration_process_0.rs"
+
+[[test]]
+name = "__calyx_integration_suite_0"
+path = "tests/__calyx_integration_suite_0.rs"
+
+[[test]]
+name = "__calyx_integration_suite_1"
+path = "tests/__calyx_integration_suite_1.rs"
+
+# END generated integration harnesses (issue #1546)

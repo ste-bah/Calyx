@@ -2,6 +2,7 @@ use super::{RowTable, VersionChain, VersionedCfStore};
 use crate::cf::ColumnFamily;
 use crate::gc::{GcMetrics, GcRateLimit, GcResult, SnapshotVersionGc};
 use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
+use std::collections::BTreeMap;
 
 impl VersionedCfStore {
     pub fn set_snapshot_gc_rate_limit(&self, rate_limit: GcRateLimit) {
@@ -48,7 +49,7 @@ impl SnapshotVersionGc for VersionedCfStore {
         let mut remaining = max_versions;
         let mut versions_reclaimed = 0usize;
         let mut bytes_freed = 0usize;
-        for versions in table.values_mut() {
+        for versions in table.values_mut().flat_map(BTreeMap::values_mut) {
             if remaining == 0 {
                 break;
             }
@@ -102,6 +103,7 @@ fn reclaim_chain(
 fn snapshot_gc_debt_for_table(table: &RowTable, safe_point: Seq) -> u64 {
     table
         .values()
+        .flat_map(BTreeMap::values)
         .map(|versions| reclaimable_versions(versions, safe_point) as u64)
         .sum()
 }

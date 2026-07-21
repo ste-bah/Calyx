@@ -1,6 +1,7 @@
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_aster::vault::{CALYX_DECRYPTION_FAILED, QuotaConfig, VaultContext};
 use calyx_core::VaultId;
-mod fsv_support;
 use fsv_support::{fsv_root_env_subdir, reset_dir};
 use serde_json::json;
 use std::fs;

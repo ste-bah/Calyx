@@ -2,10 +2,13 @@ use serde::{Deserialize, Serialize};
 
 pub const BASE_PAGE_INDEX_DIR: &str = "base_page_index_v1";
 pub const BASE_PAGE_INDEX_MANIFEST: &str = "manifest.json";
+pub const BASE_PAGE_INDEX_GENERATIONS_DIR: &str = "generations";
 pub const DEFAULT_BASE_PAGE_INDEX_PAGE_SIZE: usize = 1024;
 
 pub(super) const INDEX_MAGIC: &str = "calyx.base_page_index";
-pub(super) const INDEX_VERSION: u32 = 1;
+pub(super) const LEGACY_INDEX_VERSION: u32 = 1;
+pub(super) const GENERATION_INDEX_VERSION: u32 = 2;
+pub(super) const INDEX_VERSION: u32 = 3;
 pub(super) const MISSING_CODE: &str = "CALYX_BASE_PAGE_INDEX_MISSING";
 pub(super) const STALE_CODE: &str = "CALYX_BASE_PAGE_INDEX_STALE";
 pub(super) const CORRUPT_CODE: &str = "CALYX_BASE_PAGE_INDEX_CORRUPT";
@@ -15,6 +18,8 @@ pub(super) const REMEDIATION: &str = "run `calyx readback cx-list --vault <dir> 
 pub struct BasePageIndexManifest {
     pub magic: String,
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
     pub ledger_head_height: u64,
     pub ledger_head_tip_hash_hex: String,
     pub page_size: usize,
@@ -64,12 +69,20 @@ pub enum BasePageIndexSource {
         order_seq: u64,
         order_class_rank: u8,
         order_index: usize,
+        /// Exact SST record start. Version 3 readers require this so a Base
+        /// point read does not checksum and decode the whole SST body.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_offset: Option<u64>,
     },
     Wal {
         path: String,
         seq: u64,
         start_offset: u64,
         end_offset: u64,
+        /// Exact CF-tag offset inside the encoded WAL write-batch payload.
+        /// Version 3 readers require this to skip unrelated slot payloads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row_offset: Option<u64>,
     },
 }
 

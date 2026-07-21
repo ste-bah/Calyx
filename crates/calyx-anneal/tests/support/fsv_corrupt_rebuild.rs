@@ -11,7 +11,7 @@ use calyx_anneal::{
 use calyx_core::SlotId;
 use serde_json::json;
 
-use crate::fsv_support::vault_id;
+use super::fsv_support::vault_id;
 use edges::{
     run_base_corruption_edge, run_corrupt_ann_fault, run_empty_scheduler_edge,
     run_failing_lens_route, run_tripwire_failure_edge,

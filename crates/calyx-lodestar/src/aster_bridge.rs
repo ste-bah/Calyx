@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use calyx_aster::plain_graph::PlainGraph;
 use calyx_aster::timetravel::TimeTravelSnapshot;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{AnchorKind, CalyxError, Clock, CxId, LedgerRef, Seq, Ts};
+use calyx_core::{AnchorKind, CalyxError, Clock, CxId, LedgerRef, Seq, SlotId, Ts};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
@@ -18,18 +18,50 @@ use crate::summarize::{
 use crate::{LodestarError, Result, ScopeCache};
 
 pub const DEFAULT_ASTER_ASSOC_COLLECTION: &str = "default";
+pub const PANEL_ASTER_ASSOC_COLLECTION: &str = "kernel-panel-v3";
 pub const ASTER_ASSOC_METADATA_KEY: &str = "lodestar_assoc_v1";
 
 mod physical;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AsterAssocMetadata {
     pub retention_horizon: Option<Ts>,
+    /// Legacy single-lane graph marker. New sealed graphs must leave this empty
+    /// and populate `embedding_slots` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_slot: Option<SlotId>,
+    /// Ordered dense content lanes used by every graph edge and query gate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embedding_slots: Vec<SlotId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rrf_k: Option<u32>,
+    /// Frozen panel version used when the graph embeddings were measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_version: Option<u64>,
+    /// Last vault sequence incorporated before the graph contract was sealed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_source_seq: Option<Seq>,
+    /// k used for the persisted between-document nearest-neighbour graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn: Option<usize>,
+    /// Corpus-native admission boundary used to refuse unsupported queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_cos_threshold: Option<f32>,
+    /// Fused graph score boundary for panel-native graphs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_score_threshold: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AsterAssocNodeProps {
+    /// Legacy single-lane embedding. New panel-native graphs leave this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// Complete no-flatten panel measurement keyed by stable slot id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub embeddings: BTreeMap<SlotId, Vec<f32>>,
     pub ts: Option<Ts>,
     #[serde(default)]
     pub anchors: Vec<AnchorKind>,

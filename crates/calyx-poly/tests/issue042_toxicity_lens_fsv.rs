@@ -251,6 +251,8 @@ fn assert_close64(actual: f64, expected: f64) {
 }
 
 fn fsv_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../target/fsv/issue042_toxicity_lens_20260705_001")
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue042-toxicity-lens", || {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/fsv/issue042_toxicity_lens_20260705_001")
+    })
 }

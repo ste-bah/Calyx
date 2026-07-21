@@ -202,6 +202,8 @@ fn assert_close(actual: f32, expected: f32) {
 }
 
 fn fsv_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../target/fsv/issue041_book_shape_lens_20260705_001")
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue041-book-shape-lens", || {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/fsv/issue041_book_shape_lens_20260705_001")
+    })
 }

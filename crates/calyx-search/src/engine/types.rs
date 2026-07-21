@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use calyx_core::{Constellation, CxId, SlotId};
 use calyx_sextant::{DroppedGuardHit, FusionStrategy, Hit, RrfProfile};
 
+use crate::persisted::PersistedSearchGeneration;
+
 use crate::error::{CliResult, SearchError};
 
 /// Fusion strategy choice (transport-agnostic; the CLI flag parser and the HTTP
@@ -72,6 +74,7 @@ pub struct SearchOutcome {
     pub guard_tau: Option<f32>,
     pub docs: BTreeMap<CxId, Constellation>,
     pub dropped_guard_hits: Vec<DroppedGuardHit>,
+    pub generation: Option<PersistedSearchGeneration>,
 }
 
 impl SearchOutcome {
@@ -81,6 +84,14 @@ impl SearchOutcome {
             guard_tau: None,
             docs: BTreeMap::new(),
             dropped_guard_hits: Vec::new(),
+            generation: None,
+        }
+    }
+
+    pub(super) fn empty_with_generation(generation: PersistedSearchGeneration) -> Self {
+        Self {
+            generation: Some(generation),
+            ..Self::empty()
         }
     }
 }

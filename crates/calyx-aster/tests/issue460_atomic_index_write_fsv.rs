@@ -2,7 +2,7 @@
 //!
 //! Trigger with:
 //! `CALYX_ISSUE460_FSV_ROOT=/var/lib/calyx/data/fsv-issue460-atomic-index-<stamp> \
-//! cargo test -p calyx-aster --test issue460_atomic_index_write_fsv -- --ignored --nocapture`
+//! cargo test -p calyx-aster --test __calyx_integration_suite_1 issue460_atomic_index_write_fsv -- --ignored --nocapture`
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,9 @@ use calyx_aster::wal::replay_dir;
 use calyx_core::{Clock, VaultId};
 use serde_json::{Value, json};
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::collect_physical_file_states;
 
 fn vault_id() -> VaultId {

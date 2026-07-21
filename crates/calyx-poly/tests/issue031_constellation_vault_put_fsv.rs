@@ -262,6 +262,8 @@ fn assert_scalar_close(cx: &calyx_core::Constellation, key: &str, expected: f64)
 }
 
 fn fsv_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/fsv/issue031_constellation_vault_put")
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue031-constellation-vault-put", || {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/fsv/issue031_constellation_vault_put")
+    })
 }

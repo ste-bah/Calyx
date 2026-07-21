@@ -10,7 +10,7 @@ use calyx_core::{
 };
 use calyx_registry::{
     AlgorithmicLens, CapabilityCard, CapabilitySignalKind, CostMetrics, DenseProfileRequest,
-    LensHealth, Registry, profile_dense_vectors,
+    LensHealth, ProfileExecutionStats, Registry, profile_dense_vectors,
 };
 
 use super::core::{cosine, dense, has_anchor, has_anchor_kind};
@@ -27,6 +27,7 @@ pub(super) struct ProfileMeasurement {
     pub(super) vectors: BTreeMap<CxId, SlotVector>,
     pub(super) cost: Option<CostMetrics>,
     pub(super) signal_kind: CapabilitySignalKind,
+    pub(super) execution: ProfileExecutionStats,
 }
 
 pub(super) fn measure_candidate(
@@ -67,13 +68,24 @@ pub(super) fn measure_registered_lens(
     lens_id: LensId,
     modality: Modality,
 ) -> Result<ProfileMeasurement> {
-    let mut ordered = Vec::with_capacity(docs.len());
+    let ids = docs.keys().copied().collect::<Vec<_>>();
+    let inputs = docs
+        .values()
+        .map(|cx| input_for_constellation(vault_dir, cx, modality))
+        .collect::<Result<Vec<_>>>()?;
+    let measured = registry.measure_batch(lens_id, &inputs)?;
+    if measured.len() != inputs.len() {
+        return Err(invalid_metric(format!(
+            "registered lens {lens_id} returned {} vectors for {} inputs",
+            measured.len(),
+            inputs.len()
+        )));
+    }
+    let mut ordered = Vec::with_capacity(measured.len());
     let mut vectors = BTreeMap::new();
-    for cx in docs.values() {
-        let input = input_for_constellation(vault_dir, cx, modality)?;
-        let vector = registry.measure(lens_id, &input)?;
+    for (cx_id, vector) in ids.into_iter().zip(measured) {
         ordered.push(dense_projection(&vector)?);
-        vectors.insert(cx.cx_id, vector);
+        vectors.insert(cx_id, vector);
     }
     Ok(ProfileMeasurement {
         lens_id,
@@ -82,6 +94,7 @@ pub(super) fn measure_registered_lens(
         vectors,
         cost: None,
         signal_kind: CapabilitySignalKind::Unknown,
+        execution: batch_execution(),
     })
 }
 
@@ -126,6 +139,7 @@ pub(super) fn capability_card(
         signal: Some(signal),
         signal_kind: measured.signal_kind,
         health,
+        execution: measured.execution,
     })
 }
 
@@ -185,11 +199,22 @@ fn measure_with_lens(
     cost: Option<CostMetrics>,
     signal_kind: CapabilitySignalKind,
 ) -> Result<ProfileMeasurement> {
-    let mut ordered = Vec::with_capacity(corpus.len());
+    let inputs = corpus
+        .iter()
+        .map(|cx| input_for_constellation(vault_dir, cx, modality))
+        .collect::<Result<Vec<_>>>()?;
+    let measured = lens.measure_batch(&inputs)?;
+    if measured.len() != inputs.len() {
+        return Err(invalid_metric(format!(
+            "candidate lens {} returned {} vectors for {} inputs",
+            lens.id(),
+            measured.len(),
+            inputs.len()
+        )));
+    }
+    let mut ordered = Vec::with_capacity(measured.len());
     let mut vectors = BTreeMap::new();
-    for cx in corpus {
-        let input = input_for_constellation(vault_dir, cx, modality)?;
-        let vector = lens.measure(&input)?;
+    for (cx, vector) in corpus.iter().zip(measured) {
         ordered.push(dense_projection(&vector)?);
         vectors.insert(cx.cx_id, vector);
     }
@@ -200,6 +225,7 @@ fn measure_with_lens(
         vectors,
         cost,
         signal_kind,
+        execution: batch_execution(),
     })
 }
 
@@ -231,7 +257,17 @@ fn measure_commission_target(
         vectors,
         cost: Some(target_cost(target.expected_cost, corpus.len())),
         signal_kind: CapabilitySignalKind::Placeholder,
+        execution: ProfileExecutionStats::default(),
     })
+}
+
+fn batch_execution() -> ProfileExecutionStats {
+    ProfileExecutionStats {
+        measurement_passes: 1,
+        batch_measure_calls: 1,
+        scalar_measure_calls: 0,
+        ..ProfileExecutionStats::default()
+    }
 }
 
 fn profile_labels(

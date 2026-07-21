@@ -399,6 +399,8 @@ fn write_manifest(
         max_batch: flags.max_batch,
         // Resolved by the #1157 batch preflight after this initial write.
         batch_policy: None,
+        // upstream added this field; None => downstream default max tokens.
+        max_tokens: None,
     };
     let path = out.join(MANIFEST_NAME);
     write_json_file(&path, &manifest)?;

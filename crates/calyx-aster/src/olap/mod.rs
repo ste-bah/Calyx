@@ -1,11 +1,15 @@
+mod cpu;
+mod dispatch;
 mod types;
 
+#[cfg(all(test, feature = "cuda"))]
+mod issue1519_fsv;
 #[cfg(test)]
 mod tests;
 
 pub use types::{
-    DEFAULT_MAX_GROUPS, DEFAULT_MAX_ROWS, OlapAggregate, OlapGroupAggregate, OlapScanPlan,
-    OlapScanResult,
+    DEFAULT_MAX_GROUPS, DEFAULT_MAX_ROWS, OLAP_CUDA_MIN_ROWS, OlapAggregate, OlapExecutionStats,
+    OlapGroupAggregate, OlapScanPlan, OlapScanResult, olap_sum_tolerance,
 };
 
 use crate::mmap_col::MmapColumn;
@@ -13,7 +17,6 @@ use crate::sst::arrow::{ArrowColumnView, decode_column_shape};
 use crate::vault::{AsterVault, SlotColumnManifest};
 use calyx_core::{CalyxError, Clock, Result, Seq, SlotId};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -54,8 +57,7 @@ pub fn scan_materialized_slot_column_aggregate(
     let chunk = decode_column_shape(column.as_bytes())?;
     validate_manifest_shape(&manifest, &chunk)?;
     validate_plan(plan, chunk.dim(), chunk.n_rows())?;
-    let aggregate = scan_total(&chunk, plan.value_column)?;
-    let groups = scan_groups(&chunk, plan)?;
+    let (aggregate, groups, execution) = dispatch::scan(&chunk, plan)?;
     Ok(OlapScanResult {
         source_manifest_path: manifest_path.to_path_buf(),
         source_chunk_path: chunk_path,
@@ -66,43 +68,8 @@ pub fn scan_materialized_slot_column_aggregate(
         group_by_column: plan.group_by_column,
         aggregate,
         groups,
+        execution,
     })
-}
-
-fn scan_total(chunk: &ArrowColumnView<'_>, column: usize) -> Result<OlapAggregate> {
-    let mut acc = Accumulator::default();
-    for value in chunk.column_values(column)? {
-        acc.push(value)?;
-    }
-    acc.finish()
-}
-
-fn scan_groups(chunk: &ArrowColumnView<'_>, plan: OlapScanPlan) -> Result<Vec<OlapGroupAggregate>> {
-    let Some(group_column) = plan.group_by_column else {
-        return Ok(Vec::new());
-    };
-    let mut groups = BTreeMap::<u32, Accumulator>::new();
-    for row in 0..chunk.n_rows() {
-        let group_key = finite(chunk.value(group_column, row)?)?;
-        let value = chunk.value(plan.value_column, row)?;
-        if !groups.contains_key(&group_key.to_bits()) && groups.len() == plan.max_groups {
-            return Err(olap_error(
-                "CALYX_OLAP_SCAN_LIMIT",
-                format!("group cap {} exceeded", plan.max_groups),
-            ));
-        }
-        groups.entry(group_key.to_bits()).or_default().push(value)?;
-    }
-    groups
-        .into_iter()
-        .map(|(group_key_bits, acc)| {
-            Ok(OlapGroupAggregate {
-                group_key_bits,
-                group_key: f32::from_bits(group_key_bits),
-                aggregate: acc.finish()?,
-            })
-        })
-        .collect()
 }
 
 fn validate_plan(plan: OlapScanPlan, dim: usize, rows: usize) -> Result<()> {
@@ -182,54 +149,6 @@ fn validate_manifest_shape(
         ));
     }
     Ok(())
-}
-
-#[derive(Debug, Default, Clone)]
-struct Accumulator {
-    count: usize,
-    sum: f64,
-    min: f32,
-    max: f32,
-}
-
-impl Accumulator {
-    fn push(&mut self, value: f32) -> Result<()> {
-        let value = finite(value)?;
-        if self.count == 0 {
-            self.min = value;
-            self.max = value;
-        } else {
-            self.min = self.min.min(value);
-            self.max = self.max.max(value);
-        }
-        self.count += 1;
-        self.sum += f64::from(value);
-        Ok(())
-    }
-
-    fn finish(self) -> Result<OlapAggregate> {
-        if self.count == 0 {
-            return Err(olap_error("CALYX_OLAP_EMPTY", "aggregate has no rows"));
-        }
-        Ok(OlapAggregate {
-            count: self.count,
-            sum: self.sum,
-            min: self.min,
-            max: self.max,
-            avg: self.sum / self.count as f64,
-        })
-    }
-}
-
-fn finite(value: f32) -> Result<f32> {
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(olap_error(
-            "CALYX_OLAP_NONFINITE_VALUE",
-            "column aggregate encountered NaN or Inf",
-        ))
-    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

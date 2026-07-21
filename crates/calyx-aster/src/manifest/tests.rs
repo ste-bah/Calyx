@@ -1,12 +1,73 @@
 use super::*;
 use crate::sst::write_sst;
 use crate::wal::{Wal, WalOptions};
+use calyx_ledger::QuarantineLookup;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn required_manifest_members_report_truthful_io_kinds_without_mutation() {
+    let dir = test_dir("required-members-typed-io");
+    let store = ManifestStore::open(&dir);
+    let before_missing_current = directory_inventory(&dir);
+
+    let missing_current = store.load_current().expect_err("CURRENT is required");
+    let after_missing_current = directory_inventory(&dir);
+    println!(
+        "MANIFEST_IO_EDGE_MISSING_CURRENT before={before_missing_current:?} after={after_missing_current:?} error={missing_current:?}"
+    );
+    assert_eq!(missing_current.code, "CALYX_ASTER_MANIFEST_MISSING");
+    assert!(
+        missing_current
+            .message
+            .contains(&dir.join("CURRENT").display().to_string())
+    );
+    assert!(missing_current.message.contains("kind=NotFound"));
+    assert_ne!(missing_current.code, "CALYX_DISK_PRESSURE");
+    assert_eq!(before_missing_current, after_missing_current);
+
+    let pointed = manifest_filename(7);
+    fs::write(dir.join(CURRENT_FILE), &pointed).expect("write real CURRENT pointer");
+    let before_missing_manifest = directory_inventory(&dir);
+    let missing_manifest = store
+        .load_current()
+        .expect_err("pointed manifest is required");
+    let after_missing_manifest = directory_inventory(&dir);
+    println!(
+        "MANIFEST_IO_EDGE_MISSING_POINTED before={before_missing_manifest:?} after={after_missing_manifest:?} error={missing_manifest:?}"
+    );
+    assert_eq!(missing_manifest.code, "CALYX_ASTER_MANIFEST_MISSING");
+    assert!(
+        missing_manifest
+            .message
+            .contains(&dir.join(pointed).display().to_string())
+    );
+    assert_eq!(before_missing_manifest, after_missing_manifest);
+    cleanup(dir);
+}
+
+#[test]
+fn manifest_io_classification_reserves_disk_pressure_for_capacity_errors() {
+    let path = Path::new("vault/CURRENT");
+    for kind in [io::ErrorKind::StorageFull, io::ErrorKind::QuotaExceeded] {
+        let error = storage_error("write manifest", path, io::Error::from(kind));
+        assert_eq!(error.code, "CALYX_DISK_PRESSURE", "kind={kind:?}");
+        assert!(error.message.contains(&format!("kind={kind:?}")));
+    }
+    for kind in [
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::ReadOnlyFilesystem,
+        io::ErrorKind::Other,
+    ] {
+        let error = storage_error("read manifest", path, io::Error::from(kind));
+        assert_eq!(error.code, "CALYX_ASTER_MANIFEST_IO", "kind={kind:?}");
+        assert!(error.message.contains(&format!("kind={kind:?}")));
+    }
+}
 
 #[test]
 fn manifest_swap_uses_current_pointer_atomically() {
@@ -40,9 +101,10 @@ fn derived_content_seq_roundtrips_and_fails_closed_when_absent_or_ahead() {
     write_manifest_assets(&dir);
     let store = ManifestStore::open(&dir);
 
-    // Legacy manifest bytes (field absent) decode to None and fail closed to
-    // durable_seq.
-    let legacy = manifest(1, 10);
+    // A pre-watermark manifest (field absent) decodes to None and fails
+    // closed to durable_seq. Its semantic model is also explicitly legacy.
+    let mut legacy = manifest(1, 10);
+    legacy.derived_content_model = None;
     assert_eq!(legacy.derived_content_seq, None);
     assert_eq!(legacy.effective_derived_content_seq(), 10);
     store.write_current(&legacy).expect("write legacy");
@@ -56,6 +118,10 @@ fn derived_content_seq_roundtrips_and_fails_closed_when_absent_or_ahead() {
     store.write_current(&recorded).expect("write recorded");
     let loaded = store.load_current().expect("load recorded");
     assert_eq!(loaded.derived_content_seq, Some(7));
+    assert_eq!(
+        loaded.derived_content_model,
+        Some(PERSISTENT_SEARCH_CONTENT_MODEL)
+    );
     assert_eq!(loaded.effective_derived_content_seq(), 7);
 
     // A watermark ahead of durable_seq vouches for uncheckpointed seqs:
@@ -67,6 +133,16 @@ fn derived_content_seq_roundtrips_and_fails_closed_when_absent_or_ahead() {
         .expect_err("watermark ahead of durable_seq");
     assert_eq!(err.code, "CALYX_ASTER_CORRUPT_SHARD");
     assert!(err.message.contains("derived_content_seq 11"));
+
+    let mut unsupported = manifest(4, 10);
+    unsupported.derived_content_model = Some(PERSISTENT_SEARCH_CONTENT_MODEL + 1);
+    let err = unsupported
+        .validate()
+        .expect_err("unknown explicit watermark model");
+    assert!(
+        err.message
+            .contains("unsupported derived-content watermark model")
+    );
     cleanup(dir);
 }
 
@@ -199,6 +275,60 @@ fn quarantine_records_roundtrip_and_match_ranges() {
 }
 
 #[test]
+fn quarantine_snapshot_is_generation_coherent_and_new_generations_fail_closed() {
+    let empty_dir = test_dir("quarantine-snapshot-empty");
+    let empty = load_vault_quarantine_snapshot(&empty_dir).expect("no CURRENT is empty");
+    println!("MANIFEST_SNAPSHOT_EDGE_EMPTY before_current=false after_quarantined=false");
+    assert!(!empty.contains_quarantined(0..u64::MAX).unwrap());
+    cleanup(empty_dir);
+
+    let dir = test_dir("quarantine-snapshot-generation");
+    write_manifest_assets(&dir);
+    let store = ManifestStore::open(&dir);
+    let mut first = manifest(1, 10);
+    first.quarantines = vec![QuarantineRecord::new(2, 5, 3, 100).unwrap()];
+    store.write_current(&first).expect("write first generation");
+    let first_snapshot = load_vault_quarantine_snapshot(&dir).expect("load first generation");
+    println!("MANIFEST_SNAPSHOT_BEFORE generation=1 quarantines=2..5");
+
+    assert!(!first_snapshot.contains_quarantined(0..2).unwrap());
+    assert!(first_snapshot.contains_quarantined(2..3).unwrap());
+    assert!(first_snapshot.contains_quarantined(4..5).unwrap());
+    assert!(!first_snapshot.contains_quarantined(5..6).unwrap());
+
+    let mut second = manifest(2, 10);
+    second.quarantines = vec![QuarantineRecord::new(7, 9, 8, 200).unwrap()];
+    store
+        .write_current(&second)
+        .expect("write second generation");
+    let second_snapshot = load_vault_quarantine_snapshot(&dir).expect("load second generation");
+    assert!(first_snapshot.contains_quarantined(2..5).unwrap());
+    assert!(!first_snapshot.contains_quarantined(7..9).unwrap());
+    assert!(!second_snapshot.contains_quarantined(2..5).unwrap());
+    assert!(second_snapshot.contains_quarantined(7..9).unwrap());
+    println!(
+        "MANIFEST_SNAPSHOT_AFTER generation=2 old_2_5={} new_7_9={}",
+        first_snapshot.contains_quarantined(2..5).unwrap(),
+        second_snapshot.contains_quarantined(7..9).unwrap()
+    );
+
+    fs::write(dir.join("panel/panel-0001.json"), b"tampered").expect("tamper immutable ref");
+    assert!(
+        second_snapshot.contains_quarantined(7..9).unwrap(),
+        "an acquired request snapshot stays coherent"
+    );
+    let error = load_vault_quarantine_snapshot(&dir)
+        .expect_err("the next request must validate and reject the tampered generation");
+    assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
+    assert!(error.message.contains("hash mismatch"));
+    println!(
+        "MANIFEST_SNAPSHOT_EDGE_TAMPER before_snapshot_usable=true after_reload_code={}",
+        error.code
+    );
+    cleanup(dir);
+}
+
+#[test]
 fn corrupt_base_shard_read_fails_closed_with_restore_guidance() {
     let dir = test_dir("base-corrupt");
     let path = dir.join("cf").join("base").join("base.sst");
@@ -214,6 +344,10 @@ fn corrupt_base_shard_read_fails_closed_with_restore_guidance() {
         .position(|window| window == value)
         .expect("value position");
     bytes[value_at] ^= 0x01;
+    // Simulates external corruption: drop the shared-cache mapping first
+    // (Windows refuses to truncate a mapped file); the fresh open below must
+    // still re-checksum and fail closed.
+    crate::sst::invalidate_reader(&path);
     fs::write(&path, bytes).expect("write corrupt base sst");
 
     let error = read_base_shard(&path, key).expect_err("corrupt base fails closed");
@@ -253,4 +387,20 @@ fn test_dir(name: &str) -> PathBuf {
 
 fn cleanup(dir: PathBuf) {
     fs::remove_dir_all(dir).expect("cleanup test dir");
+}
+
+fn directory_inventory(dir: &Path) -> Vec<(String, u64)> {
+    let mut inventory = fs::read_dir(dir)
+        .expect("read test directory")
+        .map(|entry| {
+            let entry = entry.expect("read directory entry");
+            let metadata = entry.metadata().expect("read entry metadata");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                metadata.len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    inventory.sort();
+    inventory
 }

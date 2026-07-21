@@ -8,14 +8,21 @@ use super::IDX_MIX;
 use crate::index::vecfile::{FbinVectors, I8BinVectors};
 
 pub fn gen_row(seed: u64, idx: u64, dim: usize) -> Vec<f32> {
+    let mut row = vec![0.0; dim];
+    gen_row_into(seed, idx, &mut row);
+    row
+}
+
+pub fn gen_row_into(seed: u64, idx: u64, destination: &mut [f32]) {
+    let dim = destination.len();
+    assert!(dim > 0, "synthetic row dimension must be nonzero");
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ idx.wrapping_mul(IDX_MIX));
-    let mut v: Vec<f32> = (0..dim)
-        .map(|j| rng.random_range(-1.0_f32..1.0) + ((idx as usize + j) % dim) as f32 * 0.001)
-        .collect();
+    for (j, value) in destination.iter_mut().enumerate() {
+        *value = rng.random_range(-1.0_f32..1.0) + ((idx as usize + j) % dim) as f32 * 0.001;
+    }
     let spike = (idx as usize) % dim;
-    v[spike] += 4.0;
-    normalize(&mut v);
-    v
+    destination[spike] += 4.0;
+    normalize(destination);
 }
 
 pub(super) fn normalize(v: &mut [f32]) {
@@ -37,6 +44,9 @@ pub trait VectorSource: Sync {
         self.len() == 0
     }
     fn row(&self, idx: u64) -> Vec<f32>;
+    fn row_into(&self, idx: u64, destination: &mut [f32]) {
+        destination.copy_from_slice(&self.row(idx));
+    }
 }
 
 /// Real float32 embeddings memory-mapped from Calyx `.fbin`.
@@ -61,6 +71,9 @@ impl VectorSource for FbinSource {
     }
     fn row(&self, idx: u64) -> Vec<f32> {
         self.vectors.row(idx).to_vec()
+    }
+    fn row_into(&self, idx: u64, destination: &mut [f32]) {
+        destination.copy_from_slice(self.vectors.row(idx));
     }
 }
 
@@ -100,6 +113,13 @@ impl VectorSource for I8BinSource {
             self.vectors.row_f32_raw(idx)
         }
     }
+    fn row_into(&self, idx: u64, destination: &mut [f32]) {
+        if self.normalize {
+            self.vectors.copy_row_f32_normalized(idx, destination);
+        } else {
+            self.vectors.copy_row_f32_raw(idx, destination);
+        }
+    }
 }
 
 /// Deterministic synthetic rows. Builder-logic unit tests only.
@@ -118,5 +138,23 @@ impl VectorSource for SyntheticSource {
     }
     fn row(&self, idx: u64) -> Vec<f32> {
         gen_row(self.seed, idx, self.dim)
+    }
+    fn row_into(&self, idx: u64, destination: &mut [f32]) {
+        gen_row_into(self.seed, idx, destination);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_row_fill_matches_allocating_api() {
+        let expected = gen_row(42, 7919, 17);
+        let mut actual = vec![f32::NAN; 17];
+
+        gen_row_into(42, 7919, &mut actual);
+
+        assert_eq!(actual, expected);
     }
 }

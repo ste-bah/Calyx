@@ -1,7 +1,17 @@
 #include <math.h>
+#include <stdint.h>
+
+#define POST_FLAG_NONFINITE 1u
+#define POST_FLAG_EMPTY_MASK 2u
+#define POST_FLAG_INVALID_INDEX 4u
+#define POST_FLAG_ZERO_NORM 8u
 
 __device__ __forceinline__ bool finite2(float a, float b) {
     return isfinite(a) && isfinite(b);
+}
+
+__device__ __forceinline__ const float *external_f32_ptr(unsigned long long ptr) {
+    return reinterpret_cast<const float *>(static_cast<uintptr_t>(ptr));
 }
 
 __device__ __forceinline__ void reduce_sums(
@@ -198,6 +208,266 @@ extern "C" __global__ __launch_bounds__(256) void normalize_rows_f32(
 
     for (int i = tid; i < dim; i += blockDim.x) {
         vecs[base + i] = isfinite(scale_shared) ? vecs[base + i] * scale_shared : NAN;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256) void copy_dense_external_f32(
+    unsigned long long values_ptr,
+    int batch,
+    int dim,
+    float *out,
+    unsigned int *flags) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int len = batch * dim;
+    if (idx >= len) {
+        return;
+    }
+    const float *values = external_f32_ptr(values_ptr);
+    const float value = values[idx];
+    if (!isfinite(value)) {
+        atomicOr(flags, POST_FLAG_NONFINITE);
+    }
+    out[idx] = value;
+}
+
+extern "C" __global__ __launch_bounds__(256) void pool_tokens_external_f32(
+    unsigned long long values_ptr,
+    const long long *mask,
+    int batch,
+    int seq,
+    int dim,
+    int policy,
+    float *out,
+    unsigned int *flags) {
+    __shared__ int count_shared;
+    __shared__ int selected_shared;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= batch) {
+        return;
+    }
+
+    if (tid == 0) {
+        int count = 0;
+        int selected = -1;
+        const int mask_base = row * seq;
+        for (int token = 0; token < seq; ++token) {
+            if (mask[mask_base + token] > 0) {
+                if (selected < 0 || policy == 2) {
+                    selected = token;
+                }
+                ++count;
+            }
+        }
+        count_shared = count;
+        selected_shared = selected;
+        if (count == 0 || selected < 0) {
+            atomicOr(flags, POST_FLAG_EMPTY_MASK);
+        }
+    }
+    __syncthreads();
+
+    if (count_shared <= 0 || selected_shared < 0) {
+        return;
+    }
+
+    const float *values = external_f32_ptr(values_ptr);
+    const int token_base = row * seq * dim;
+    const int mask_base = row * seq;
+    const int out_base = row * dim;
+    for (int axis = tid; axis < dim; axis += blockDim.x) {
+        float value = 0.0f;
+        if (policy == 0) {
+            for (int token = 0; token < seq; ++token) {
+                if (mask[mask_base + token] > 0) {
+                    value += values[token_base + token * dim + axis];
+                }
+            }
+            value /= static_cast<float>(count_shared);
+        } else {
+            value = values[token_base + selected_shared * dim + axis];
+        }
+        if (!isfinite(value)) {
+            atomicOr(flags, POST_FLAG_NONFINITE);
+        }
+        out[out_base + axis] = value;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256) void sparse_positive_external_f32(
+    unsigned long long values_ptr,
+    int batch,
+    int dim,
+    unsigned int *indices,
+    float *out,
+    int *counts,
+    unsigned int *flags) {
+    const int axis = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= batch || axis >= dim) {
+        return;
+    }
+
+    const float *values = external_f32_ptr(values_ptr);
+    const float value = values[row * dim + axis];
+    if (!isfinite(value)) {
+        atomicOr(flags, POST_FLAG_NONFINITE);
+        return;
+    }
+    if (value > 0.0f) {
+        const int slot = atomicAdd(&counts[row], 1);
+        indices[row * dim + slot] = static_cast<unsigned int>(axis);
+        out[row * dim + slot] = value;
+    }
+}
+
+// BGE-M3 emits one lexical weight per input token, not a vocabulary-width
+// row.  Compact and max-reduce duplicate token ids entirely on the device.
+// One deterministic worker owns each row so the emitted indices are sorted
+// and stable across CUDA schedules; seq is bounded by the frozen tokenizer
+// contract (512), while the transformer forward dominates this O(seq^2)
+// postprocess.
+extern "C" __global__ void bgem3_sparse_compact_external_f32(
+    unsigned long long values_ptr,
+    const long long *token_ids,
+    const long long *mask,
+    int batch,
+    int seq,
+    int vocab_dim,
+    unsigned int *indices,
+    float *out,
+    int *counts,
+    unsigned int *flags) {
+    const int row = blockIdx.x;
+    if (row >= batch || threadIdx.x != 0) {
+        return;
+    }
+    const float *values = external_f32_ptr(values_ptr);
+    const int base = row * seq;
+    int count = 0;
+    for (int token = 0; token < seq; ++token) {
+        if (mask[base + token] <= 0) {
+            continue;
+        }
+        const long long token_id = token_ids[base + token];
+        if (token_id >= 0 && token_id <= 3) {
+            continue;
+        }
+        if (token_id < 0 || token_id >= vocab_dim) {
+            atomicOr(flags, POST_FLAG_INVALID_INDEX);
+            continue;
+        }
+        const float weight = values[base + token];
+        if (!isfinite(weight)) {
+            atomicOr(flags, POST_FLAG_NONFINITE);
+            continue;
+        }
+        if (weight <= 0.0f) {
+            continue;
+        }
+        const unsigned int id = static_cast<unsigned int>(token_id);
+        int position = 0;
+        while (position < count && indices[base + position] < id) {
+            ++position;
+        }
+        if (position < count && indices[base + position] == id) {
+            out[base + position] = fmaxf(out[base + position], weight);
+            continue;
+        }
+        if (count >= seq) {
+            atomicOr(flags, POST_FLAG_INVALID_INDEX);
+            continue;
+        }
+        for (int move = count; move > position; --move) {
+            indices[base + move] = indices[base + move - 1];
+            out[base + move] = out[base + move - 1];
+        }
+        indices[base + position] = id;
+        out[base + position] = weight;
+        ++count;
+    }
+    counts[row] = count;
+}
+
+extern "C" __global__ __launch_bounds__(256) void colbert_compact_external_f32(
+    unsigned long long values_ptr,
+    const long long *mask,
+    int batch,
+    int seq,
+    int dim,
+    int normalize,
+    float *out,
+    int *counts,
+    unsigned int *flags) {
+    const int token = blockIdx.x;
+    const int row = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (row >= batch || token >= seq) {
+        return;
+    }
+
+    const int mask_base = row * seq;
+    if (token == 0 && tid == 0) {
+        int count = 0;
+        for (int idx = 0; idx < seq; ++idx) {
+            if (mask[mask_base + idx] > 0) {
+                ++count;
+            }
+        }
+        counts[row] = count;
+        if (count == 0) {
+            atomicOr(flags, POST_FLAG_EMPTY_MASK);
+        }
+    }
+
+    if (mask[mask_base + token] <= 0) {
+        return;
+    }
+
+    int ordinal = 0;
+    for (int idx = 0; idx < token; ++idx) {
+        if (mask[mask_base + idx] > 0) {
+            ++ordinal;
+        }
+    }
+
+    const float *values = external_f32_ptr(values_ptr);
+    const int input_base = row * seq * dim + token * dim;
+    const int output_base = row * seq * dim + ordinal * dim;
+    __shared__ float norm_shared[256];
+    float norm_sq = 0.0f;
+    if (normalize) {
+        for (int axis = tid; axis < dim; axis += blockDim.x) {
+            const float value = values[input_base + axis];
+            if (!isfinite(value)) {
+                atomicOr(flags, POST_FLAG_NONFINITE);
+            } else {
+                norm_sq += value * value;
+            }
+        }
+        norm_shared[tid] = norm_sq;
+        __syncthreads();
+        for (int stride = 128; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                norm_shared[tid] += norm_shared[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (!(norm_shared[0] > 0.0f) || !isfinite(norm_shared[0])) {
+            if (tid == 0) {
+                atomicOr(flags, POST_FLAG_ZERO_NORM);
+            }
+            return;
+        }
+    }
+    const float inv_norm = normalize ? rsqrtf(norm_shared[0]) : 1.0f;
+    for (int axis = tid; axis < dim; axis += blockDim.x) {
+        const float value = values[input_base + axis];
+        if (!isfinite(value)) {
+            atomicOr(flags, POST_FLAG_NONFINITE);
+        }
+        out[output_base + axis] = value * inv_norm;
     }
 }
 

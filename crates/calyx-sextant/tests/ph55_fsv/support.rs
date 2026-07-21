@@ -25,8 +25,8 @@ use calyx_sextant::query::{
 use calyx_sextant::{CALYX_INVALID_ARGUMENT, CALYX_PLANNER_COST_CAP};
 use serde_json::{Value, json};
 
-#[path = "../sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use sextant_support::hex;
 
 #[path = "unwired_edges.rs"]

@@ -3,8 +3,8 @@
 #[allow(dead_code, reason = "reuse the feedback controller's durable fixture")]
 #[path = "issue233_feedback/support.rs"]
 mod issue233_feedback_support;
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use std::fs;
 

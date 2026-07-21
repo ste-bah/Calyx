@@ -28,7 +28,9 @@ const PROCESS_RSS_HEADROOM: usize = 64 * 1024 * 1024;
 const SMOKE_RSS_TREND_BYTES_PER_OP_MAX: f64 = 8.0;
 const FULL_RSS_TREND_BYTES_PER_OP_MAX: f64 = 1.0;
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::{env_or_temp_root, reset_dir, temp_root};
 
 #[test]

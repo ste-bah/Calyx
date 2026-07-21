@@ -1,16 +1,20 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use calyx_anneal::{
     AsterMistakeStorage, AsterReplayStorage, CALYX_ANNEAL_INVALID_CAPACITY,
     CALYX_ANNEAL_REPLAY_INVALID_ROW, MistakeLog, MistakeRef, ReplayBuffer, ReplayEntry,
-    ReplayStorage, decode_replay_snapshot, replay_snapshot_key,
+    ReplayStorage, ReplayWrite, decode_replay_snapshot, encode_replay_snapshot,
+    replay_snapshot_key,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{AnchorKind, Clock, CxId, FixedClock, Result};
 use proptest::prelude::*;
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::vault_id;
 
 #[test]
@@ -90,11 +94,17 @@ fn seed_from_log_replays_recent_mistakes_without_log_feedback() {
     log.append(cx(2), 0.7, 0.3, AnchorKind::Reward).unwrap();
     log.append(cx(3), 0.5, 0.5, AnchorKind::Reward).unwrap();
     let log_rows_before = log.readback_recent(10).unwrap().len();
-    let mut buffer = ReplayBuffer::open(MemoryReplayStorage::default(), 2, clock).unwrap();
+    let storage = MemoryReplayStorage::default();
+    let mut buffer = ReplayBuffer::open(storage.clone(), 2, clock).unwrap();
 
     let accepted = buffer.seed_from_log(&log, 3).unwrap();
 
     assert_eq!(accepted, 2);
+    assert_eq!(
+        storage.commit_count(),
+        1,
+        "bulk seed must publish one checkpoint"
+    );
     assert_eq!(buffer.top_surprises(5), vec![0.8, 0.39999999999999997]);
     assert_eq!(
         buffer
@@ -166,14 +176,101 @@ fn aster_storage_writes_cbor_snapshot_under_anneal_replay_cf() {
     let rows = vault
         .scan_cf_at(vault.latest_seq(), ColumnFamily::AnnealReplay)
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].0, replay_snapshot_key());
-    let snapshot = decode_replay_snapshot(&rows[0].1).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|(key, _)| key == b"head/v3"));
+    assert!(
+        rows.iter()
+            .any(|(key, _)| key.starts_with(b"checkpoint/v3/"))
+    );
+    let snapshot = ReplayBuffer::open(
+        AsterReplayStorage::new(&vault),
+        2,
+        Arc::new(FixedClock::new(207)),
+    )
+    .unwrap()
+    .snapshot();
     assert_eq!(snapshot.capacity, 2);
     assert_eq!(snapshot.entries.len(), 1);
     assert_eq!(snapshot.entries[0].cx_id, cx(9));
     assert_eq!(snapshot.entries[0].target, 0.75);
     assert_eq!(snapshot.entries[0].surprise, 0.75);
+}
+
+#[test]
+fn admitted_pushes_append_deltas_rejections_write_nothing_and_checkpoint_reclaims() {
+    let storage = MemoryReplayStorage::default();
+    let mut buffer = ReplayBuffer::open_with_checkpoint_interval(
+        storage.clone(),
+        2,
+        2,
+        Arc::new(FixedClock::new(208)),
+    )
+    .unwrap();
+
+    assert!(buffer.push(entry(1, 0.5, 1)).unwrap());
+    assert_eq!(storage.commit_count(), 1);
+    assert_eq!(storage.row_keys().len(), 2);
+    assert!(buffer.push(entry(2, 0.6, 2)).unwrap());
+    assert_eq!(storage.commit_count(), 2);
+    assert_eq!(storage.row_keys().len(), 3);
+    assert!(!buffer.push(entry(3, 0.1, 3)).unwrap());
+    assert_eq!(storage.commit_count(), 2, "rejected pushes must not write");
+    assert!(buffer.push(entry(4, 0.9, 4)).unwrap());
+    assert_eq!(storage.commit_count(), 3);
+    let keys = storage.row_keys();
+    assert_eq!(
+        keys.len(),
+        2,
+        "checkpoint must reclaim prior live generation"
+    );
+    assert!(keys.iter().any(|key| key == b"head/v3"));
+    assert!(keys.iter().any(|key| key.starts_with(b"checkpoint/v3/")));
+
+    let reopened = ReplayBuffer::open(storage, 2, Arc::new(FixedClock::new(209))).unwrap();
+    assert_eq!(reopened.top_surprises(4), vec![0.9, 0.6]);
+}
+
+#[test]
+fn legacy_v2_snapshot_migrates_atomically_and_missing_delta_fails_closed() {
+    let legacy = MemoryReplayStorage::default();
+    legacy
+        .commit(&[ReplayWrite::Put {
+            key: replay_snapshot_key(),
+            value: encode_replay_snapshot(&calyx_anneal::ReplaySnapshot {
+                capacity: 2,
+                entries: vec![entry(7, 0.7, 7)],
+            })
+            .unwrap(),
+        }])
+        .unwrap();
+    let migrated = ReplayBuffer::open(legacy.clone(), 2, Arc::new(FixedClock::new(210))).unwrap();
+    assert_eq!(migrated.top_surprises(2), vec![0.7]);
+    assert!(!legacy.row_keys().contains(&replay_snapshot_key()));
+    assert_eq!(legacy.row_keys().len(), 2);
+
+    let corrupt = MemoryReplayStorage::default();
+    let mut buffer = ReplayBuffer::open_with_checkpoint_interval(
+        corrupt.clone(),
+        3,
+        10,
+        Arc::new(FixedClock::new(211)),
+    )
+    .unwrap();
+    buffer.push(entry(1, 0.4, 1)).unwrap();
+    buffer.push(entry(2, 0.5, 2)).unwrap();
+    let delta = corrupt
+        .row_keys()
+        .into_iter()
+        .find(|key| key.starts_with(b"delta/v3/"))
+        .unwrap();
+    corrupt
+        .commit(&[ReplayWrite::Delete { key: delta }])
+        .unwrap();
+    let error = ReplayBuffer::open(corrupt, 3, Arc::new(FixedClock::new(212)))
+        .err()
+        .unwrap();
+    assert_eq!(error.code, CALYX_ANNEAL_REPLAY_INVALID_ROW);
+    assert!(error.message.contains("missing delta"));
 }
 
 proptest! {
@@ -194,16 +291,44 @@ proptest! {
 
 #[derive(Clone, Default)]
 struct MemoryReplayStorage {
-    snapshot: Arc<Mutex<Option<Vec<u8>>>>,
+    rows: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    commits: Arc<Mutex<Vec<Vec<ReplayWrite>>>>,
+}
+
+impl MemoryReplayStorage {
+    fn commit_count(&self) -> usize {
+        self.commits.lock().unwrap().len()
+    }
+
+    fn row_keys(&self) -> Vec<Vec<u8>> {
+        self.rows.lock().unwrap().keys().cloned().collect()
+    }
 }
 
 impl ReplayStorage for MemoryReplayStorage {
-    fn load_snapshot(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.snapshot.lock().unwrap().clone())
+    fn scan_rows(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
     }
 
-    fn save_snapshot(&self, value: &[u8]) -> Result<()> {
-        *self.snapshot.lock().unwrap() = Some(value.to_vec());
+    fn commit(&self, writes: &[ReplayWrite]) -> Result<()> {
+        let mut rows = self.rows.lock().unwrap();
+        for write in writes {
+            match write {
+                ReplayWrite::Put { key, value } => {
+                    rows.insert(key.clone(), value.clone());
+                }
+                ReplayWrite::Delete { key } => {
+                    rows.remove(key);
+                }
+            }
+        }
+        self.commits.lock().unwrap().push(writes.to_vec());
         Ok(())
     }
 }

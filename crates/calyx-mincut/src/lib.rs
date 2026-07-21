@@ -25,5 +25,5 @@ pub use scc::{CondensedEdge, CondensedGraph, SccResult, condensate, tarjan_scc};
 pub use spectral::{
     EigenPair, SparseGraph, SpectralCache, SpectralCacheEntry, SpectralCacheKey, SpectralError,
     SpectralResult, eigenvector_centrality, gft_project, gft_reconstruct, laplacian_eigenmaps,
-    laplacian_eigenmaps_with_max_iter, spectral_gap,
+    laplacian_eigenmaps_with_max_iter, normalized_laplacian_eigenmaps_with_max_iter, spectral_gap,
 };

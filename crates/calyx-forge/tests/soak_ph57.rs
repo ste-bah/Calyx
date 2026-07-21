@@ -1,5 +1,3 @@
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,18 +12,16 @@ use calyx_forge::{
 };
 use serde::Serialize;
 
+mod soak_ph57_http;
+
+use soak_ph57_http::{HealthReadback, TeiEndpoint, TeiLoadReadback};
+use soak_ph57_http::{background_tei_load, check_tei_health};
+
 const MIB: usize = 1024 * 1024;
 const GIB: usize = 1024 * MIB;
 const BUDGET_CODE: &str = "CALYX_FORGE_VRAM_BUDGET";
 const MAX_VRAM_MIB: u64 = 31 * 1024;
 const MAX_POWER_W: u32 = 600;
-
-#[derive(Clone, Copy)]
-struct TeiEndpoint {
-    port: u16,
-    path: &'static str,
-    body: &'static str,
-}
 
 const TEI_ENDPOINTS: [TeiEndpoint; 3] = [
     TeiEndpoint {
@@ -59,32 +55,6 @@ struct SoakReadback {
     max_power_draw_w: u32,
     metric_text: String,
     admission_overhead_ns: f64,
-}
-
-#[derive(Clone, Serialize)]
-struct HealthReadback {
-    port: u16,
-    status: u16,
-    latency_ms: f64,
-}
-
-#[derive(Clone, Serialize)]
-struct TeiRequestReadback {
-    port: u16,
-    path: &'static str,
-    status: u16,
-    latency_ms: f64,
-    ok: bool,
-}
-
-#[derive(Clone, Serialize)]
-struct TeiLoadReadback {
-    requested: usize,
-    successes: usize,
-    failures: usize,
-    p50_ms: f64,
-    p99_ms: f64,
-    requests: Vec<TeiRequestReadback>,
 }
 
 #[derive(Serialize)]
@@ -125,19 +95,19 @@ impl BlockDeallocator for NoopDealloc {
 }
 
 #[test]
+#[ignore = "manual GPU-host FSV: requires real TEI services on 8088/8089/8090 and NVIDIA telemetry"]
 fn concurrent_tei_and_forge_soak_writes_readback() -> Result<()> {
     let health = check_tei_health(&[8088, 8089, 8090]);
-    if !health
-        .iter()
-        .any(|item| item.port == 8088 && item.status == 200)
-    {
-        println!("SKIP_PH57_SOAK: TEI :8088 /health not responsive");
-        return Ok(());
-    }
-    assert!(health.iter().all(|item| item.status == 200));
+    assert!(
+        health.iter().all(|item| item.ok),
+        "PH57 FSV requires three real healthy TEI services; expected HTTP 200 from /health on ports 8088, 8089, and 8090, observed {health:#?}"
+    );
 
     let tei_baseline = background_tei_load(100, &TEI_ENDPOINTS);
-    assert_eq!(tei_baseline.failures, 0);
+    assert!(
+        tei_baseline.failures == 0,
+        "PH57 baseline TEI requests failed: {tei_baseline:#?}"
+    );
 
     let samples = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -171,7 +141,10 @@ fn concurrent_tei_and_forge_soak_writes_readback() -> Result<()> {
     let admission_overhead_ns = measure_admission_overhead_ns();
     let metric_text = forge.after.admission_metrics_text();
 
-    assert_eq!(tei_during_forge.failures, 0);
+    assert!(
+        tei_during_forge.failures == 0,
+        "PH57 TEI requests failed during Forge load: {tei_during_forge:#?}"
+    );
     assert!(tei_during_forge.p99_ms <= tei_baseline.p99_ms.max(1.0) * 2.0);
     assert!(forge.after.splits_total + forge.after.failed_total >= 1);
     assert!(forge.after.failed_total >= 1);
@@ -183,7 +156,10 @@ fn concurrent_tei_and_forge_soak_writes_readback() -> Result<()> {
     assert!(max_power_draw_w > 0);
     assert!(max_memory_used_mib <= MAX_VRAM_MIB);
     assert!(max_power_draw_w <= MAX_POWER_W);
-    assert_eq!(one_tei_edge.failures, 0);
+    assert!(
+        one_tei_edge.failures == 0,
+        "PH57 single-endpoint TEI requests failed: {one_tei_edge:#?}"
+    );
     assert!(one_tei_forge.after.failed_total >= 1);
     assert_eq!(one_tei_forge.panics, 0);
     assert_eq!(one_tei_forge.other_errors, 0);
@@ -228,44 +204,6 @@ fn concurrent_tei_and_forge_soak_writes_readback() -> Result<()> {
         readback.admission_overhead_ns
     );
     Ok(())
-}
-
-fn background_tei_load(n: usize, endpoints: &[TeiEndpoint]) -> TeiLoadReadback {
-    let requests = Arc::new(Mutex::new(Vec::with_capacity(n)));
-    thread::scope(|scope| {
-        for idx in 0..n {
-            let endpoint = endpoints[idx % endpoints.len()];
-            let out = Arc::clone(&requests);
-            scope.spawn(move || {
-                let started = Instant::now();
-                let status = http_post(endpoint).unwrap_or(0);
-                let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
-                out.lock().unwrap().push(TeiRequestReadback {
-                    port: endpoint.port,
-                    path: endpoint.path,
-                    status,
-                    latency_ms,
-                    ok: (200..300).contains(&status),
-                });
-            });
-        }
-    });
-    let mut requests = requests.lock().unwrap().clone();
-    requests.sort_by(|a, b| a.latency_ms.total_cmp(&b.latency_ms));
-    let successes = requests.iter().filter(|item| item.ok).count();
-    let failures = requests.len().saturating_sub(successes);
-    let latencies = requests
-        .iter()
-        .map(|item| item.latency_ms)
-        .collect::<Vec<_>>();
-    TeiLoadReadback {
-        requested: n,
-        successes,
-        failures,
-        p50_ms: percentile(&latencies, 0.50),
-        p99_ms: percentile(&latencies, 0.99),
-        requests,
-    }
 }
 
 fn forge_load(n: usize, bytes_per_dispatch: usize) -> ForgeLoadReadback {
@@ -341,54 +279,6 @@ fn classify_outcome(outcome: std::thread::Result<Result<Vec<usize>>>) -> ForgeOu
     }
 }
 
-fn check_tei_health(ports: &[u16]) -> Vec<HealthReadback> {
-    ports
-        .iter()
-        .map(|port| {
-            let started = Instant::now();
-            let status = http_get(*port, "/health").unwrap_or(0);
-            HealthReadback {
-                port: *port,
-                status,
-                latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
-            }
-        })
-        .collect()
-}
-
-fn http_get(port: u16, path: &str) -> std::io::Result<u16> {
-    http_request(port, "GET", path, "")
-}
-
-fn http_post(endpoint: TeiEndpoint) -> std::io::Result<u16> {
-    http_request(endpoint.port, "POST", endpoint.path, endpoint.body)
-}
-
-fn http_request(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<u16> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response_status(&response).unwrap_or(0))
-}
-
-fn response_status(response: &str) -> Option<u16> {
-    response
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
-}
-
 fn start_nvidia_sampler(
     samples: Arc<Mutex<Vec<NvidiaSample>>>,
     stop: Arc<AtomicBool>,
@@ -434,16 +324,6 @@ fn query_nvidia_smi(started: Instant) -> std::io::Result<NvidiaSample> {
         memory_used_mib,
         power_draw_w,
     })
-}
-
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = ((sorted.len() as f64 * p).ceil() as usize)
-        .saturating_sub(1)
-        .min(sorted.len() - 1);
-    sorted[idx]
 }
 
 fn measure_admission_overhead_ns() -> f64 {

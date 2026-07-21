@@ -12,11 +12,14 @@ use calyx_core::{CalyxError, Input, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::config::{MultimodalAdapterConfig, MultimodalAdapterProvider};
+use super::config::{
+    CALYX_MULTIMODAL_ALLOW_CPU_ADAPTER_ENV, MultimodalAdapterConfig, MultimodalAdapterProvider,
+};
 
 const DEFAULT_SHARED_GPU_WORKERS: usize = 4;
 const MAX_SHARED_GPU_WORKERS: usize = 16;
 const GPU_WORKERS_ENV: &str = "CALYX_MULTIMODAL_GPU_WORKERS";
+const CPU_OVERRIDE_REQUIRED_CODE: &str = "CALYX_MULTIMODAL_CPU_OVERRIDE_REQUIRED";
 
 #[derive(Serialize)]
 struct AdapterRequest<'a> {
@@ -110,6 +113,7 @@ pub fn measure_batch(
     inputs: &[Input],
     _worker: &Mutex<Option<AdapterWorker>>,
 ) -> Result<Vec<Vec<f32>>> {
+    ensure_provider_allowed(config)?;
     let request = AdapterRequest {
         config: config.provider.is_gpu().then_some(config.path.as_path()),
         inputs: inputs.iter().map(|input| input.bytes.as_slice()).collect(),
@@ -139,6 +143,33 @@ pub fn measure_batch(
         )));
     }
     Ok(response.vectors)
+}
+
+fn ensure_provider_allowed(config: &MultimodalAdapterConfig) -> Result<()> {
+    if config.provider != MultimodalAdapterProvider::CpuExplicit
+        || env_truthy(CALYX_MULTIMODAL_ALLOW_CPU_ADAPTER_ENV)
+    {
+        return Ok(());
+    }
+    Err(CalyxError {
+        code: CPU_OVERRIDE_REQUIRED_CODE,
+        message: format!(
+            "multimodal adapter {} requested cpu_explicit provider without {CALYX_MULTIMODAL_ALLOW_CPU_ADAPTER_ENV}=1",
+            config.path.display()
+        ),
+        remediation: "use cuda_fail_loud/tensorrt_cuda_fail_loud for production GPU adapters, or set CALYX_MULTIMODAL_ALLOW_CPU_ADAPTER=1 only for an audited CPU-only run",
+    })
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "allow" | "allowed"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl AdapterWorker {

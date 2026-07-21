@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::conditional_mi::{
     ConditionalIndependence, ConditionalMiReport,
     conditional_mutual_information_gaussian_with_alpha,
+    conditional_mutual_information_gaussian_with_alpha_cuda_strict,
 };
-use crate::partial_correlation::pearson;
+use crate::cuda_strict::strict_cuda_requested;
+use crate::partial_correlation::{pearson, pearson_cuda_strict};
 
 pub const DEFAULT_PC_ALPHA: f32 = 0.05;
 
@@ -54,6 +56,9 @@ pub fn pc_stable_gaussian(
     alpha: f32,
     max_conditioning: usize,
 ) -> Result<PcStableReport> {
+    if strict_cuda_requested() {
+        return pc_stable_gaussian_cuda_strict(series, alpha, max_conditioning);
+    }
     validate_pc_inputs(series, alpha, max_conditioning)?;
     let n_vars = series.len();
     let mut adjacent = vec![vec![true; n_vars]; n_vars];
@@ -122,6 +127,88 @@ pub fn pc_stable_gaussian(
     })
 }
 
+/// Strict CUDA Gaussian PC-stable skeleton. This never falls back to CPU.
+pub fn pc_stable_gaussian_cuda_strict(
+    series: &[PcSeries<'_>],
+    alpha: f32,
+    max_conditioning: usize,
+) -> Result<PcStableReport> {
+    pc_stable_gaussian_cuda_strict_impl(series, alpha, max_conditioning)
+}
+
+fn pc_stable_gaussian_cuda_strict_impl(
+    series: &[PcSeries<'_>],
+    alpha: f32,
+    max_conditioning: usize,
+) -> Result<PcStableReport> {
+    validate_pc_inputs(series, alpha, max_conditioning)?;
+    let n_vars = series.len();
+    let mut adjacent = vec![vec![true; n_vars]; n_vars];
+    for (idx, row) in adjacent.iter_mut().enumerate() {
+        row[idx] = false;
+    }
+
+    let mut removed_edges = Vec::new();
+    for depth in 0..=max_conditioning {
+        let snapshot = adjacent.clone();
+        let mut removals = Vec::new();
+        for i in 0..n_vars {
+            for j in (i + 1)..n_vars {
+                if !snapshot[i][j] {
+                    continue;
+                }
+                for conditioning in endpoint_conditioning_sets(&snapshot, i, j, depth) {
+                    let test = gaussian_ci_test_cuda_strict(series, i, j, &conditioning, alpha)?;
+                    if test.independent {
+                        removals.push((i, j, test));
+                        break;
+                    }
+                }
+            }
+        }
+        for (i, j, test) in removals {
+            if adjacent[i][j] {
+                adjacent[i][j] = false;
+                adjacent[j][i] = false;
+                removed_edges.push(PcRemovedEdge {
+                    left: series[i].name.to_string(),
+                    right: series[j].name.to_string(),
+                    conditioning_set: test
+                        .conditioning
+                        .iter()
+                        .map(|&idx| series[idx].name.to_string())
+                        .collect(),
+                    statistic_bits: test.statistic_bits,
+                    p_value: test.p_value,
+                    depth,
+                });
+            }
+        }
+    }
+
+    let mut retained_edges = Vec::new();
+    for i in 0..n_vars {
+        for j in (i + 1)..n_vars {
+            if adjacent[i][j] {
+                retained_edges.push(PcEdge {
+                    left: series[i].name.to_string(),
+                    right: series[j].name.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(PcStableReport {
+        estimator: "gaussian_pc_stable_skeleton_cuda_strict".to_string(),
+        alpha,
+        max_conditioning,
+        n_samples: series[0].values.len(),
+        variables: series.iter().map(|s| s.name.to_string()).collect(),
+        retained_edges,
+        removed_edges,
+    })
+}
+
 struct CiDecision {
     independent: bool,
     conditioning: Vec<usize>,
@@ -163,6 +250,49 @@ fn gaussian_ci_test(
         &controls,
         alpha,
     )?;
+    Ok(CiDecision {
+        independent: report.decision == ConditionalIndependence::Independent,
+        conditioning: conditioning.to_vec(),
+        statistic_bits: report.cmi_bits,
+        p_value: report.p_value,
+    })
+}
+
+fn gaussian_ci_test_cuda_strict(
+    series: &[PcSeries<'_>],
+    left: usize,
+    right: usize,
+    conditioning: &[usize],
+    alpha: f32,
+) -> Result<CiDecision> {
+    if conditioning.is_empty() {
+        let report = pearson_cuda_strict(series[left].values, series[right].values)?;
+        let r = report.r as f64;
+        let unexplained = 1.0 - r * r;
+        if unexplained <= f64::EPSILON {
+            return Ok(CiDecision {
+                independent: false,
+                conditioning: Vec::new(),
+                statistic_bits: f32::INFINITY,
+                p_value: 0.0,
+            });
+        }
+        let bits = (-0.5 * unexplained.ln() / std::f64::consts::LN_2) as f32;
+        return Ok(CiDecision {
+            independent: report.p_value >= alpha,
+            conditioning: Vec::new(),
+            statistic_bits: bits,
+            p_value: report.p_value,
+        });
+    }
+    let controls: Vec<&[f32]> = conditioning.iter().map(|&idx| series[idx].values).collect();
+    let report: ConditionalMiReport =
+        conditional_mutual_information_gaussian_with_alpha_cuda_strict(
+            series[left].values,
+            series[right].values,
+            &controls,
+            alpha,
+        )?;
     Ok(CiDecision {
         independent: report.decision == ConditionalIndependence::Independent,
         conditioning: conditioning.to_vec(),

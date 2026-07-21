@@ -1,5 +1,8 @@
 use std::fs;
 
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{BoostConfig, CALYX_TEMPORAL_AP60_VIOLATION, DecayFunction, LedgerRef};
 use calyx_sextant::{
     FreshnessTag, FusionWeights, Hit, PeriodicOptions, ProvenanceSource, TemporalFixedClock,
@@ -7,9 +10,6 @@ use calyx_sextant::{
     temporal_search_from_primary, temporal_search_pipeline, validate_primary_temporal_weight,
 };
 use serde_json::json;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
 use sextant_support::{
     cx_u8_fill as cx, fsv_root, reset_dir, write_json, write_root_file_blake3_sums,
 };

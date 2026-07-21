@@ -6,6 +6,7 @@ use crate::compaction::{
 };
 use crate::gc::{GcRateLimit, GcResult, SnapshotGcTick};
 use crate::mvcc::Snapshot;
+use crate::sst::invalidate_reader;
 use crate::storage_names::{classify_sst, sst_order_key};
 use crate::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Result};
@@ -149,6 +150,10 @@ fn reclaim_snapshot_inputs(report: &crate::compaction::CompactionReport) -> Resu
         if classify_sst(&input)?.is_none() {
             continue;
         }
+        // Drop any cached shared reader before deleting: an active mapping keeps
+        // DeleteFile failing on Windows (fail-closed), so invalidation shrinks
+        // that window to reads still holding a clone in flight.
+        invalidate_reader(&input);
         fs::remove_file(&input).map_err(|error| {
             CalyxError::disk_pressure(format!(
                 "reclaim snapshot GC input {}: {error}",

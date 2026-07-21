@@ -27,8 +27,8 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde_json::json;
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 use support::{named_fsv_root, reset_dir, write_blake3sums, write_json};
 
 fn gaussian(rng: &mut ChaCha8Rng) -> f32 {

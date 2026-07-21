@@ -208,7 +208,9 @@ fn issue919_vector_fusion_fails_closed_with_persisted_candidates() {
 }
 
 fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || PathBuf::from("target").join("fsv"))
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue919-vector-fusion", || {
+        PathBuf::from("target").join("fsv")
+    })
 }
 
 fn put_dense(vault: &AsterVault, input: &[u8], seq: u64, data: [f32; 2]) -> CxId {

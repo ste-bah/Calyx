@@ -14,12 +14,13 @@ use calyx_ledger::{ActorId, EntryKind, LedgerAppender, decode as decode_ledger};
 use calyx_registry::Registry;
 use serde_json::{Value, json};
 
-#[path = "support/propose_lens.rs"]
-#[allow(dead_code)]
-mod support;
+// calyx-shared-module: path=support/propose_lens.rs alias=__calyx_shared_support_propose_lens_rs local=support visibility=private
+use crate::__calyx_shared_support_propose_lens_rs as support;
 use support::*;
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::{
     ManifestPathStyle, reset_dir, vault_id, write_json, write_physical_size_list,
     write_tree_manifest,

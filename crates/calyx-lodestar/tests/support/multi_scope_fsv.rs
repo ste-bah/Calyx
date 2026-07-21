@@ -13,7 +13,7 @@ use calyx_paths::AssocGraph;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::real_corpora::{
+use super::real_corpora::{
     CorpusCase, STAMP,
     recall_tuning::{RecallTuningReport, tuning_report},
     write_json,

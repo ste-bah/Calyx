@@ -1,0 +1,112 @@
+{
+  "format": "calyx-cuyahoga-citecheck-fixture-v1",
+  "brief_sha256": "90d861377d0da880316399d613245a647e1cb178dcac604121d9e3b9cc765312",
+  "citations": [
+    {
+      "citation_id": "C01",
+      "citation_text": "Cleveland v. McCruel, 8th Dist. Cuyahoga No. 103971, 2017-Ohio-182.",
+      "case_name": "Cleveland v. McCruel",
+      "docket_number": "103971",
+      "proposition": "An order placing a defendant in a statutory pretrial-diversion program is immediately appealable when it affects the state's substantial right to complete the prosecution.",
+      "reviewed_class": "supported",
+      "target_opinion_id": "4117067"
+    },
+    {
+      "citation_id": "C02",
+      "citation_text": "State v. Slater, 8th Dist. Cuyahoga No. 101358, 2014-Ohio-5552.",
+      "case_name": "State v. Slater",
+      "docket_number": "101358",
+      "proposition": "A presentence plea-withdrawal request may be denied when a knowing and voluntary plea is followed only by a change of heart.",
+      "reviewed_class": "supported",
+      "target_opinion_id": "2762313"
+    },
+    {
+      "citation_id": "C03",
+      "citation_text": "State v. Torres, 8th Dist. Cuyahoga No. 111037, 2022-Ohio-3230.",
+      "case_name": "State v. Torres",
+      "docket_number": "111037",
+      "proposition": "Newly discovered evidence warrants a new trial only when it creates a strong probability of changing the result and satisfies the remaining Petro factors.",
+      "reviewed_class": "supported",
+      "target_opinion_id": "8206604"
+    },
+    {
+      "citation_id": "C04",
+      "citation_text": "State v. Harrowfield, 8th Dist. Cuyahoga No. 113947, 2024-Ohio-4871.",
+      "case_name": "State v. Harrowfield",
+      "docket_number": "113947",
+      "proposition": "Police must obtain a second warrant before viewing any cloud backup synchronized after a phone is seized.",
+      "reviewed_class": "fabricated"
+    },
+    {
+      "citation_id": "C05",
+      "citation_text": "State v. Wachee, 8th Dist. Cuyahoga No. 110117, 2021-Ohio-4427.",
+      "case_name": "State v. Wachee",
+      "docket_number": "110117",
+      "proposition": "An App.R. 26(B) applicant must support proposed errors with record-based facts showing a genuine, colorable claim of ineffective appellate assistance.",
+      "reviewed_class": "supported",
+      "target_opinion_id": "5136011"
+    },
+    {
+      "citation_id": "C06",
+      "citation_text": "State v. Burton, 8th Dist. Cuyahoga No. 107054, 2019-Ohio-2431.",
+      "case_name": "State v. Burton",
+      "docket_number": "107054",
+      "proposition": "Counsel's failure to file a suppression motion is not automatically deficient; the record must show that the motion had a reasonable probability of success.",
+      "reviewed_class": "supported",
+      "target_opinion_id": "4408729"
+    },
+    {
+      "citation_id": "C07",
+      "citation_text": "State v. Mercer-Lane, 8th Dist. Cuyahoga No. 112608, 2023-Ohio-4412.",
+      "case_name": "State v. Mercer-Lane",
+      "docket_number": "112608",
+      "proposition": "Kidnapping and a sexual offense merge categorically whenever they occur during the same encounter.",
+      "reviewed_class": "fabricated"
+    },
+    {
+      "citation_id": "C08",
+      "citation_text": "State v. Radney, 8th Dist. Cuyahoga No. 103869, 2016-Ohio-5328.",
+      "case_name": "State v. Radney",
+      "docket_number": "103869",
+      "proposition": "Kidnapping under R.C. 2905.01(A)(4) is mitigated to a second-degree felony when the accused proves the victim was released in a safe place unharmed.",
+      "reviewed_class": "supported",
+      "target_opinion_id": "4023653"
+    },
+    {
+      "citation_id": "C09",
+      "citation_text": "State v. Delvallie, 8th Dist. Cuyahoga No. 109315, 2022-Ohio-470.",
+      "case_name": "State v. Delvallie",
+      "docket_number": "109315",
+      "proposition": "A defendant must prove beyond a reasonable doubt that the Reagan Tokes statutory framework violates due process or the separation-of-powers doctrine.",
+      "reviewed_class": "supported",
+      "target_opinion_id": "6227032"
+    },
+    {
+      "citation_id": "C10",
+      "citation_text": "State v. Anderson, 8th Dist. Cuyahoga No. 112514, 2024-Ohio-843.",
+      "case_name": "State v. Anderson",
+      "docket_number": "112514",
+      "proposition": "Consecutive sentences are contrary to law when the trial court fails to make the proportionality finding required by R.C. 2929.14(C)(4).",
+      "reviewed_class": "supported",
+      "target_opinion_id": "9948768"
+    },
+    {
+      "citation_id": "C11",
+      "citation_text": "State v. Burton, 8th Dist. Cuyahoga No. 114052, 2025-Ohio-650.",
+      "case_name": "State v. Burton",
+      "docket_number": "114052",
+      "proposition": "When postrelease-control notice was correctly given at the hearing but misstated in the journal entry, a nunc pro tunc entry may correct the clerical error.",
+      "reviewed_class": "supported",
+      "target_opinion_id": "10813355"
+    },
+    {
+      "citation_id": "C12",
+      "citation_text": "State v. Bonnell, 8th Dist. Cuyahoga No. 96368, 2011-Ohio-5837.",
+      "case_name": "State v. Bonnell",
+      "docket_number": "96368",
+      "proposition": "Ohio recognizes entrapment whenever a confidential informant initiates contact with the accused.",
+      "reviewed_class": "low_support",
+      "target_opinion_id": "2704114"
+    }
+  ]
+}

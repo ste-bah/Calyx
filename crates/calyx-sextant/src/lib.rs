@@ -1,7 +1,7 @@
 //! Sextant search and navigation for Calyx retrieval.
 
-/// True when this build compiled the cuVS GPU index paths (cagra graph build
-/// and brute-force parity): the `cuda` feature was enabled on a target where
+/// True when this build compiled the cuVS GPU index paths (CAGRA graph build,
+/// DiskANN PQ build, and brute-force parity): the `cuda` feature was enabled on a target where
 /// libcuvs exists (Linux, `cfg(sextant_cuvs)` from build.rs). Exported for
 /// build-info capability readback (#1130) — deploy gates must assert this
 /// resolved value, never a feature spelling, because a top-level feature name
@@ -46,7 +46,8 @@ pub use error::{
     CALYX_INDEX_KERNEL_UNAVAILABLE, CALYX_INVALID_ARGUMENT, CALYX_LENS_NOT_FOUND,
     CALYX_PLANNER_COST_CAP, CALYX_SEXTANT_ASSOC_GRAPH_MISSING,
     CALYX_SEXTANT_CONSENSUS_INSUFFICIENT_LENSES, CALYX_SEXTANT_CX_MISSING,
-    CALYX_SEXTANT_DIM_MISMATCH, CALYX_SEXTANT_EF_TOO_SMALL, CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE,
+    CALYX_SEXTANT_DIM_MISMATCH, CALYX_SEXTANT_EF_TOO_SMALL, CALYX_SEXTANT_GPU_CACHE_EXHAUSTED,
+    CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE, CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE,
     CALYX_SEXTANT_GRAPH_HOP_KIND_UNKNOWN, CALYX_SEXTANT_INDEX_EMPTY, CALYX_SEXTANT_NO_LENSES,
     CALYX_SEXTANT_PLAN_COST_EXCEEDED, CALYX_SEXTANT_PLAN_UNBOUNDED, CALYX_SEXTANT_POSTINGS_CORRUPT,
     CALYX_SEXTANT_POSTINGS_NOT_SORTED, CALYX_SEXTANT_PROVENANCE_MISSING, CALYX_SEXTANT_QUERY_SHAPE,
@@ -63,25 +64,28 @@ pub use error::{
 pub use fusion::{FusionContext, FusionStrategy, RrfProfile, WeightedProfile, weighted_profiles};
 pub use guarded::{GuardedSearchReport, apply_in_region_guard_to_hits};
 pub use hit::{
-    DroppedGuardHit, FreshnessTag, Hit, HitGuardEvidence, HitGuardMode, PerLensContribution,
-    ProvenanceSource,
+    DroppedGuardHit, FreshnessTag, Hit, HitGuardEvidence, HitGuardMode, HitRerankEvidence,
+    HitRerankMethod, PerLensContribution, ProvenanceSource,
 };
 pub use index::{
     BwPostcutoffAnnealRegistry, BwPostcutoffConfig, BwPostcutoffTuner, Direction, DirectionalBoost,
     DualDiskAnnSearch, DualIndex, FUNNEL_MIN_VAULT_SIZE, FinalCxSearch, FunnelHit, FunnelParams,
     FunnelPath, HnswIndex, IndexSearchHit, IndexStats, InvertedIndex, KernelFirstSearch,
-    KernelRegion, KernelRegionAnn, KernelRegionId, LocalCxId, MaxSimIndex, PostingListReader,
+    KernelRegion, KernelRegionAnn, KernelRegionId, LocalCxId, MAXSIM_CUDA_MAX_K, MaxSimCudaChunk,
+    MaxSimCudaReport, MaxSimCudaRequest, MaxSimCudaTopK, MaxSimIndex, PostingListReader,
     PostingListWriter, PostingMember, QuantConfig, QuantKind, RegionCandidate, RegionId,
     RegionPartitions, SPANN_CENTROID_MAGIC, SextantIndex, SpannCentroidIndex, SpannSearch,
+    SparseBm25CudaIndex, SparseBm25CudaReport, SparseBm25CudaRequest, SparseBm25CudaTopK,
     SyntheticVault, TuneDirection, TunerAdjustment, TunerAdjustmentKind, TunerConfig,
     TunerLedgerEntry, TunerObservation, TunerRange, TunerWarning, build_centroids, build_dual,
-    build_dual_with_search, build_synthetic_vault, dual_graph_path, open_dual,
-    register_with_anneal, synthetic_dense_rows,
+    build_dual_with_search, build_synthetic_vault, dual_graph_path, maxsim_cuda_topk, open_dual,
+    register_with_anneal, sparse_bm25_cuda_topk, synthetic_dense_rows,
 };
 pub use navigation::{
-    ConsensusHit, ConsensusMode, ConsensusReport, LensComparison, MAX_TRAVERSE_HOPS, SkillNode,
-    SkillParams, SkillTree, SlotCosine, TraverseDirection, TraversePath, TraverseStep, agree,
-    compare_lenses, define, disagree, neighbors, search_skill, skills, traverse, traverse_graph,
+    ConsensusHit, ConsensusMode, ConsensusReport, LensComparison, MAX_TRAVERSE_HOPS,
+    SkillExecutionBackend, SkillExecutionStats, SkillNode, SkillParams, SkillTree, SlotCosine,
+    TraverseDirection, TraversePath, TraverseStep, agree, compare_lenses, define, disagree,
+    neighbors, search_skill, skills, traverse, traverse_graph,
 };
 pub use planner::{IntentLabel, PlanLimits, PlannedQuery, QueryPlanner};
 pub use planner_explain::PlannerExplain;

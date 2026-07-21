@@ -94,6 +94,51 @@ fn invalid_shape_and_nonfinite_inputs_fail_closed() {
 }
 
 #[test]
+fn zero_norm_inputs_fail_closed_for_positive_beta() {
+    let mut zero_query = [0.0, 0.0];
+    let member = [1.0, 0.0];
+    let query_error = descend(
+        &mut zero_query,
+        &[&member],
+        DEFAULT_BETA,
+        MAX_STEPS,
+        DEFAULT_EPS,
+    )
+    .expect_err("zero query");
+    assert_eq!(query_error.code(), "CALYX_FORGE_NUMERICAL_INVARIANT");
+
+    let mut query = [1.0, 0.0];
+    let zero_member = [0.0, 0.0];
+    let member_error = descend(
+        &mut query,
+        &[&zero_member],
+        DEFAULT_BETA,
+        MAX_STEPS,
+        DEFAULT_EPS,
+    )
+    .expect_err("zero member");
+    assert_eq!(member_error.code(), "CALYX_FORGE_NUMERICAL_INVARIANT");
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn large_region_requires_cuda_without_host_scan() {
+    let dim = 512_usize;
+    let members = (0..513).map(|_| vec![1.0; dim]).collect::<Vec<_>>();
+    let member_refs = members.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut query = vec![1.0; dim];
+    let error = descend(
+        &mut query,
+        &member_refs,
+        DEFAULT_BETA,
+        MAX_STEPS,
+        DEFAULT_EPS,
+    )
+    .expect_err("large CPU fallback must be disabled");
+    assert_eq!(error.code(), CALYX_ORACLE_ENERGY_CUDA_REQUIRED);
+}
+
+#[test]
 fn beta_lookup_uses_tuned_value_or_default() {
     struct Fixture;
     impl AnnealConfig for Fixture {

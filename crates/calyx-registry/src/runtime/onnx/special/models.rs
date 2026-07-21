@@ -4,7 +4,7 @@ use calyx_core::{CalyxError, Result, SlotShape};
 use fastembed::{Bgem3Model, RerankerModel, SparseModel};
 
 use crate::frozen::NormPolicy;
-use crate::spec::FastembedBgem3Output;
+use crate::spec::{Bgem3Engine, FastembedBgem3Output};
 
 pub(super) const BGE_M3_DENSE_DIM: u32 = 1024;
 pub(super) const BGE_M3_SPARSE_DIM: u32 = 250_002;
@@ -42,11 +42,17 @@ pub(super) fn bgem3_corpus_token(output: FastembedBgem3Output) -> &'static [u8] 
     }
 }
 
-pub(super) fn bgem3_runtime_name(output: FastembedBgem3Output) -> &'static str {
-    match output {
-        FastembedBgem3Output::Dense => "fastembed-bgem3-dense",
-        FastembedBgem3Output::Sparse => "fastembed-bgem3-sparse",
-        FastembedBgem3Output::Colbert => "fastembed-bgem3-colbert",
+pub(super) fn bgem3_runtime_name(
+    output: FastembedBgem3Output,
+    engine: Bgem3Engine,
+) -> &'static str {
+    match (engine, output) {
+        (Bgem3Engine::FastembedCpu, FastembedBgem3Output::Dense) => "fastembed-bgem3-dense",
+        (Bgem3Engine::FastembedCpu, FastembedBgem3Output::Sparse) => "fastembed-bgem3-sparse",
+        (Bgem3Engine::FastembedCpu, FastembedBgem3Output::Colbert) => "fastembed-bgem3-colbert",
+        (Bgem3Engine::OnnxCuda, FastembedBgem3Output::Dense) => "onnx-bgem3-dense",
+        (Bgem3Engine::OnnxCuda, FastembedBgem3Output::Sparse) => "onnx-bgem3-sparse",
+        (Bgem3Engine::OnnxCuda, FastembedBgem3Output::Colbert) => "onnx-bgem3-colbert",
     }
 }
 

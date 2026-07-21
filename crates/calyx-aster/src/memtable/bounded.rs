@@ -1,6 +1,7 @@
 use crate::sst::{self, SstSummary};
 use calyx_core::{CalyxError, Result, Seq};
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -176,6 +177,28 @@ impl BoundedMemtable {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         }
+    }
+
+    /// Returns the greatest entry in `[start, upper]` (or `[start, upper)`).
+    pub(crate) fn predecessor(
+        &self,
+        start: &[u8],
+        upper: &[u8],
+        inclusive: bool,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let upper = if inclusive {
+            Bound::Included(upper.to_vec())
+        } else {
+            Bound::Excluded(upper.to_vec())
+        };
+        entries
+            .range((Bound::Included(start.to_vec()), upper))
+            .next_back()
+            .map(|(key, value)| (key.clone(), value.clone()))
     }
 
     /// Flushes the current memtable snapshot into an immutable SSTable.

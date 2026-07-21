@@ -4,7 +4,7 @@ mod anchor_codec;
 mod anchor_compact;
 mod anchor_merge;
 mod batch_ingest;
-mod cf_codec;
+pub(crate) mod cf_codec;
 mod commit;
 mod compaction_bridge;
 pub mod context;
@@ -15,6 +15,7 @@ pub mod encode;
 mod gc_bridge;
 pub mod grant;
 mod htap;
+mod ingest_precondition;
 mod input_pointer;
 mod key;
 pub mod keyspace;
@@ -23,6 +24,7 @@ mod ledger_anchor_batch;
 mod ledger_append;
 mod ledger_hook;
 mod open;
+mod prepared;
 pub mod quota;
 mod retention_horizon;
 mod router_bridge;
@@ -33,9 +35,9 @@ mod slot_column;
 mod snapshot_lease;
 mod store;
 mod temporal_xterm;
+use crate::cf::{CfRouter, ColumnFamily, KeyRange};
 #[cfg(test)]
-use crate::cf::ledger_key;
-use crate::cf::{CfRouter, ColumnFamily, KeyRange, anchor_key, base_key, slot_key};
+use crate::cf::{anchor_key, base_key, ledger_key};
 use crate::dedup::DedupPolicy;
 use crate::mvcc::{Freshness, ReadBarrier, Snapshot, VersionedCfStore};
 use crate::resource::{ResourceStatus, VramBudgetStatus, collect_resource_status};
@@ -53,17 +55,26 @@ pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
 pub use htap::HtapDualRead;
+pub use ingest_precondition::{
+    CALYX_INGEST_PRECONDITION_FAILED, CALYX_INGEST_PRECONDITION_INVALID, IngestPrecondition,
+    IngestPreconditionClaim, IngestPreconditionContext, IngestVaultState,
+};
 pub use input_pointer::{CALYX_INPUT_POINTER_IDENTITY_MISMATCH, InputPointerBackfill};
 pub use key::{CALYX_DECRYPTION_FAILED, CALYX_ENCRYPTION_FAILED, CALYX_VAULT_KEY_MISSING};
 pub use keyspace::{
     CALYX_VAULT_KEYSPACE_MISMATCH, KeyspaceGuard, VaultWriteLock, VaultWriteLockGuard, vault_prefix,
 };
+pub use layer_commit::CfLedgerEntry;
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,
     read_materialized_slot_column,
 };
-pub use {context::VaultContext, durable::VaultOptions};
+pub use store::{PutDisposition, PutOutcome};
+pub use {
+    context::VaultContext,
+    durable::{RecoveryProgressHook, VaultOptions},
+};
 
 /// Wall-clock lifetime of a bounded reader lease. A lease is pinned at the
 /// start of a read/scan and re-checked (against SystemClock) on each access, so
@@ -384,33 +395,27 @@ where
         )
     }
 
+    /// Reads the greatest visible raw CF row in `[start, upper]` at `snapshot`.
+    pub fn predecessor_cf_at(
+        &self,
+        snapshot: Seq,
+        cf: ColumnFamily,
+        start: &[u8],
+        upper: &[u8],
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let snapshot = self.snapshot_handle(snapshot);
+        self.rows
+            .predecessor_cf_at(snapshot.snapshot(), cf, start, upper, &self.clock)
+    }
+
     pub(super) fn stage_constellation_rows(
         &self,
         rows: &mut Vec<encode::WriteRow>,
         constellation: &Constellation,
     ) -> Result<()> {
         constellation.validate_schema()?;
-        let id = constellation.cx_id;
-        rows.push(encode::WriteRow {
-            cf: ColumnFamily::Base,
-            key: base_key(id),
-            value: encode::encode_constellation_base(constellation)?,
-        });
-        for (slot, vector) in &constellation.slots {
-            rows.push(encode::WriteRow {
-                cf: ColumnFamily::slot(*slot),
-                key: slot_key(id),
-                value: encode::encode_slot_vector(vector)?,
-            });
-        }
-        for anchor in &constellation.anchors {
-            rows.push(encode::WriteRow {
-                cf: ColumnFamily::Anchors,
-                key: anchor_key(id, &anchor.kind),
-                value: encode::encode_anchor(anchor)?,
-            });
-        }
-        Ok(())
+        let prepared = prepared::PreparedConstellationEncoding::new(constellation)?;
+        prepared::stage_validated_constellation_rows(rows, constellation, prepared)
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -485,29 +490,31 @@ where
 }
 
 #[cfg(test)]
+mod anchor_merge_tests;
+#[cfg(test)]
 mod compaction_tests;
-
 #[cfg(test)]
-mod recovery_stranding_tests;
+#[path = "vault/encode_tests.rs"]
+mod encode_tests;
 #[cfg(test)]
-mod seq_domain_tests;
-
+mod ledger_atomicity_tests;
 #[cfg(test)]
-mod recovery_tests;
-
+mod ledger_checkpoint_tests;
 #[cfg(test)]
 mod ledger_integration_tests;
 #[cfg(test)]
 mod ledger_timestamp_tests;
-
 #[cfg(test)]
-mod ledger_atomicity_tests;
-
+mod recovery_stranding_tests;
 #[cfg(test)]
-mod ledger_checkpoint_tests;
-
+mod recovery_tests;
 #[cfg(test)]
-mod anchor_merge_tests;
-
+mod seq_domain_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod issue1547_tests;
+#[cfg(test)]
+#[path = "vault/issue1799_tests.rs"]
+mod issue1799_tests;

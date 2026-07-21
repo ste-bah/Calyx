@@ -1,15 +1,14 @@
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     CALYX_TRIPWIRE_INVALID_CONFIG, CALYX_TRIPWIRE_INVALID_METRIC, TripwireMetric, TripwireRegistry,
     TripwireResult, tripwire_config_path,
 };
 use fsv_support::{write_json, write_manifest};
 use serde_json::json;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
 
 #[test]
 #[ignore = "requires CALYX_ISSUE394_FSV_ROOT in a manual verification run"]

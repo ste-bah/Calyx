@@ -16,7 +16,7 @@ use calyx_poly::{
 };
 use serde_json::{Value, json};
 
-use crate::support::{reset_dir, write_json};
+use super::support::{reset_dir, write_json};
 
 const VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SALT: &[u8] = b"poly-issue233-feedback-controller";

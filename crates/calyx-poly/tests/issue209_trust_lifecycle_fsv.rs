@@ -25,10 +25,10 @@ use calyx_poly::panel_diagnostics::{
 use calyx_poly::risk::MarketIntegrityScreen;
 use serde_json::json;
 
-#[path = "fsv_support.rs"]
-mod support;
-#[path = "synthetic_panels.rs"]
-mod synthetic;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
+// calyx-shared-module: path=synthetic_panels.rs alias=__calyx_shared_synthetic_panels_rs local=synthetic visibility=private
+use crate::__calyx_shared_synthetic_panels_rs as synthetic;
 
 use support::{
     known_healthy_market_integrity, known_healthy_oracle_risk, known_healthy_wash_trade,

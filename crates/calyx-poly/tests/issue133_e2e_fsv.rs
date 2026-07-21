@@ -9,8 +9,8 @@ use calyx_poly::pipeline::{ground_market, ingest_snapshot};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 mod issue133_support;
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 use issue133_support::{Prediction, ScenarioError, outcome_anchor, scalar};
 use support::{
     collect_files, hex, known_healthy_market_integrity, known_healthy_oracle_risk,

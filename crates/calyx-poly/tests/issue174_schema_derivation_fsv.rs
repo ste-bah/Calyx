@@ -407,14 +407,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn unique_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("target/fsv")
-        .join(format!(
-            "issue174_schema_derivation_test_{}_{}",
-            std::process::id(),
-            now_ms()
-        ))
+    let run = format!(
+        "issue174_schema_derivation_test_{}_{}",
+        std::process::id(),
+        now_ms()
+    );
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue174-schema-derivation", || {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("target/fsv/issue174-schema-derivation")
+    })
+    .join(run)
 }
 
 fn now_ms() -> u128 {

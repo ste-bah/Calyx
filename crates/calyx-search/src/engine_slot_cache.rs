@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::engine::{GuardChoice, SearchFreshness};
-use crate::engine_measure::slot_vector_shape;
+use crate::engine_slot_fanout::search_slots_uncached;
 use crate::engine_trace::SearchTracer;
 use crate::error::{CliError, CliResult};
 use crate::persisted::PersistedSearchIndexes;
 
-const CACHE_KEY_SCHEMA: &str = "calyx-search-slot-cache-key-v1";
+const CACHE_KEY_SCHEMA: &str = "calyx-search-slot-cache-key-v2-staged-multi";
 const CACHE_KEY_ERROR: &str = "CALYX_SEARCH_SLOT_CACHE_KEY_INCOMPLETE";
 const CACHE_KEY_REMEDIATION: &str = "include vault path, manifest fingerprint, freshness policy, guard, candidate universe, selected slots, search_k, and measured query vector hashes before reusing slot search results";
 const DEFAULT_MAX_ENTRIES: usize = 128;
@@ -264,48 +264,6 @@ pub(crate) fn search_slots_with_cache(
         },
     );
     Ok(per_slot)
-}
-
-type SlotHitsWithLatency = (
-    BTreeMap<SlotId, Vec<IndexSearchHit>>,
-    BTreeMap<SlotId, u128>,
-);
-
-fn search_slots_uncached(
-    indexes: &PersistedSearchIndexes,
-    query_vectors: &[(SlotId, SlotVector)],
-    k: usize,
-    filter_candidates: Option<&BTreeSet<CxId>>,
-    trace: &mut SearchTracer<'_>,
-) -> CliResult<SlotHitsWithLatency> {
-    let mut out = BTreeMap::new();
-    let mut elapsed_by_slot = BTreeMap::new();
-    for (slot, query) in query_vectors {
-        trace.emit_detail(
-            "search_slot.start",
-            Some(*slot),
-            Some(k),
-            Some(slot_vector_shape(query)),
-        );
-        let started = Instant::now();
-        let hits = if let Some(candidates) = filter_candidates {
-            indexes.search_filtered(*slot, query, k, candidates)?
-        } else {
-            indexes.search(*slot, query, k)?
-        };
-        let slot_elapsed_ms = started.elapsed().as_millis();
-        elapsed_by_slot.insert(*slot, slot_elapsed_ms);
-        trace.emit_detail(
-            "search_slot.done",
-            Some(*slot),
-            Some(hits.len()),
-            Some(format!("slot_elapsed_ms={slot_elapsed_ms}")),
-        );
-        if !hits.is_empty() {
-            out.insert(*slot, hits);
-        }
-    }
-    Ok((out, elapsed_by_slot))
 }
 
 impl SearchSlotCacheKey {

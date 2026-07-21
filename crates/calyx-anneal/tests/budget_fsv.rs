@@ -1,10 +1,5 @@
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     BACKGROUND_NICE, BudgetConfig, BudgetEnforcer, BudgetProbe, BudgetProbeSample, BudgetStatus,
     CALYX_ANNEAL_BUDGET_EXHAUSTED, CALYX_ANNEAL_BUDGET_NVML_UNAVAILABLE, budget_config_path,
@@ -13,6 +8,10 @@ use calyx_anneal::{
 use calyx_core::FixedClock;
 use fsv_support::{write_json, write_manifest};
 use serde_json::json;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 const FSV_TS: u64 = 1_785_500_397;
 const MIB: u64 = 1024 * 1024;

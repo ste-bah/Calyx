@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "calyx-ledger"
 version.workspace = true
 edition.workspace = true
@@ -19,3 +20,11 @@ ulid.workspace = true
 calyx-fsv = { path = "../calyx-fsv" }
 calyx-testkit = { path = "../calyx-testkit" }
 proptest.workspace = true
+
+# BEGIN generated integration harnesses (issue #1546)
+
+[[test]]
+name = "__calyx_integration_suite_0"
+path = "tests/__calyx_integration_suite_0.rs"
+
+# END generated integration harnesses (issue #1546)

@@ -5,7 +5,7 @@
 //! the engine's own audit log + fired-event queue. The `EventRecurs` condition
 //! is driven by REAL appended occurrences — no mocked counts.
 //!
-//! Run: `cargo test -p calyx-loom --test issue572_reactive_fsv -- --nocapture`.
+//! Run: `cargo test -p calyx-loom --test __calyx_integration_isolated_issue572_reactive_fsv issue572_reactive_fsv -- --nocapture`.
 
 use std::collections::BTreeMap;
 use std::fs;

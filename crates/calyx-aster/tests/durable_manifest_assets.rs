@@ -14,7 +14,9 @@ use calyx_core::{
 };
 use serde_json::{Value, json};
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::named_fsv_root_os;
 
 #[test]

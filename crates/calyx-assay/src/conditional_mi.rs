@@ -9,7 +9,9 @@
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::partial_correlation::{PartialReport, partial_correlation_controlling};
+use crate::partial_correlation::{
+    PartialReport, partial_correlation_controlling, partial_correlation_controlling_cuda_strict,
+};
 
 pub const DEFAULT_CMI_ALPHA: f32 = 0.05;
 pub const GAUSSIAN_CMI_FORMULA: &str = "-0.5 * log2(1 - partial_r^2)";
@@ -56,6 +58,22 @@ pub fn conditional_mutual_information_gaussian_with_alpha(
         )));
     }
     let partial = partial_correlation_controlling(x, y, controls)?;
+    gaussian_cmi_from_partial(partial, alpha)
+}
+
+/// Strict CUDA Gaussian CMI. This never falls back to CPU.
+pub fn conditional_mutual_information_gaussian_with_alpha_cuda_strict(
+    x: &[f32],
+    y: &[f32],
+    controls: &[&[f32]],
+    alpha: f32,
+) -> Result<ConditionalMiReport> {
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "Gaussian CMI alpha must be in (0,1); got {alpha}"
+        )));
+    }
+    let partial = partial_correlation_controlling_cuda_strict(x, y, controls)?;
     gaussian_cmi_from_partial(partial, alpha)
 }
 

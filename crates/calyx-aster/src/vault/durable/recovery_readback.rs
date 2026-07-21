@@ -1,10 +1,10 @@
 use super::super::encode::WriteRow;
 use super::{RecoveredBatch, storage_error};
 use crate::compaction::TieringPolicy;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::storage_names::{SstName, classify_sst, parse_cf_dir_name};
 use calyx_core::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -55,7 +55,7 @@ pub(super) fn read_manifested_batches(
                 if seq > durable_seq {
                     continue;
                 }
-                let reader = SstReader::open(&path)?;
+                let reader = shared_reader(&path)?;
                 for (row_offset, row) in reader.iter()?.into_iter().enumerate() {
                     by_seq.entry(seq).or_default().push((
                         index + row_offset,
@@ -80,6 +80,37 @@ pub(super) fn read_manifested_batches(
             }
         })
         .collect())
+}
+
+/// Lists every on-disk CF that can feed the persistent search generation.
+/// Legacy watermark migration must load all of these levels even when the
+/// caller requested a narrower latest-read router, otherwise a slot-only
+/// content commit could be silently omitted from the re-derived frontier.
+pub(in crate::vault) fn persistent_search_cfs(
+    root: &Path,
+    tiering_policy: Option<&TieringPolicy>,
+) -> Result<Vec<crate::cf::ColumnFamily>> {
+    let mut cfs = BTreeSet::new();
+    for cf_root in tiered_cf_roots(root, tiering_policy) {
+        if !cf_root.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&cf_root).map_err(|error| storage_error("read CF root", error))? {
+            let entry = entry.map_err(|error| storage_error("read CF entry", error))?;
+            if !entry
+                .file_type()
+                .map_err(|error| storage_error("stat CF entry", error))?
+                .is_dir()
+            {
+                continue;
+            }
+            let cf = parse_cf_dir_name(&entry.file_name().to_string_lossy())?;
+            if cf.feeds_persistent_search_index() {
+                cfs.insert(cf);
+            }
+        }
+    }
+    Ok(cfs.into_iter().collect())
 }
 
 pub(in crate::vault) fn tiered_cf_roots(

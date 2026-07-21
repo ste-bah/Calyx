@@ -6,8 +6,11 @@ use calyx_core::FixedClock;
 use proptest::prelude::*;
 use serde_json::json;
 
-mod ph52_signal_support;
-mod ph52_support;
+// calyx-shared-module: path=ph52_signal_support/mod.rs alias=__calyx_shared_ph52_signal_support_mod_rs local=ph52_signal_support visibility=private
+
+use crate::__calyx_shared_ph52_signal_support_mod_rs as ph52_signal_support;
+// calyx-shared-module: path=ph52_support/mod.rs alias=__calyx_shared_ph52_support_mod_rs local=ph52_support visibility=private
+use crate::__calyx_shared_ph52_support_mod_rs as ph52_support;
 
 use ph52_signal_support::noise;
 use ph52_support::write_readback;

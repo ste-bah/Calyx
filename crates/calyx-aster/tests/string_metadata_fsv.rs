@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_aster::cf::{ColumnFamily, base_key};
 use calyx_aster::vault::{AsterVault, VaultOptions, encode};
 use calyx_core::{
     Constellation, CxFlags, InputRef, LedgerRef, METADATA_CHUNK_ID, METADATA_DATABASE_NAME,
     Modality, SlotId, SlotVector, VaultId, VaultStore,
 };
-mod fsv_support;
 use fsv_support::{fsv_root_os, reset_dir};
 
 const CHUNK_ID: &str = "chunk:PH64/001 with spaces";

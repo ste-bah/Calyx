@@ -150,6 +150,8 @@ fn slot_kind(slot: &SlotVector) -> &'static str {
 }
 
 fn fsv_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/fsv/issue182_derived_feature_absence")
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue182-derived-feature-absence", || {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/fsv/issue182_derived_feature_absence")
+    })
 }

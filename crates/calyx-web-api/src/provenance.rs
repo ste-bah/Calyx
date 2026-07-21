@@ -6,31 +6,13 @@ use crate::blocking::run_blocking;
 // /v1/provenance/{id} — real Ledger answer-trace (#577)
 // ---------------------------------------------------------------------------
 
-/// Real vault-manifest-backed quarantine: a ledger seq is quarantined iff the
-/// vault manifest says so (mirrors the CLI `calyx provenance` path). Never
-/// silently treats a quarantined entry as trusted.
-struct VaultQuarantine {
-    vault_dir: PathBuf,
-}
-
-impl QuarantineLookup for VaultQuarantine {
-    fn contains_quarantined(&self, range: std::ops::Range<u64>) -> CalyxResult<bool> {
-        for seq in range {
-            if is_vault_seq_quarantined(&self.vault_dir, seq)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-}
-
 /// The vault's OWN append-only Ledger CF (via [`AsterLedgerCfStore`]) + its
 /// manifest quarantine, opened once at startup. Unifies the origin: provenance
 /// reads the SAME vault as measure/search/guard/kernel — no separate ledger
 /// directory. Read-only by construction (this service never appends).
 pub struct ProvenanceCtx {
     pub(super) store: AsterLedgerCfStore,
-    quarantine: VaultQuarantine,
+    vault_dir: PathBuf,
     /// Bounded TTL cache for `/v1/provenance/{id}` (#1898) — the headline win,
     /// since each miss does a full ledger `scan()` + `verify_chain()`.
     pub(super) cache: ResponseCache,
@@ -49,9 +31,7 @@ impl ProvenanceCtx {
             .map_err(|error| format!("scan vault ledger {}: {error:?}", vault_dir.display()))?;
         Ok(Self {
             store,
-            quarantine: VaultQuarantine {
-                vault_dir: vault_dir.to_path_buf(),
-            },
+            vault_dir: vault_dir.to_path_buf(),
             cache: ResponseCache::from_env()?,
         })
     }
@@ -131,22 +111,42 @@ pub(super) async fn provenance_wired(
 }
 
 fn provenance_body(ctx: &ProvenanceCtx, id: String) -> Result<Value, ApiError> {
-    // Source-of-truth scan: every read is straight off the on-disk ledger.
-    let row_count = match ctx.store.scan() {
-        Ok(rows) => rows.len() as u64,
+    // One validated manifest generation supplies all quarantine lookups for
+    // this computation. Immutable-reference verification therefore occurs
+    // once, and a concurrent CURRENT swap is observed on the next computation.
+    let quarantine = match load_vault_quarantine_snapshot(&ctx.vault_dir) {
+        Ok(quarantine) => quarantine,
         Err(error) => {
-            tracing::error!(error = ?error, "CALYX_WEB_API_PROVENANCE_SCAN_FAILED");
+            tracing::error!(error = ?error, "CALYX_WEB_API_PROVENANCE_MANIFEST_FAILED");
             return Err(ApiError::of(ErrorCode::Internal));
         }
     };
-    let chain = match verify_chain(&ctx.store, 0..row_count) {
+
+    provenance_body_from_sources(&ctx.store, &quarantine, id)
+}
+
+pub(super) fn provenance_body_from_sources(
+    store: &dyn LedgerCfStore,
+    quarantine: &QuarantineSet,
+    id: String,
+) -> Result<Value, ApiError> {
+    let snapshot = match store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::error!(error = ?error, "CALYX_WEB_API_PROVENANCE_SNAPSHOT_FAILED");
+            return Err(ApiError::of(ErrorCode::Internal));
+        }
+    };
+    let row_count = snapshot.len() as u64;
+    let decoded = DecodedLedgerSnapshot::from_snapshot(&snapshot);
+    let chain = match verify_decoded_snapshot(&decoded, 0..row_count) {
         Ok(result) => result,
         Err(error) => {
             tracing::error!(error = ?error, "CALYX_WEB_API_PROVENANCE_VERIFY_FAILED");
             return Err(ApiError::of(ErrorCode::Internal));
         }
     };
-    let trace = match get_answer_trace(&ctx.store, &ctx.quarantine, id.as_bytes()) {
+    let trace = match get_answer_trace_from_snapshot(&decoded, quarantine, id.as_bytes()) {
         Ok(trace) => trace,
         Err(error) => {
             tracing::error!(error = ?error, "CALYX_WEB_API_PROVENANCE_TRACE_FAILED");

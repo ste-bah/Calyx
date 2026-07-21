@@ -20,6 +20,7 @@
 //!   [`StreamIngester::drain_and_close`] as an `Err` — never silently dropped.
 
 mod backpressure;
+mod quantize_batch;
 mod quantize_online;
 
 pub use backpressure::{BackpressureGuard, CALYX_STREAM_BACKPRESSURE};
@@ -82,6 +83,18 @@ pub struct StreamStats {
     pub backpressured: usize,
     /// Microbatches flushed (one Ledger entry each).
     pub batches: usize,
+    /// Dense slots encoded below the measured CUDA crossover.
+    pub cpu_quantized: usize,
+    /// Dense slots encoded through ragged CUDA batches.
+    pub cuda_quantized: usize,
+    /// Distinct `(dimension, level)` groups submitted to CUDA.
+    pub cuda_shape_groups: usize,
+    /// CUDA kernel launches used by streaming quantization.
+    pub cuda_kernel_launches: u64,
+    /// Streaming quantization host-to-device bytes.
+    pub cuda_h2d_bytes: u64,
+    /// Streaming quantization device-to-host bytes.
+    pub cuda_d2h_bytes: u64,
 }
 
 #[derive(Default)]
@@ -224,6 +237,12 @@ fn nonfinite_index(vector: &SlotVector) -> Option<usize> {
 struct BatchOutcome {
     ingested: usize,
     quantized: usize,
+    cpu_quantized: usize,
+    cuda_quantized: usize,
+    cuda_shape_groups: usize,
+    cuda_kernel_launches: u64,
+    cuda_h2d_bytes: u64,
+    cuda_d2h_bytes: u64,
 }
 
 /// Drains the channel into microbatches and processes each, capturing the first
@@ -237,6 +256,7 @@ fn flush_loop<C>(
 ) where
     C: Clock + Send + Sync + 'static,
 {
+    let mut quantizer = quantize_batch::BatchQuantizer::default();
     loop {
         let mut batch = Vec::new();
         match receiver.recv() {
@@ -249,12 +269,18 @@ fn flush_loop<C>(
                 Err(_) => break,
             }
         }
-        match process_batch(vault, config, &batch, post_ingest) {
+        match process_batch(vault, config, &batch, post_ingest, &mut quantizer) {
             Ok(outcome) => {
                 if let Ok(mut state) = flush.lock() {
                     state.stats.ingested += outcome.ingested;
                     state.stats.quantized += outcome.quantized;
                     state.stats.batches += 1;
+                    state.stats.cpu_quantized += outcome.cpu_quantized;
+                    state.stats.cuda_quantized += outcome.cuda_quantized;
+                    state.stats.cuda_shape_groups += outcome.cuda_shape_groups;
+                    state.stats.cuda_kernel_launches += outcome.cuda_kernel_launches;
+                    state.stats.cuda_h2d_bytes += outcome.cuda_h2d_bytes;
+                    state.stats.cuda_d2h_bytes += outcome.cuda_d2h_bytes;
                 }
             }
             Err(err) => {
@@ -273,6 +299,7 @@ fn process_batch<C>(
     config: &QuantizeOnlineConfig,
     batch: &[StreamEvent],
     post_ingest: Option<&PostIngestHook<C>>,
+    quantizer: &mut quantize_batch::BatchQuantizer,
 ) -> Result<BatchOutcome>
 where
     C: Clock + Send + Sync + 'static,
@@ -281,27 +308,53 @@ where
     if batch.is_empty() {
         return Ok(outcome);
     }
-    for event in batch {
-        let cx_id = vault.cx_id_for_input(&event.input.raw_bytes, event.input.panel_version);
-        let mut input = event.input.clone();
-        let mut quantized_any = false;
+    let mut prepared = batch
+        .iter()
+        .map(|event| event.input.clone())
+        .collect::<Vec<_>>();
+    let cx_ids = batch
+        .iter()
+        .map(|event| vault.cx_id_for_input(&event.input.raw_bytes, event.input.panel_version))
+        .collect::<Vec<_>>();
+    let mut jobs = Vec::new();
+    for (event_index, event) in batch.iter().enumerate() {
         for (slot_id, vector) in &event.input.slots {
             if let SlotVector::Dense { data, .. } = vector {
-                let quantized = quantize_slot_online(data, config, cx_id)?;
-                input.metadata.insert(
+                jobs.push((
+                    event_index,
                     format!("quant_slot_{}", slot_id.0),
-                    to_hex(&quantized.bytes),
-                );
-                outcome.quantized += 1;
-                quantized_any = true;
+                    quantize_batch::BatchRow {
+                        raw: data,
+                        cx_id: cx_ids[event_index],
+                    },
+                ));
             }
         }
-        if quantized_any {
+    }
+    let rows = jobs.iter().map(|job| job.2).collect::<Vec<_>>();
+    let encoded = quantizer.encode(config, &rows)?;
+    outcome.quantized = encoded.rows.len();
+    outcome.cpu_quantized = encoded.stats.cpu_rows;
+    outcome.cuda_quantized = encoded.stats.cuda_rows;
+    outcome.cuda_shape_groups = encoded.stats.cuda_shape_groups;
+    outcome.cuda_kernel_launches = encoded.stats.cuda_kernel_launches;
+    outcome.cuda_h2d_bytes = encoded.stats.cuda_h2d_bytes;
+    outcome.cuda_d2h_bytes = encoded.stats.cuda_d2h_bytes;
+    let mut quantized_events = vec![false; prepared.len()];
+    for ((event_index, metadata_key, _), quantized) in jobs.iter().zip(encoded.rows) {
+        prepared[*event_index]
+            .metadata
+            .insert(metadata_key.clone(), to_hex(&quantized.bytes));
+        quantized_events[*event_index] = true;
+    }
+    for (event_index, input) in prepared.iter_mut().enumerate() {
+        if quantized_events[event_index] {
             input
                 .metadata
                 .insert("quantized".to_string(), "true".to_string());
         }
-        let result = ingest_at(vault, &input, event.at, None)?;
+        let event = &batch[event_index];
+        let result = ingest_at(vault, input, event.at, None)?;
         let ledger_ref = latest_ledger_ref(vault)?;
         if let Some(hook) = post_ingest {
             hook(vault, result_cx_id(&result), ledger_ref)?;

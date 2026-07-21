@@ -1,7 +1,5 @@
-use std::collections::BTreeMap;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_aster::dedup::EpochSecs;
 use calyx_aster::recurrence::{
     FREQUENCY_SCALAR, OccurrenceContext, RetentionPolicy, append_occurrence,
@@ -17,6 +15,7 @@ use calyx_sextant::{
     frequency_kernel_bonus, recurrence_boost_evidence, recurrence_boost_score,
 };
 use sextant_support::cx_u8_fill as cx;
+use std::collections::BTreeMap;
 
 const QUERY_TIME: i64 = 1_000_000;
 const EPSILON: f32 = 1.0e-5;

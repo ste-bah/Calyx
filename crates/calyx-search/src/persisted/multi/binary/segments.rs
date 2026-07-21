@@ -3,12 +3,16 @@ use super::*;
 #[derive(Debug)]
 pub(in crate::persisted::multi) struct BinarySidecarSummary {
     pub(in crate::persisted::multi) base_seq: u64,
+    #[cfg(test)]
     pub(in crate::persisted::multi) row_count: u64,
+    #[cfg(test)]
     pub(in crate::persisted::multi) token_count: u64,
     pub(in crate::persisted::multi) ids: BTreeSet<CxId>,
+    #[cfg(test)]
     pub(in crate::persisted::multi) sha256: String,
 }
 
+#[cfg(test)]
 pub(in crate::persisted::multi) fn summarize_binary_entry(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
@@ -88,9 +92,12 @@ pub(in crate::persisted::multi) fn summarize_binary_path(
     }
     Ok(BinarySidecarSummary {
         base_seq: header.base_seq,
+        #[cfg(test)]
         row_count: header.row_count,
+        #[cfg(test)]
         token_count: header.token_count,
         ids: seen,
+        #[cfg(test)]
         sha256: actual,
     })
 }

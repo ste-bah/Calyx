@@ -15,13 +15,13 @@ mod rows;
 use super::cuda_guard::CudaDropGuard;
 use super::io_binding::OnnxRunPlan;
 use super::session::{ManagedOnnxSession, build_session};
-use super::{OnnxFileSpec, OnnxLens, OnnxModelFiles, config_invalid};
-use crate::frozen::{FrozenLensContract, LensDType, sha256_digest};
+use super::{OnnxFileSpec, OnnxLens, OnnxModelFiles, PoolingPolicy, config_invalid};
+use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::runtime::common::hash_files;
 use batch::{TokenBatch, session_inputs, stream_token_batches, token_batches};
 #[cfg(test)]
 pub(super) use output::pool_output;
-pub(in crate::runtime::onnx) use output::pooling_from_config;
+pub(crate) use output::pooling_from_config;
 use output::{CustomOutput, output_from_session, vectors_from_output};
 use pipeline::{
     log_pipeline_start, pipeline_batch_window, pipeline_output_window, should_pipeline,
@@ -34,6 +34,8 @@ pub struct CustomOnnxRuntime {
     tokenizer: Tokenizer,
     output: CustomOutput,
     max_tokens: usize,
+    #[cfg(feature = "cuda")]
+    cuda_postprocess: Option<calyx_forge::CudaContext>,
 }
 
 impl CustomOnnxRuntime {
@@ -178,6 +180,11 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
     let session = build_session(&run_label, &spec.model_file, spec.provider_policy)?;
     let session = CudaDropGuard::new(session, spec.provider_policy);
     let run_plan = OnnxRunPlan::new(spec.provider_policy, run_label)?;
+    #[cfg(feature = "cuda")]
+    let cuda_postprocess = super::device_postprocess::cuda_postprocess_context(
+        spec.provider_policy,
+        run_plan.device_id(),
+    )?;
     let output = output_from_session(
         session.as_ref(),
         spec.expected_shape,
@@ -203,6 +210,8 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
         tokenizer,
         output,
         max_tokens,
+        #[cfg(feature = "cuda")]
+        cuda_postprocess,
     };
     Ok(OnnxLens::from_custom_parts(
         contract,
@@ -214,18 +223,38 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
 }
 
 fn custom_corpus_hash(spec: &OnnxFileSpec, output: CustomOutput) -> [u8; 32] {
-    match output {
-        CustomOutput::Dense { .. } => sha256_digest(&[
-            b"onnx-custom-v1",
-            spec.model_id.as_bytes(),
-            spec.pooling.as_str().as_bytes(),
-            format!("{:?}", spec.norm_policy).as_bytes(),
-        ]),
-        CustomOutput::Sparse { .. } => sha256_digest(&[
+    contract_corpus_hash(
+        &spec.model_id,
+        matches!(output, CustomOutput::Sparse { .. }),
+        spec.pooling,
+        spec.norm_policy,
+    )
+}
+
+/// Single source of truth for the custom ONNX frozen-contract corpus hash,
+/// used by both the runtime constructor (`from_files`) and the static
+/// derivation (`derive_runtime_contract_from_spec`). `sparse` mirrors
+/// `output_from_session`: a custom ONNX lens is sparse if and only if its
+/// declared output shape is sparse.
+pub(crate) fn contract_corpus_hash(
+    model_id: &str,
+    sparse: bool,
+    pooling: PoolingPolicy,
+    norm_policy: NormPolicy,
+) -> [u8; 32] {
+    if sparse {
+        sha256_digest(&[
             b"onnx-custom-splade-v1",
-            spec.model_id.as_bytes(),
+            model_id.as_bytes(),
             b"sparse-positive-f32",
-        ]),
+        ])
+    } else {
+        sha256_digest(&[
+            b"onnx-custom-v1",
+            model_id.as_bytes(),
+            pooling.as_str().as_bytes(),
+            format!("{norm_policy:?}").as_bytes(),
+        ])
     }
 }
 
@@ -233,6 +262,17 @@ impl CustomOnnxRuntime {
     fn run_token_batch(&mut self, batch: &TokenBatch) -> Result<Vec<SlotVector>> {
         let input_tensors = session_inputs(self.session.as_ref(), batch)?;
         let output = self.output;
+        #[cfg(feature = "cuda")]
+        if let Some(cuda_postprocess) = self.cuda_postprocess.clone() {
+            return self.run_plan.run_extract_device(
+                self.session.as_mut(),
+                input_tensors,
+                (batch.batch, batch.seq),
+                |outputs| {
+                    output::vectors_from_device_output(outputs, batch, output, &cuda_postprocess)
+                },
+            );
+        }
         self.run_plan.run_extract(
             self.session.as_mut(),
             input_tensors,

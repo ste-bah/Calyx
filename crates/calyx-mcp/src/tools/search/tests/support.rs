@@ -226,6 +226,7 @@ fn rewrite_ledger_sst(vault: &Path, entries: &[calyx_aster::sst::SstEntry]) {
 }
 
 pub(super) fn write_calibrated_default_guard(vault: &Path, vault_id: &str, name: &str, tau: f32) {
+    let vault_path = vault.to_path_buf();
     let state = load_vault_panel_state(vault).expect("load panel state");
     let slot = state
         .panel
@@ -274,7 +275,7 @@ pub(super) fn write_calibrated_default_guard(vault: &Path, vault_id: &str, name:
     };
     let vault_id = vault_id.parse().expect("parse vault id");
     let vault = AsterVault::open(
-        vault,
+        &vault_path,
         vault_id,
         crate::tools::vault::store::vault_salt(vault_id, name),
         VaultOptions::default(),
@@ -285,6 +286,8 @@ pub(super) fn write_calibrated_default_guard(vault: &Path, vault_id: &str, name:
         .write_cf(ColumnFamily::Guard, b"profile\0default".to_vec(), bytes)
         .expect("write guard profile");
     vault.flush().expect("flush guard profile");
+    calyx_search::rebuild_for_vault_with_panel_state(&vault_path, &vault, &state)
+        .expect("publish search generation after direct guard fixture write");
 }
 
 pub(super) fn maybe_write_fsv_json(name: &str, value: &Value) {

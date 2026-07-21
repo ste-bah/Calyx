@@ -15,11 +15,11 @@ use calyx_poly::{
 };
 use serde_json::{Value, json};
 
-use crate::issue096_static::{
+use super::issue096_static::{
     assert_agent_paths_exist, assert_no_trade_keys, file_name, hash_file, prefix,
     provider_metadata, read_manifest, snapshot, vault_id,
 };
-use crate::support::{
+use super::support::{
     hex, known_healthy_market_integrity, known_healthy_oracle_risk, known_healthy_wash_trade,
     reset_dir, write_json,
 };

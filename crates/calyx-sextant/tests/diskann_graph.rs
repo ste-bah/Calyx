@@ -2,7 +2,7 @@
 //!
 //! Graph-constructing tests are `#[ignore = "server-only"]` per the PH68 scale
 //! boundary and run explicitly in a manual verification run:
-//! `cargo test -p calyx-sextant --test diskann_graph -- --include-ignored`
+//! `cargo test -p calyx-sextant --test __calyx_integration_suite_1 diskann_graph -- --include-ignored`
 
 use std::path::PathBuf;
 

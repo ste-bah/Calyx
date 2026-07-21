@@ -81,20 +81,23 @@ pub use persistence_contracts::{
     RegistryContractAudit, RegistryContractDiff, RegistryContractFieldDiff,
     RegistryContractRepairChange, VaultRegistryContractRepairAllWrite,
     VaultRegistryContractRepairWrite, audit_registry_snapshot_contracts,
-    audit_vault_registry_contracts, lens_spec_with_frozen_contract,
-    repair_vault_registry_contracts_from_specs, repair_vault_registry_slot_from_spec,
-    require_vault_registry_contracts,
+    audit_vault_registry_contracts, derive_runtime_contract_from_spec,
+    lens_spec_with_frozen_contract, repair_vault_registry_contracts_from_specs,
+    repair_vault_registry_slot_from_spec, require_vault_registry_contracts,
 };
 pub use placement::{
-    CALYX_RAM_BUDGET_EXCEEDED, CALYX_VRAM_BUDGET_EXCEEDED, CpuLensPool, CpuPoolAdmission,
-    LENS_RAM_REMEDIATION, LENS_VRAM_REMEDIATION, PlacementBudget, PlacementPlan, choose_placement,
+    CALYX_BGE_M3_CPU_GRAPH_GPU_PLACEMENT, CALYX_RAM_BUDGET_EXCEEDED, CALYX_VRAM_BUDGET_EXCEEDED,
+    CpuLensPool, CpuPoolAdmission, LENS_RAM_REMEDIATION, LENS_VRAM_REMEDIATION, PlacementBudget,
+    PlacementPlan, choose_placement,
 };
 pub use profile::{
+    CALYX_PROFILE_CUDA_MIN_ROWS_ENV, CALYX_PROFILE_REQUIRE_CUDA_ENV,
     CAPABILITY_MAX_PAIRWISE_CORR_ENV, CAPABILITY_MIN_SIGNAL_BITS_ENV, CapabilityCard,
     CapabilityGateDecision, CapabilityGateEvaluation, CapabilityGateThresholds,
     CapabilitySignalKind, CapabilitySignalReliability, CostMetrics, CoverageMetrics,
-    DenseProfileRequest, MetricSource, ProfileOptions, ProfileProbe, Profiler, SeparationMetrics,
-    SpreadMetrics, append_capability_gate_ledger, apply_assay_metrics, capability_gate_json,
+    DEFAULT_PROFILE_CUDA_MIN_ROWS, DenseProfileRequest, MetricSource, ProfileExecutionStats,
+    ProfileMathBackend, ProfileOptions, ProfileProbe, Profiler, SeparationMetrics, SpreadMetrics,
+    append_capability_gate_ledger, apply_assay_metrics, capability_gate_json,
     evaluate_capability_gate, max_panel_pairwise_correlation, profile_dense_vectors, profile_lens,
     profile_slot_with_assay, signal_kind_from_spec,
 };
@@ -104,7 +107,10 @@ pub use runtime::adapters::{
     allow_noncommercial_from_env, default_multimodal_lens_specs, ensure_license_allowed,
     is_non_commercial_license, register_multimodal_lens_pack, shutdown_multimodal_gpu_workers,
 };
-pub use runtime::algorithmic::{AlgorithmicEncoder, AlgorithmicLens};
+pub use runtime::algorithmic::{
+    AlgorithmicBatchProvider, AlgorithmicBatchStats, AlgorithmicEncoder, AlgorithmicLens,
+    BYTE_FEATURES_CUDA_MIN_INPUT_BYTES, SPARSE_KEYWORDS_CUDA_MIN_TOKENS, TOKEN_HASH_CUDA_MIN_WORDS,
+};
 pub use runtime::candle::{
     CandleDevicePolicy, CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy,
     CandlePrecision, DEFAULT_CANDLE_MODEL,
@@ -113,7 +119,7 @@ pub use runtime::external_cmd::ExternalCmdLens;
 pub use runtime::onnx::{
     DEFAULT_ANSWERAI_COLBERT_MODEL, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
     OnnxColbertFileSpec, OnnxColbertLens, OnnxFileSpec, OnnxLens, OnnxModelFiles,
-    OnnxProviderPolicy, PoolingPolicy,
+    OnnxProviderPolicy, OnnxShapeBucketBudget, PoolingPolicy, onnx_shape_bucket_budget,
 };
 pub use runtime::qwen3::{
     DEFAULT_QWEN3_MAX_TOKENS, DEFAULT_QWEN3_MODEL, FastembedQwen3Lens, Qwen3FileSpec,
@@ -122,9 +128,14 @@ pub use runtime::qwen3::{
 pub use runtime::static_lookup::{
     StaticLookupDType, StaticLookupFileSpec, StaticLookupFiles, StaticLookupLens,
 };
-pub use runtime::tei_http::{DEFAULT_TEI_ENDPOINT, TeiHttpLens};
-pub use runtime_limit::measure_registry_batch_with_runtime_limit;
-pub use spec::{FastembedBgem3Output, LensHealth, LensRuntime, LensSpec};
+pub use runtime::tei_http::{
+    DEFAULT_TEI_ENDPOINT, TeiEndpointIdentity, TeiHttpLens, TeiServiceInfo, read_tei_service_info,
+    tei_endpoint_identity,
+};
+pub use runtime_limit::{
+    measure_registry_batch_with_runtime_limit, measure_registry_group_with_runtime_limit,
+};
+pub use spec::{Bgem3Engine, FastembedBgem3Output, LensHealth, LensRuntime, LensSpec};
 pub use swap::{BackfillCandidate, BackfillQueue, SlotSpec, SwapController};
 pub use temporal::{
     DecayFunction, E2RecencyConfig, E2RecencyLens, E3PeriodicConfig, E3PeriodicLens,

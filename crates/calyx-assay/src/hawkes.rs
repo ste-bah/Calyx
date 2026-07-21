@@ -7,6 +7,8 @@
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cuda_strict::strict_cuda_requested;
+
 pub const DEFAULT_HAWKES_DECAY: f32 = 2.0;
 pub const DEFAULT_HAWKES_ITERATIONS: usize = 50;
 pub const DEFAULT_HAWKES_MIN_EDGE_BRANCHING_RATIO: f32 = 0.05;
@@ -81,6 +83,9 @@ pub fn exponential_hawkes_em(
     processes: &[HawkesEventSeries<'_>],
     config: &HawkesConfig,
 ) -> Result<HawkesReport> {
+    if strict_cuda_requested() {
+        return exponential_hawkes_em_cuda_strict(processes, config);
+    }
     validate_hawkes_inputs(processes, config)?;
     let d = processes.len();
     let observation_end = config.observation_end as f64;
@@ -175,6 +180,90 @@ pub fn exponential_hawkes_em(
     })
 }
 
+/// Strict CUDA fixed-decay exponential Hawkes EM. This never falls back to CPU.
+pub fn exponential_hawkes_em_cuda_strict(
+    processes: &[HawkesEventSeries<'_>],
+    config: &HawkesConfig,
+) -> Result<HawkesReport> {
+    exponential_hawkes_em_cuda_strict_impl(processes, config)
+}
+
+#[cfg(feature = "cuda")]
+fn exponential_hawkes_em_cuda_strict_impl(
+    processes: &[HawkesEventSeries<'_>],
+    config: &HawkesConfig,
+) -> Result<HawkesReport> {
+    validate_hawkes_inputs(processes, config)?;
+    let (events, offsets) = flatten_hawkes_events(processes)?;
+    let backend = calyx_forge::CudaBackend::new()
+        .map_err(|err| crate::cuda_strict::forge_to_calyx("Hawkes EM", err))?;
+    let fit = calyx_forge::hawkes_em_host(
+        backend.context(),
+        &events,
+        &offsets,
+        config.observation_end as f64,
+        config.decay as f64,
+        config.iterations,
+    )
+    .map_err(|err| crate::cuda_strict::forge_to_calyx("Hawkes EM", err))?;
+    let d = processes.len();
+    let branching_matrix_f64: Vec<Vec<f64>> = fit
+        .branching_matrix
+        .chunks_exact(d)
+        .map(|row| row.iter().map(|&value| value as f64).collect())
+        .collect();
+    let retained_edges = retained_edges(
+        processes,
+        &branching_matrix_f64,
+        config.min_edge_branching_ratio,
+    );
+    let stability = if fit.spectral_radius < 1.0 {
+        HawkesStability::Subcritical
+    } else {
+        HawkesStability::CriticalOrSupercritical
+    };
+    Ok(HawkesReport {
+        estimator: "fixed_decay_exponential_hawkes_em_cuda_strict".to_string(),
+        observation_start: 0.0,
+        observation_end: config.observation_end,
+        decay: config.decay,
+        iterations: config.iterations,
+        processes: processes
+            .iter()
+            .map(|process| process.name.to_string())
+            .collect(),
+        event_counts: processes
+            .iter()
+            .map(|process| process.event_times.len())
+            .collect(),
+        baseline_rates: processes
+            .iter()
+            .enumerate()
+            .map(|(idx, process)| HawkesBaseline {
+                process: process.name.to_string(),
+                event_count: process.event_times.len(),
+                rate: fit.baseline_rates[idx],
+            })
+            .collect(),
+        branching_matrix: fit
+            .branching_matrix
+            .chunks_exact(d)
+            .map(|row| row.to_vec())
+            .collect(),
+        retained_edges,
+        spectral_radius: fit.spectral_radius,
+        stability,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn exponential_hawkes_em_cuda_strict_impl(
+    _processes: &[HawkesEventSeries<'_>],
+    _config: &HawkesConfig,
+) -> Result<HawkesReport> {
+    Err(crate::cuda_strict::cuda_unavailable("Hawkes EM"))
+}
+
 fn validate_hawkes_inputs(
     processes: &[HawkesEventSeries<'_>],
     config: &HawkesConfig,
@@ -244,6 +333,35 @@ fn validate_hawkes_inputs(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn flatten_hawkes_events(processes: &[HawkesEventSeries<'_>]) -> Result<(Vec<f64>, Vec<i32>)> {
+    let total_events = processes
+        .iter()
+        .try_fold(0usize, |acc, process| {
+            acc.checked_add(process.event_times.len())
+        })
+        .ok_or_else(|| {
+            CalyxError::forge_vram_budget("Hawkes CUDA flattened event count overflow")
+        })?;
+    if total_events > i32::MAX as usize {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "Hawkes CUDA flattened event count exceeds i32 kernel range: {total_events}"
+        )));
+    }
+    let mut events = Vec::with_capacity(total_events);
+    let mut offsets = Vec::with_capacity(processes.len() + 1);
+    offsets.push(0_i32);
+    for process in processes {
+        events.extend(process.event_times.iter().map(|&event| event as f64));
+        offsets.push(i32::try_from(events.len()).map_err(|_| {
+            CalyxError::assay_insufficient_samples(
+                "Hawkes CUDA flattened offset exceeds i32 kernel range",
+            )
+        })?);
+    }
+    Ok((events, offsets))
 }
 
 fn source_exposures(events: &[Vec<f64>], observation_end: f64, decay: f64) -> Result<Vec<f64>> {

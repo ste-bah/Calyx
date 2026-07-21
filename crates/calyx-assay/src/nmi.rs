@@ -5,7 +5,18 @@ use std::collections::BTreeMap;
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cuda_strict::strict_cuda_requested;
+use crate::dependence_dispatch::{DependenceCudaStats, auto_cuda_at};
 use crate::ksg::MIN_ASSAY_SAMPLES;
+
+#[path = "nmi/cuda.rs"]
+mod cuda;
+
+use self::cuda::partitioned_histogram_nmi_cuda_strict_with_stats_impl;
+
+/// CUDA becomes the production route at this paired-sample count. Explicit
+/// strict calls and `CALYX_ASSAY_CUDA_STRICT` bypass this CPU small-N cutoff.
+pub const NMI_CUDA_MIN_SAMPLES: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NmiReport {
@@ -18,6 +29,33 @@ pub struct NmiReport {
 }
 
 pub fn partitioned_histogram_nmi(x: &[f32], y: &[f32], bins: usize) -> Result<NmiReport> {
+    if strict_cuda_requested() || auto_cuda_at(x.len(), NMI_CUDA_MIN_SAMPLES) {
+        return partitioned_histogram_nmi_cuda_strict(x, y, bins);
+    }
+    partitioned_histogram_nmi_cpu(x, y, bins)
+}
+
+/// Strict CUDA histogram NMI. This never falls back to CPU, including below
+/// [`NMI_CUDA_MIN_SAMPLES`].
+pub fn partitioned_histogram_nmi_cuda_strict(
+    x: &[f32],
+    y: &[f32],
+    bins: usize,
+) -> Result<NmiReport> {
+    partitioned_histogram_nmi_cuda_strict_with_stats(x, y, bins).map(|(report, _)| report)
+}
+
+/// Strict CUDA histogram NMI with transfer, memory, work, and launch telemetry.
+pub fn partitioned_histogram_nmi_cuda_strict_with_stats(
+    x: &[f32],
+    y: &[f32],
+    bins: usize,
+) -> Result<(NmiReport, DependenceCudaStats)> {
+    validate_nmi_samples(x, y, bins)?;
+    partitioned_histogram_nmi_cuda_strict_with_stats_impl(x, y, bins)
+}
+
+fn partitioned_histogram_nmi_cpu(x: &[f32], y: &[f32], bins: usize) -> Result<NmiReport> {
     validate_nmi_samples(x, y, bins)?;
     let xb = bin_values(x, bins);
     let yb = bin_values(y, bins);
@@ -39,6 +77,43 @@ pub fn partitioned_histogram_nmi(x: &[f32], y: &[f32], bins: usize) -> Result<Nm
         bins,
         n_samples: x.len(),
     })
+}
+
+#[cfg(feature = "cuda")]
+fn nmi_from_counts(
+    x_counts: &[u64],
+    y_counts: &[u64],
+    joint_counts: &[u64],
+    bins: usize,
+    n_samples: usize,
+) -> NmiReport {
+    let hx = entropy_counts(x_counts, n_samples);
+    let hy = entropy_counts(y_counts, n_samples);
+    let hxy = entropy_counts(joint_counts, n_samples);
+    let mi = (hx + hy - hxy).max(0.0);
+    let denom = (hx * hy).sqrt();
+    NmiReport {
+        nmi: if denom > 0.0 { mi / denom } else { 0.0 },
+        mi_bits: mi,
+        x_entropy_bits: hx,
+        y_entropy_bits: hy,
+        bins,
+        n_samples,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn entropy_counts(counts: &[u64], n_samples: usize) -> f32 {
+    let n = n_samples.max(1) as f32;
+    counts
+        .iter()
+        .copied()
+        .filter(|&count| count > 0)
+        .map(|count| {
+            let p = count as f32 / n;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 fn validate_nmi_samples(x: &[f32], y: &[f32], bins: usize) -> Result<()> {

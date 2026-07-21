@@ -492,6 +492,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -503,6 +504,7 @@ dependencies = [
  "calyx-anneal",
  "calyx-aster",
  "calyx-core",
+ "calyx-forge",
  "calyx-fsv",
  "calyx-ledger",
  "calyx-lodestar",
@@ -624,6 +626,7 @@ dependencies = [
  "proptest",
  "rand",
  "rand_chacha",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
@@ -634,6 +637,20 @@ dependencies = [
 [[package]]
 name = "calyx-fsv"
 version = "0.1.0"
+
+[[package]]
+name = "calyx-gatebrokerd"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
 
 [[package]]
 name = "calyx-hazard-soak"
@@ -723,6 +740,7 @@ dependencies = [
  "calyx-aster",
  "calyx-buildinfo",
  "calyx-core",
+ "calyx-forge",
  "calyx-fsv",
  "calyx-ledger",
  "calyx-loom",
@@ -796,6 +814,7 @@ dependencies = [
  "calyx-assay",
  "calyx-aster",
  "calyx-core",
+ "calyx-fsv",
  "calyx-ledger",
  "calyx-lodestar",
  "calyx-loom",
@@ -865,6 +884,7 @@ dependencies = [
  "sha2",
  "ulid",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,11 +1,13 @@
 //! PH56 T04 FSV for bounded memtable backpressure.
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::memtable::Memtable;
 use calyx_aster::resource::{ResourceStatus, VramBudgetStatus};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::VaultId;
-mod fsv_support;
 use fsv_support::{fsv_root_os, reset_dir};
 use serde_json::json;
 use std::fs;

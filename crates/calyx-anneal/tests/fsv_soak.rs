@@ -1,10 +1,5 @@
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     ABRunner, AnnealLedger, AsterAnnealLedgerStore, AsterSoakStorage,
     CALYX_ANNEAL_SOAK_LIVE_TRAFFIC_UNAVAILABLE, CALYX_ASTER_CF_UNAVAILABLE, ForgeScopeTuner,
@@ -20,6 +15,10 @@ use fsv_support::{
     hex, physical_files, read_json, reset_dir, vault_id, write_json, write_manifest,
 };
 use serde_json::{Value, json};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const FSV_TS: u64 = 1_785_500_417;
 

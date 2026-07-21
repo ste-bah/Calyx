@@ -219,13 +219,13 @@ fn corrupt_time_index_is_isolated_from_stream_and_reactive() {
     let before_reactive_rows =
         audit_entries(vault.as_ref()).len() + fired_events(vault.as_ref()).len();
     let before_time_index_rows = read_all(vault.as_ref()).unwrap().len();
-    vault
+    let write_error = vault
         .write_cf(ColumnFamily::TimeIndex, vec![0; 17], b"bad".to_vec())
-        .unwrap();
-    let read_all_error = read_all(vault.as_ref()).unwrap_err();
-    assert_eq!(read_all_error.code, "CALYX_ASTER_CORRUPT_SHARD");
-    let err = vault.as_of(1).unwrap_err();
-    assert_eq!(err.code, "CALYX_ASTER_CORRUPT_SHARD");
+        .expect_err("reserved TimeIndex mutation must fail closed");
+    assert_eq!(write_error.code, "CALYX_ASTER_CORRUPT_SHARD");
+    let after_time_index_rows = read_all(vault.as_ref()).unwrap().len();
+    assert_eq!(after_time_index_rows, before_time_index_rows);
+    let snapshot = vault.as_of(1).expect("valid index remains readable");
     let after_reactive_rows =
         audit_entries(vault.as_ref()).len() + fired_events(vault.as_ref()).len();
     assert_eq!(before_reactive_rows, after_reactive_rows);
@@ -239,8 +239,9 @@ fn corrupt_time_index_is_isolated_from_stream_and_reactive() {
             "streamed": 50,
             "corrupt_key_len": 17,
             "time_index_rows_before_corruption": before_time_index_rows,
-            "read_all_error_code": read_all_error.code,
-            "as_of_error_code": err.code,
+            "time_index_rows_after_rejected_write": after_time_index_rows,
+            "write_error_code": write_error.code,
+            "as_of_seq_after_rejected_write": snapshot.seqno(),
             "reactive_rows_before": before_reactive_rows,
             "reactive_rows_after": after_reactive_rows,
             "fired_rows_after": fired_rows,
@@ -411,6 +412,12 @@ fn combine_stats(left: &StreamStats, right: &StreamStats) -> StreamStats {
         quantized: left.quantized + right.quantized,
         backpressured: left.backpressured + right.backpressured,
         batches: left.batches + right.batches,
+        cpu_quantized: left.cpu_quantized + right.cpu_quantized,
+        cuda_quantized: left.cuda_quantized + right.cuda_quantized,
+        cuda_shape_groups: left.cuda_shape_groups + right.cuda_shape_groups,
+        cuda_kernel_launches: left.cuda_kernel_launches + right.cuda_kernel_launches,
+        cuda_h2d_bytes: left.cuda_h2d_bytes + right.cuda_h2d_bytes,
+        cuda_d2h_bytes: left.cuda_d2h_bytes + right.cuda_d2h_bytes,
     }
 }
 

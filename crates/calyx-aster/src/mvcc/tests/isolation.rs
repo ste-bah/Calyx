@@ -1,4 +1,134 @@
 use super::*;
+
+#[derive(Debug)]
+struct CountingClock {
+    ts: Ts,
+    calls: AtomicU64,
+}
+
+impl CountingClock {
+    fn new(ts: Ts) -> Self {
+        Self {
+            ts,
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.calls.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Clock for CountingClock {
+    fn now(&self) -> Ts {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.ts
+    }
+}
+
+#[test]
+fn native_read_batch_uses_one_clock_barrier_and_row_phase() {
+    let store = VersionedCfStore::default();
+    store
+        .commit_batch([
+            (ColumnFamily::Base, b"a".to_vec(), b"v1-a".to_vec()),
+            (ColumnFamily::Base, b"gone".to_vec(), tombstone_value()),
+            (
+                ColumnFamily::slot(SlotId::new(0)),
+                b"slot".to_vec(),
+                b"v1-slot".to_vec(),
+            ),
+        ])
+        .unwrap();
+    let clock = CountingClock::new(100);
+    let snapshot = store.pin_snapshot(Freshness::FreshDerived, &clock, 1_000);
+    clock.reset();
+
+    let reads = [
+        CfRead::new(ColumnFamily::Base, b"a".to_vec()),
+        CfRead::new(ColumnFamily::Base, b"missing".to_vec()),
+        CfRead::new(ColumnFamily::Base, b"a".to_vec()),
+        CfRead::new(ColumnFamily::Base, b"gone".to_vec()),
+        CfRead::new(ColumnFamily::slot(SlotId::new(0)), b"slot".to_vec()),
+    ];
+    let before = store.batch_read_phase_counts();
+    println!(
+        "MVCC_BATCH_BEFORE reads={} clock_calls=0 phases={before:?}",
+        reads.len()
+    );
+    let values = store.read_batch(snapshot, &reads, &clock).unwrap();
+    let after = store.batch_read_phase_counts();
+
+    assert_eq!(clock.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(after.0 - before.0, 1, "one barrier read phase");
+    assert_eq!(after.1 - before.1, 1, "one row-table read phase");
+    assert_eq!(after.2 - before.2, 0, "table-only batch skips router");
+    assert_eq!(
+        values,
+        [
+            Some(b"v1-a".to_vec()),
+            None,
+            Some(b"v1-a".to_vec()),
+            None,
+            Some(b"v1-slot".to_vec()),
+        ]
+    );
+    println!(
+        "MVCC_BATCH_AFTER reads={} clock_calls={} phase_delta=({},{},{}) values={values:?}",
+        reads.len(),
+        clock.calls.load(Ordering::Relaxed),
+        after.0 - before.0,
+        after.1 - before.1,
+        after.2 - before.2
+    );
+
+    clock.reset();
+    let phases = store.batch_read_phase_counts();
+    assert!(store.read_batch(snapshot, &[], &clock).unwrap().is_empty());
+    assert_eq!(clock.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(store.batch_read_phase_counts(), phases);
+    println!("MVCC_BATCH_EDGE_EMPTY after=[] clock_calls=1 phase_delta=(0,0,0)");
+}
+
+#[test]
+#[ignore = "manual native read_batch scaling FSV"]
+fn native_read_batch_scaling_fsv() {
+    let store = VersionedCfStore::default();
+    store
+        .commit_batch((0_u32..1_000).map(|index| {
+            (
+                ColumnFamily::Base,
+                index.to_be_bytes().to_vec(),
+                index.wrapping_mul(3).to_be_bytes().to_vec(),
+            )
+        }))
+        .unwrap();
+    let clock = CountingClock::new(100);
+    let snapshot = store.pin_snapshot(Freshness::FreshDerived, &clock, 1_000);
+
+    for width in [1_usize, 10, 100, 1_000] {
+        let reads = (0..width)
+            .map(|index| CfRead::new(ColumnFamily::Base, (index as u32).to_be_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        clock.reset();
+        let before = store.batch_read_phase_counts();
+        let started = std::time::Instant::now();
+        let values = store.read_batch(snapshot, &reads, &clock).unwrap();
+        let elapsed = started.elapsed();
+        let after = store.batch_read_phase_counts();
+        assert_eq!(values.len(), width);
+        assert!(values.iter().all(Option::is_some));
+        assert_eq!(clock.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(after.0 - before.0, 1);
+        assert_eq!(after.1 - before.1, 1);
+        assert_eq!(after.2 - before.2, 0);
+        println!(
+            "MVCC_BATCH_SCALE width={} store_rows=1000 clock_calls=1 barrier_phases=1 row_phases=1 router_phases=0 elapsed_us={}",
+            width,
+            elapsed.as_micros()
+        );
+    }
+}
 use std::sync::{Arc, Barrier};
 use std::thread;
 

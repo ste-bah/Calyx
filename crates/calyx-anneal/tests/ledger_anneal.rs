@@ -1,10 +1,18 @@
 use calyx_anneal::{
-    AnnealLedger, AnnealLedgerAction, AnnealLedgerEntry, CALYX_ASTER_CF_UNAVAILABLE,
-    CALYX_LEDGER_ENTRY_TOO_LARGE, ChangeId, MetricComparison, MetricSnapshot, TripwireMetric,
+    AnnealLedger, AnnealLedgerAction, AnnealLedgerEntry, AsterAnnealLedgerStore,
+    CALYX_ASTER_CF_UNAVAILABLE, CALYX_LEDGER_ENTRY_TOO_LARGE, ChangeId, MetricComparison,
+    MetricSnapshot, TripwireMetric,
 };
-use calyx_core::{CalyxError, FixedClock, Result};
-use calyx_ledger::{ActorId, LedgerAppender, LedgerCfStore, LedgerRow, MemoryLedgerStore};
+use calyx_aster::cf::{ColumnFamily, ledger_key};
+use calyx_aster::vault::{AsterVault, VaultOptions};
+use calyx_core::{CalyxError, FixedClock, Result, VaultId};
+use calyx_ledger::{
+    ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerEntry, LedgerRow, MemoryLedgerStore,
+    SubjectId, decode as decode_ledger,
+};
 use proptest::prelude::*;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEST_TS: u64 = 1_785_500_398;
 
@@ -134,6 +142,67 @@ fn mismatched_prev_hash_fails_closed() {
     assert_eq!(ledger.read_recent(10).unwrap(), Vec::new());
 }
 
+#[test]
+fn aster_anneal_append_keeps_live_vault_ledger_hook_in_sync() {
+    let root = test_vault_dir("issue1571-anneal-vault-hook");
+    let vault = AsterVault::new_durable(
+        &root,
+        vault_id(),
+        b"issue1571-anneal-vault-hook",
+        VaultOptions::default(),
+    )
+    .expect("open durable vault");
+    let before = physical_ledger_entries(&vault);
+    println!("ISSUE1571_BEFORE rows={}", before.len());
+
+    let mut anneal = aster_anneal_ledger(&vault);
+    anneal
+        .write(sample_entry(
+            ChangeId(1_571_001),
+            AnnealLedgerAction::Promote,
+            Some([0; 32]),
+        ))
+        .expect("anneal append first row");
+    vault
+        .append_ledger_entry(
+            EntryKind::Admin,
+            SubjectId::Query(b"issue1571-vault-append".to_vec()),
+            b"vault append after anneal".to_vec(),
+            ActorId::Service("calyx-aster-test".to_string()),
+        )
+        .expect("vault append after anneal must use refreshed hook");
+    anneal
+        .write(sample_entry(
+            ChangeId(1_571_002),
+            AnnealLedgerAction::Revert,
+            None,
+        ))
+        .expect("same anneal appender append after vault row");
+    vault.flush().expect("flush issue1571 rows");
+
+    let after = physical_ledger_entries(&vault);
+    println!(
+        "ISSUE1571_AFTER rows={} seqs={:?} hashes={:?}",
+        after.len(),
+        after.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+        after
+            .iter()
+            .map(|entry| entry.entry_hash)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(after.len(), 3);
+    for (idx, entry) in after.iter().enumerate() {
+        assert_eq!(entry.seq, idx as u64);
+        if idx == 0 {
+            assert_eq!(entry.prev_hash, [0; 32]);
+        } else {
+            assert_eq!(entry.prev_hash, after[idx - 1].entry_hash);
+        }
+    }
+
+    fs::remove_dir_all(root).ok();
+}
+
 proptest! {
     #![proptest_config(calyx_testkit::integration_proptest_config(32))]
 
@@ -182,6 +251,42 @@ fn memory_ledger() -> AnnealLedger<MemoryLedgerStore, FixedClock> {
     let appender =
         LedgerAppender::open(MemoryLedgerStore::default(), FixedClock::new(TEST_TS)).unwrap();
     AnnealLedger::new(appender, ActorId::Service("calyx-anneal-test".to_string())).unwrap()
+}
+
+fn aster_anneal_ledger(
+    vault: &AsterVault,
+) -> AnnealLedger<AsterAnnealLedgerStore<'_, calyx_core::SystemClock>, FixedClock> {
+    let store = AsterAnnealLedgerStore::new(vault);
+    let appender = LedgerAppender::open(store, FixedClock::new(TEST_TS)).unwrap();
+    AnnealLedger::new(appender, ActorId::Service("calyx-anneal-test".to_string())).unwrap()
+}
+
+fn physical_ledger_entries(vault: &AsterVault) -> Vec<LedgerEntry> {
+    vault
+        .scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)
+        .expect("scan physical Ledger CF")
+        .into_iter()
+        .map(|(key, bytes)| {
+            let entry = decode_ledger(&bytes).expect("decode physical ledger entry");
+            assert_eq!(key, ledger_key(entry.seq));
+            entry
+        })
+        .collect()
+}
+
+fn test_vault_dir(name: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "calyx-anneal-{name}-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+fn vault_id() -> VaultId {
+    "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
 }
 
 fn sample_entry(

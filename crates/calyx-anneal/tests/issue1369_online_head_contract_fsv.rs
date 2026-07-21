@@ -5,10 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
+#[allow(dead_code)]
+// calyx-shared-module: path=support/fsv_bad_change.rs alias=__calyx_shared_support_fsv_bad_change_rs local=support visibility=private
+use crate::__calyx_shared_support_fsv_bad_change_rs as support;
 use calyx_anneal::{
     ActionMetricSnapshot, ArtifactKey, ArtifactPtr, ArtifactReplayMeasurer, AsterHeadStorage,
     AsterMistakeStorage, AsterReplayStorage, HeadKind, MistakeLog, OnlineHead, OnlineHeadState,
-    ReplayBuffer, ReplayQuery, TripwireMetric, decode_online_head, decode_replay_snapshot,
+    ReplayBuffer, ReplayQuery, TripwireMetric, decode_online_head, decode_replay_rows,
     record_mistake_for_replay,
 };
 use calyx_aster::cf::{ColumnFamily, ledger_key};
@@ -19,12 +24,6 @@ use calyx_core::{
 };
 use calyx_ledger::{EntryKind, decode as decode_ledger};
 use serde_json::{Value, json};
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
-#[allow(dead_code)]
-#[path = "support/fsv_bad_change.rs"]
-mod support;
 
 const TEST_TS: u64 = 1_783_800_369;
 const TEST_NAME: &str = "issue1369_online_head_contract_manual_fsv";
@@ -162,8 +161,8 @@ fn readback(root: &Path) -> Result<Value> {
     assert_eq!(fixture, FIXTURE_VALUE);
 
     let replay_rows = vault.scan_cf_at(seq, ColumnFamily::AnnealReplay)?;
-    assert_eq!(replay_rows.len(), 1);
-    let replay = decode_replay_snapshot(&replay_rows[0].1)?;
+    assert_eq!(replay_rows.len(), 2);
+    let replay = decode_replay_rows(&replay_rows)?.expect("replay rows present");
     assert_eq!(replay.entries.len(), 1);
     assert_eq!(replay.entries[0].target, 0.8);
     assert!((replay.entries[0].surprise - 0.2).abs() < 1.0e-12);
@@ -195,8 +194,10 @@ fn readback(root: &Path) -> Result<Value> {
             "value_hex": hex(&fixture),
         },
         "replay": {
-            "key_hex": hex(&replay_rows[0].0),
-            "value_hex": hex(&replay_rows[0].1),
+            "physical_rows": replay_rows.iter().map(|(key, value)| json!({
+                "key_hex": hex(key),
+                "value_hex": hex(value),
+            })).collect::<Vec<_>>(),
             "decoded": replay,
         },
         "predictor": {

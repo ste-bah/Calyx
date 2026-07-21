@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId,
     SlotVector,
@@ -9,13 +12,10 @@ use calyx_core::{
 use calyx_sextant::{HitGuardMode, HnswIndex, Query, QueryGuard, SearchEngine, SlotIndexMap};
 use calyx_ward::{GuardPolicy, GuardProfile, NoveltyAction};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
 use sextant_support::{
     cx_u8_fill as cx, default_vault_id as vault, dense, guarded_test_guard_id as guard_id,
 };
+use sha2::{Digest, Sha256};
 
 #[test]
 fn in_region_only_rejects_empty_required_profile_before_hits() {

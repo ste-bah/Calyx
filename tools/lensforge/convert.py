@@ -207,6 +207,10 @@ def convert_adapter(
     if dim <= 0:
         raise ValueError("multimodal adapter dim is required for this modality")
     license_value = str(model.get("license") or "unknown")
+    provider = str(model.get("provider") or "cuda_fail_loud")
+    max_batch = int(model.get("max_batch") or 32)
+    if max_batch <= 0:
+        raise ValueError("multimodal adapter max_batch must be > 0")
     adapter = {
         "schema": "calyx-multimodal-adapter-v2",
         "name": name,
@@ -218,7 +222,9 @@ def convert_adapter(
         "python": str(model.get("python") or os.environ.get("CALYX_ADAPTER_PYTHON") or sys.executable),
         "helper": helper_path.name,
         "model_file": model_path.name,
-        "provider": str(model.get("provider") or "cpu_explicit"),
+        "provider": provider,
+        "max_batch": max_batch,
+        "batch_policy": "dynamic_padded",
         "timeout_ms": int(model.get("timeout_ms") or 120000),
     }
     if "kmer" in model:
@@ -913,6 +919,17 @@ models:
         adapter_roles = {entry["role"] for entry in adapter_data["files"]}
         if not {"model", "adapter", "helper", "preprocessor"}.issubset(adapter_roles):
             print("self-test adapter files missing", file=sys.stderr)
+            return 1
+        adapter_config = json.loads(
+            (output / "tiny-image-adapter" / "onnx-int8" / "adapter.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if adapter_config["provider"] != "cuda_fail_loud":
+            print("self-test adapter provider default mismatch", file=sys.stderr)
+            return 1
+        if adapter_config["max_batch"] != 32 or adapter_config["batch_policy"] != "dynamic_padded":
+            print("self-test adapter batch policy mismatch", file=sys.stderr)
             return 1
         log_text = (output / "conversion-log.jsonl").read_text(encoding="utf-8")
         if "unsupported_format_modality" not in log_text:

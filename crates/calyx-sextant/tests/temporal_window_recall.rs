@@ -12,10 +12,9 @@
 //! Only seed 15 is inside the query window and it sits at fused position 10 —
 //! past the old max-slot-len budget of 5, which silently dropped it.
 
-use std::collections::BTreeMap;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
 
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CxFlags, CxId, DecayFunction, InputRef, LedgerRef, Modality,
     PeriodicOptions, SlotId, VaultId,
@@ -28,6 +27,7 @@ use calyx_sextant::{
 };
 use calyx_ward::{GuardPolicy, GuardProfile, NoveltyAction};
 use sextant_support::{cx_u8_fill as cx, dense, guarded_test_guard_id as guard_id};
+use std::collections::BTreeMap;
 
 const SLOT_A: SlotId = SlotId::new(8);
 const SLOT_B: SlotId = SlotId::new(9);

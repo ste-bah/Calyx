@@ -1,14 +1,14 @@
 //! PH68 gap #604 - token DiskANN + segmented MaxSim tests.
 
-use std::path::PathBuf;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
 
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{CxId, SlotId, SlotVector};
 use calyx_sextant::index::{
     DiskAnnBuildParams, DiskAnnSearchParams, SextantIndex, TokenDiskAnnMaxSim,
 };
 use sextant_support::cx_usize_be as cx;
+use std::path::PathBuf;
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir()

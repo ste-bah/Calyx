@@ -323,7 +323,7 @@ fn full_collect_reads_live_heap_rss_on_linux() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[test]
 fn full_collect_fails_closed_without_proc() {
     let dir = test_dir("collect-closed");
@@ -346,6 +346,21 @@ fn full_collect_fails_closed_without_proc() {
         .unwrap_err();
     assert_eq!(error.code, CALYX_RESOURCE_PROBE_UNAVAILABLE);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_heap_probe_reads_current_process_working_set() {
+    let before = heap_rss_bytes().expect("read current process working set");
+    let allocation = vec![0x5au8; 4 * 1024 * 1024];
+    std::hint::black_box(&allocation);
+    let after = heap_rss_bytes().expect("read working set after real allocation");
+
+    assert!(before > 0, "Windows working set must be non-zero");
+    assert!(
+        after > 0,
+        "Windows working set after allocation must be non-zero"
+    );
 }
 
 #[test]

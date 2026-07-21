@@ -18,7 +18,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 #[cfg(feature = "cuda")]
-mod grouped_gemm_tests {
+mod cuda_cases {
     use super::*;
 
     #[cfg(feature = "cuda")]

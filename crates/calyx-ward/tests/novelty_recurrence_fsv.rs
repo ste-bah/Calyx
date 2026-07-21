@@ -2,6 +2,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// calyx-shared-module: path=novelty_recurrence_support/mod.rs alias=__calyx_shared_novelty_recurrence_support_mod_rs local=novelty_recurrence_support visibility=private
+
+use crate::__calyx_shared_novelty_recurrence_support_mod_rs as novelty_recurrence_support;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::dedup::EpochSecs;
 use calyx_aster::vault::{AsterVault, VaultOptions};
@@ -11,11 +14,8 @@ use calyx_ward::{
     SurpriseScore, classify_novelty, novelty_action_for_signal, overdue_recurrence_scan,
     surprise_bits,
 };
-use serde_json::{Value, json};
-
-#[path = "novelty_recurrence_support/mod.rs"]
-mod novelty_recurrence_support;
 use novelty_recurrence_support::{append_times, cx, put_base, vault_id};
+use serde_json::{Value, json};
 
 #[test]
 #[ignore = "FSV trigger writes durable manual evidence under CALYX_WARD_ISSUE390_FSV_DIR"]

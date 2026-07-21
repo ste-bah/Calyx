@@ -1,6 +1,4 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use calyx_core::{Input, Lens, Modality, SlotShape, SlotVector};
 use proptest::prelude::*;
@@ -9,9 +7,13 @@ use super::custom::pool_output;
 use super::*;
 
 mod arena_env;
+mod fastembed_fail_loud;
+mod fixture;
 mod runtime_guard;
 
-static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+use fixture::{Fixture, hex32, lens_error};
+#[cfg(feature = "cuda")]
+use fixture::{assert_close, write_onnx_fsv_readback};
 
 #[test]
 #[ignore = "requires ORT_DYLIB_PATH and ORT editor/session runtime"]
@@ -291,6 +293,79 @@ fn custom_onnx_manual_fsv_from_files() {
 }
 
 #[test]
+#[ignore = "requires ORT_DYLIB_PATH, CUDA, and CALYX_FSV_ROOT"]
+#[cfg(feature = "cuda")]
+fn custom_onnx_cuda_device_postprocess_manual_fsv() {
+    let fixture = Fixture::new_cuda_token_matmul("cuda-device-output");
+    let input_text = b"hello calyx".to_vec();
+    let expected = vec![0.6_f32, 0.8_f32];
+    println!(
+        "CUDA_DEVICE_FSV_BEFORE model={} tokenizer={} config={} input_text={}",
+        fixture.model.display(),
+        fixture.tokenizer.display(),
+        fixture.config.display(),
+        String::from_utf8_lossy(&input_text)
+    );
+
+    let lens = OnnxLens::from_files(
+        fixture
+            .spec("custom-cuda-device")
+            .with_provider_policy(OnnxProviderPolicy::CudaFailLoud)
+            .with_expected_shape(SlotShape::Dense(2))
+            .with_max_batch(1),
+    )
+    .unwrap();
+    let vector = lens
+        .measure(&Input::new(Modality::Text, input_text.clone()))
+        .unwrap();
+    let SlotVector::Dense { dim, data } = vector else {
+        panic!("expected dense custom ONNX CUDA vector");
+    };
+    println!("CUDA_DEVICE_FSV_AFTER dim={dim} data={data:?}");
+    assert_eq!(dim, 2);
+    assert_close(&data, &expected, 1.0e-5);
+    let norm = data.iter().map(|value| value * value).sum::<f32>().sqrt();
+
+    let payload = serde_json::json!({
+        "source_of_truth": "SlotVector returned after ONNX Runtime CUDA output binding and Forge CUDA postprocess, persisted to this CALYX_FSV_ROOT JSON readback",
+        "before": {
+            "model": fixture.model.display().to_string(),
+            "tokenizer": fixture.tokenizer.display().to_string(),
+            "config": fixture.config.display().to_string(),
+            "input_text": String::from_utf8_lossy(&input_text).to_string(),
+            "input_token_ids": [1, 2],
+            "expected_device_output_before_pool": [[[3.0, 4.0], [6.0, 8.0]]],
+            "expected_pooling": "mean over two unmasked tokens",
+        },
+        "expected": {
+            "dim": 2,
+            "data": expected,
+            "norm": 1.0,
+        },
+        "after": {
+            "runtime": lens.runtime_name(),
+            "provider_policy": lens.provider_policy(),
+            "lens_id": format!("{:?}", lens.id()),
+            "shape": format!("{:?}", lens.shape()),
+            "dim": dim,
+            "data": data,
+            "norm": norm,
+        },
+        "checks": {
+            "device_output_audit": "device_tensor() rejects CPU outputs before Forge postprocess; reaching this readback proves ORT returned CUDA memory",
+            "postprocess": "Forge CUDA mean-pooling + L2 normalization returned the expected compact vector",
+        }
+    });
+    let readback_path = write_onnx_fsv_readback("custom-onnx-cuda-device-readback.json", payload);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&readback_path).unwrap()).unwrap();
+    assert_eq!(persisted["after"]["dim"], serde_json::json!(2));
+    assert_eq!(persisted["after"]["data"].as_array().unwrap().len(), 2);
+    println!("CUDA_DEVICE_FSV_READBACK={}", readback_path.display());
+    println!("CUDA_DEVICE_FSV_READBACK_JSON={persisted}");
+}
+
+#[test]
 #[ignore = "manual PH73 edge FSV prints source-of-truth file states"]
 fn custom_onnx_edges_manual_fsv() {
     let missing = Fixture::new("edge-missing-tokenizer", &[3.0, 4.0, 0.0]);
@@ -345,125 +420,4 @@ fn custom_onnx_edges_manual_fsv() {
         drift_error.code
     );
     assert_eq!(drift_error.code, "CALYX_LENS_FROZEN_VIOLATION");
-}
-
-struct Fixture {
-    root: PathBuf,
-    model: PathBuf,
-    tokenizer: PathBuf,
-    config: PathBuf,
-}
-
-impl Fixture {
-    fn new(name: &str, output: &[f32]) -> Self {
-        let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "calyx-custom-onnx-{name}-{}-{id}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let model = root.join("model.onnx");
-        let tokenizer = root.join("tokenizer.json");
-        let config = root.join("config.json");
-        write_tokenizer(&tokenizer);
-        fs::write(
-            &config,
-            r#"{"model_type":"calyx-test","hidden_size":3,"pooling":"mean"}"#,
-        )
-        .unwrap();
-        write_model(&model, output);
-        Self {
-            root,
-            model,
-            tokenizer,
-            config,
-        }
-    }
-
-    fn spec(&self, name: &str) -> OnnxFileSpec {
-        OnnxFileSpec::text(
-            name,
-            "calyx-test-custom-onnx",
-            self.model.clone(),
-            self.tokenizer.clone(),
-            self.config.clone(),
-            PoolingPolicy::Mean,
-            NormPolicy::unit(),
-        )
-        .with_provider_policy(OnnxProviderPolicy::CpuExplicit)
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-fn write_tokenizer(path: &Path) {
-    fs::write(
-        path,
-        r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"hello":1,"calyx":2},"unk_token":"[UNK]"}}"#,
-    )
-    .unwrap();
-}
-
-fn write_model(path: &Path, output: &[f32]) {
-    use ort::editor::{Graph, Model, ONNX_DOMAIN, Opset};
-    use ort::memory::Allocator;
-    use ort::session::Session;
-    use ort::value::{Outlet, Shape, SymbolicDimensions, Tensor, TensorElementType, ValueType};
-
-    let mut graph = Graph::new().unwrap();
-    graph
-        .set_inputs([Outlet::new(
-            "input_ids",
-            ValueType::Tensor {
-                ty: TensorElementType::Int64,
-                shape: Shape::new([1, -1]),
-                dimension_symbols: SymbolicDimensions::empty(2),
-            },
-        )])
-        .unwrap();
-    graph
-        .set_outputs([Outlet::new(
-            "sentence_embedding",
-            ValueType::Tensor {
-                ty: TensorElementType::Float32,
-                shape: Shape::new([1, output.len() as i64]),
-                dimension_symbols: SymbolicDimensions::empty(2),
-            },
-        )])
-        .unwrap();
-    let mut tensor =
-        Tensor::<f32>::new(&Allocator::default(), [1_i64, output.len() as i64]).unwrap();
-    tensor.extract_tensor_mut().1.copy_from_slice(output);
-    graph
-        .add_initializer("sentence_embedding", tensor, false)
-        .unwrap();
-    let mut model = Model::new([Opset::new(ONNX_DOMAIN, 22).unwrap()]).unwrap();
-    model.add_graph(graph).unwrap();
-    let builder = Session::builder()
-        .unwrap()
-        .with_optimized_model_path(path)
-        .unwrap();
-    let session = model.into_session(&builder).unwrap();
-    drop(session);
-    assert!(
-        path.is_file(),
-        "expected ORT to materialize {}",
-        path.display()
-    );
-}
-
-fn lens_error(result: Result<OnnxLens>) -> calyx_core::CalyxError {
-    match result {
-        Ok(lens) => panic!("expected error, got lens {}", lens.id()),
-        Err(error) => error,
-    }
-}
-
-fn hex32(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

@@ -1,16 +1,21 @@
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use crate::error::{PolyError, Result};
+use crate::exact_knn::{
+    EXACT_KNN_MAX_DEVICE_K, EXACT_KNN_RERANK_GUARD_ROWS, ExactKnnExecution, exact_cosine_top_k,
+};
 use crate::parameter_adaptation_types::*;
 
 pub(crate) fn proposed_parameters(
     request: &ParameterAdaptationRequest,
+    knn_briers: &KnnBrierTable,
 ) -> Result<ParameterSetSnapshot> {
     let sigma = standard_deviation(request.observations.iter().map(|row| row.scalar_value))?;
     let quantile_edges =
         quantile_edges(request.observations.iter().map(|row| row.heavy_tail_value))?;
     let te_lag = best_te_lag(&request.observations, request.schedule.max_te_lag)?;
-    let knn_k = best_knn_k(&request.observations, &request.schedule.candidate_knn_k)?;
+    let knn_k = best_knn_k(&request.schedule.candidate_knn_k, knn_briers)?;
     let version_hash = version_hash(request, sigma, &quantile_edges, te_lag, knn_k);
     Ok(ParameterSetSnapshot {
         version: format!(
@@ -30,9 +35,10 @@ pub(crate) fn proposed_parameters(
 pub(crate) fn adaptation_metrics(
     request: &ParameterAdaptationRequest,
     proposed: &ParameterSetSnapshot,
+    knn_briers: &KnnBrierTable,
 ) -> Result<ParameterAdaptationMetrics> {
-    let current_knn_brier = loo_knn_brier(&request.observations, request.current.knn_k)?;
-    let selected_knn_brier = loo_knn_brier(&request.observations, proposed.knn_k)?;
+    let current_knn_brier = knn_briers.get(request.current.knn_k)?;
+    let selected_knn_brier = knn_briers.get(proposed.knn_k)?;
     Ok(ParameterAdaptationMetrics {
         current_knn_brier,
         selected_knn_brier,
@@ -40,6 +46,103 @@ pub(crate) fn adaptation_metrics(
         selected_te_score: lag_score(&request.observations, proposed.te_lag)?,
         selected_sigma: proposed.encoder_sigma,
         selected_knn_k: proposed.knn_k,
+    })
+}
+
+pub(crate) struct KnnBrierTable {
+    values: BTreeMap<usize, f64>,
+    pub(crate) execution: ExactKnnExecution,
+}
+
+impl KnnBrierTable {
+    fn get(&self, k: usize) -> Result<f64> {
+        self.values.get(&k).copied().ok_or_else(|| {
+            PolyError::diagnostics(
+                ERR_PARAMETER_ADAPTATION_INVALID_REQUEST,
+                format!("missing reused kNN Brier value for k={k}"),
+            )
+        })
+    }
+}
+
+pub(crate) fn knn_brier_table(
+    rows: &[ParameterObservation],
+    requested_k: &[usize],
+) -> Result<KnnBrierTable> {
+    for &k in requested_k {
+        if k == 0 || k >= rows.len() {
+            return invalid("kNN k must be in 1..observation_count");
+        }
+    }
+    let max_k = requested_k.iter().copied().max().ok_or_else(|| {
+        PolyError::diagnostics(
+            ERR_PARAMETER_ADAPTATION_INVALID_REQUEST,
+            "kNN scoring requires at least one requested k",
+        )
+    })?;
+    let max_output_k = EXACT_KNN_MAX_DEVICE_K - 1;
+    let candidate_k = if max_k > max_output_k {
+        max_k
+    } else {
+        max_k
+            .saturating_add(EXACT_KNN_RERANK_GUARD_ROWS)
+            .min(rows.len() - 1)
+            .min(max_output_k)
+    };
+    let vectors = rows
+        .iter()
+        .map(|row| row.knn_vector.as_slice())
+        .collect::<Vec<_>>();
+    let excluded = (0..rows.len()).collect::<Vec<_>>();
+    let mut exact = exact_cosine_top_k(&vectors, &vectors, candidate_k, Some(&excluded))?;
+    exact.execution.shortlist_cpu_similarity_evaluations = exact
+        .rankings
+        .iter()
+        .map(|ranking| ranking.len() as u64)
+        .sum();
+    let mut totals = requested_k
+        .iter()
+        .copied()
+        .map(|k| (k, 0.0f64))
+        .collect::<BTreeMap<_, _>>();
+    for (query_idx, candidates) in exact.rankings.iter().enumerate() {
+        let mut ranking = candidates
+            .iter()
+            .map(|other| {
+                (
+                    cosine(&rows[query_idx].knn_vector, &rows[*other].knn_vector),
+                    *other,
+                )
+            })
+            .collect::<Vec<_>>();
+        ranking.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        ranking.truncate(max_k);
+        let mut yes_prefix = vec![0usize; max_k + 1];
+        for (rank, (_, other)) in ranking.iter().enumerate() {
+            yes_prefix[rank + 1] = yes_prefix[rank] + usize::from(rows[*other].outcome_yes);
+        }
+        let y = if rows[query_idx].outcome_yes {
+            1.0
+        } else {
+            0.0
+        };
+        for (k, total) in &mut totals {
+            let p = yes_prefix[*k] as f64 / *k as f64;
+            *total += (p - y) * (p - y);
+        }
+    }
+    for total in totals.values_mut() {
+        *total /= rows.len() as f64;
+    }
+    Ok(KnnBrierTable {
+        values: totals,
+        execution: exact.execution,
     })
 }
 
@@ -146,46 +249,15 @@ fn correlation_abs(pairs: &[(f64, f64)]) -> f64 {
     }
 }
 
-fn best_knn_k(rows: &[ParameterObservation], candidates: &[usize]) -> Result<usize> {
+fn best_knn_k(candidates: &[usize], briers: &KnnBrierTable) -> Result<usize> {
     let mut best = (0, f64::INFINITY);
     for &k in candidates {
-        if k == 0 || k >= rows.len() {
-            return invalid("candidate kNN k must be in 1..observation_count");
-        }
-        let brier = loo_knn_brier(rows, k)?;
+        let brier = briers.get(k)?;
         if brier < best.1 {
             best = (k, brier);
         }
     }
     Ok(best.0)
-}
-
-fn loo_knn_brier(rows: &[ParameterObservation], k: usize) -> Result<f64> {
-    if k == 0 || k >= rows.len() {
-        return invalid("kNN k must be in 1..observation_count");
-    }
-    let mut total = 0.0;
-    for idx in 0..rows.len() {
-        let mut sims = (0..rows.len())
-            .filter(|other| *other != idx)
-            .map(|other| {
-                (
-                    cosine(&rows[idx].knn_vector, &rows[other].knn_vector),
-                    other,
-                )
-            })
-            .collect::<Vec<_>>();
-        sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-        let yes = sims
-            .iter()
-            .take(k)
-            .filter(|(_, other)| rows[*other].outcome_yes)
-            .count();
-        let p = yes as f64 / k as f64;
-        let y = if rows[idx].outcome_yes { 1.0 } else { 0.0 };
-        total += (p - y) * (p - y);
-    }
-    Ok(total / rows.len() as f64)
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {

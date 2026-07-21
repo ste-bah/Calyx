@@ -1,7 +1,5 @@
-use std::fs;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{BoostConfig, CALYX_TEMPORAL_AP60_VIOLATION, CxId, DecayFunction, LedgerRef};
 use calyx_sextant::{
     FreshnessTag, FusionWeights, Hit, PeriodicOptions, ProvenanceSource, TemporalPolicy,
@@ -9,6 +7,7 @@ use calyx_sextant::{
 };
 use serde_json::json;
 use sextant_support::{fsv_root, reset_dir, write_json, write_root_file_blake3_sums};
+use std::fs;
 
 #[test]
 fn temporal_boost_fsv_writes_ranked_readback() {

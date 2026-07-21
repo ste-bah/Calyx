@@ -311,7 +311,7 @@ fn vault_readback_cusum_finds_planted_change_point() {
 
 /// manual FSV: writes the byte-readback SoT JSON. Run with
 /// `CALYX_FSV_ROOT=/var/lib/calyx/data/fsv-issue585-recurrence-hazard \
-///  cargo test -p calyx-assay --test recurrence_hazard_fsv -- --ignored --nocapture`
+///  cargo test -p calyx-assay --test __calyx_integration_suite_1 recurrence_hazard_fsv -- --ignored --nocapture`
 #[test]
 #[ignore = "manual FSV writes recurrence-hazard source-of-truth readbacks"]
 fn recurrence_hazard_manual_fsv() {

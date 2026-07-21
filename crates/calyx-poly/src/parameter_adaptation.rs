@@ -6,16 +6,27 @@ use std::path::{Path, PathBuf};
 
 use crate::diagnostics_store::{read_json, write_json};
 use crate::error::{PolyError, Result};
-use crate::parameter_adaptation_math::{adaptation_metrics, proposed_parameters, validate_edges};
+use crate::exact_knn::ExactKnnExecution;
+use crate::parameter_adaptation_math::{
+    adaptation_metrics, knn_brier_table, proposed_parameters, validate_edges,
+};
 pub use crate::parameter_adaptation_types::*;
 
 pub fn run_parameter_adaptation_report(
     request: &ParameterAdaptationRequest,
     output_root: &Path,
 ) -> Result<ParameterAdaptationRun> {
+    run_parameter_adaptation_report_with_execution(request, output_root).map(|result| result.0)
+}
+
+pub fn run_parameter_adaptation_report_with_execution(
+    request: &ParameterAdaptationRequest,
+    output_root: &Path,
+) -> Result<(ParameterAdaptationRun, ExactKnnExecution)> {
     let ledger_path = Path::new(&request.ledger_dir).join(PARAMETER_ADAPTATION_LEDGER_FILE);
     let before = read_parameter_adaptation_ledger_entries(&ledger_path)?;
-    let report = compute_parameter_adaptation_report(request, before.len() as u64)?;
+    let (report, execution) =
+        compute_parameter_adaptation_report_with_execution(request, before.len() as u64)?;
     let report_path = write_parameter_adaptation_report(output_root, &report)?;
     if let Some(entry) = &report.ledger_entry {
         append_ledger_entry(&ledger_path, entry)?;
@@ -42,21 +53,40 @@ pub fn run_parameter_adaptation_report(
             ),
         ));
     }
-    Ok(ParameterAdaptationRun {
-        report_path,
-        ledger_path,
-        report: readback,
-        ledger_entries,
-    })
+    Ok((
+        ParameterAdaptationRun {
+            report_path,
+            ledger_path,
+            report: readback,
+            ledger_entries,
+        },
+        execution,
+    ))
 }
 
 pub fn compute_parameter_adaptation_report(
     request: &ParameterAdaptationRequest,
     next_ledger_sequence: u64,
 ) -> Result<ParameterAdaptationReport> {
+    compute_parameter_adaptation_report_with_execution(request, next_ledger_sequence)
+        .map(|result| result.0)
+}
+
+pub fn compute_parameter_adaptation_report_with_execution(
+    request: &ParameterAdaptationRequest,
+    next_ledger_sequence: u64,
+) -> Result<(ParameterAdaptationReport, ExactKnnExecution)> {
     validate_request(request)?;
-    let proposed = proposed_parameters(request)?;
-    let metrics = adaptation_metrics(request, &proposed)?;
+    let required_k = request
+        .schedule
+        .candidate_knn_k
+        .iter()
+        .copied()
+        .chain(std::iter::once(request.current.knn_k))
+        .collect::<Vec<_>>();
+    let knn_briers = knn_brier_table(&request.observations, &required_k)?;
+    let proposed = proposed_parameters(request, &knn_briers)?;
+    let metrics = adaptation_metrics(request, &proposed, &knn_briers)?;
     let changed_parameters = changed_parameters(&request.current, &proposed);
     let promote = !changed_parameters.is_empty()
         && metrics.brier_improvement >= request.schedule.min_brier_improvement;
@@ -79,7 +109,7 @@ pub fn compute_parameter_adaptation_report(
         report_hash: report_hash.clone(),
         scheduled_at_ts: request.schedule.scheduled_at_ts,
     });
-    Ok(ParameterAdaptationReport {
+    let report = ParameterAdaptationReport {
         schema_version: PARAMETER_ADAPTATION_SCHEMA_VERSION.to_string(),
         artifact_kind: PARAMETER_ADAPTATION_ARTIFACT_KIND.to_string(),
         domain: request.domain.clone(),
@@ -100,7 +130,8 @@ pub fn compute_parameter_adaptation_report(
         rollback_artifact: request.rollback_artifact.clone(),
         ledger_entry,
         report_hash,
-    })
+    };
+    Ok((report, knn_briers.execution))
 }
 
 pub fn write_parameter_adaptation_report(

@@ -55,6 +55,7 @@ pub(super) fn ingest_media_with_derived_text(
         commit.artifact.ledger_ref.seq
     };
     vault.flush()?;
+    crate::tools::search_generation::publish_search_generation(&resolved.path, &vault, &state)?;
     Ok(vec![
         IngestReport {
             cx_id: media.cx_id.to_string(),

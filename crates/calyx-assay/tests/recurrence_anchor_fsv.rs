@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "recurrence_anchor_support/mod.rs"]
+mod recurrence_anchor_support;
 use calyx_assay::{
     Domain, OutcomeAgreement, measure_outcome_agreement, oracle_self_consistency,
     outcome_occurrence_context,
@@ -13,11 +15,8 @@ use calyx_aster::recurrence::{
 };
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{AnchorKind, AnchorValue, CxId, VaultStore};
-use serde_json::{Value, json};
-
-#[path = "recurrence_anchor_support/mod.rs"]
-mod recurrence_anchor_support;
 use recurrence_anchor_support::{append_outcomes, base_cx, cx_id, vault_id};
+use serde_json::{Value, json};
 
 #[test]
 #[ignore = "FSV trigger writes durable manual evidence under CALYX_ASSAY_ISSUE387_FSV_DIR"]

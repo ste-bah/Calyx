@@ -6,7 +6,7 @@
 //! reopen the vault, and assert hand-computed expectations. Run:
 //!
 //! ```text
-//! cargo test -p calyx-aster --test btree_query_fsv -- --nocapture
+//! cargo test -p calyx-aster --test __calyx_integration_suite_0 btree_query_fsv -- --nocapture
 //! ```
 
 use std::fs;
@@ -27,7 +27,9 @@ use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{Clock, VaultId};
 use serde_json::{Value, json};
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::collect_physical_file_states;
 
 fn vault_id() -> VaultId {

@@ -3,8 +3,8 @@
 //! Source of truth: scheduler state/report JSON plus delegated #238 harness state read back from
 //! disk, with vault ledger rows for captured pending forecasts.
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use std::fs;
 use std::path::Path;

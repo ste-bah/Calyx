@@ -1,9 +1,5 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::time::Duration;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, SlotVector, VaultId};
 use calyx_sextant::{
     FusionStrategy, HnswIndex, InvertedIndex, ProvenanceSource, Query, RerankCandidateText,
@@ -11,8 +7,13 @@ use calyx_sextant::{
 };
 use serde_json::json;
 use sextant_support::cx_u8_fill as cx;
+use std::collections::BTreeMap;
+use std::fs;
+use std::time::Duration;
 
-mod reranker_support;
+// calyx-shared-module: path=reranker_support/mod.rs alias=__calyx_shared_reranker_support_mod_rs local=reranker_support visibility=private
+
+use crate::__calyx_shared_reranker_support_mod_rs as reranker_support;
 use reranker_support::spawn_reranker;
 
 #[test]

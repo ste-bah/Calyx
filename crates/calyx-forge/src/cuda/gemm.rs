@@ -29,6 +29,35 @@ pub fn gemm_cublas(
     gemm_checked_with_blas(ctx, blas.as_ref(), a, b, GemmDims::new(m, k, n), out)
 }
 
+pub(crate) fn gram_rows_cublas(
+    ctx: &CudaContext,
+    rows: &CudaSlice<f32>,
+    row_count: usize,
+    dim: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    check_device_shape(rows.len(), row_count, dim, "cuda.gram rows")?;
+    check_device_shape(out.len(), row_count, row_count, "cuda.gram output")?;
+    if row_count == 0 || dim == 0 {
+        return Ok(());
+    }
+    let config = GemmConfig {
+        transa: sys::cublasOperation_t::CUBLAS_OP_T,
+        transb: sys::cublasOperation_t::CUBLAS_OP_N,
+        m: to_i32(row_count, "gram rows")?,
+        n: to_i32(row_count, "gram columns")?,
+        k: to_i32(dim, "gram dimension")?,
+        alpha: 1.0,
+        lda: to_i32(dim, "gram lda")?,
+        ldb: to_i32(dim, "gram ldb")?,
+        beta: 0.0,
+        ldc: to_i32(row_count, "gram ldc")?,
+    };
+    let blas = new_blas(ctx)?;
+    unsafe { blas.gemm(config, rows, rows, out) }
+        .map_err(|err| cublas_numerical(format!("Loom Gram cublasSgemm_v2 failed: {err}")))
+}
+
 pub(crate) struct GemmCublasRequest<'a> {
     pub(crate) ctx: &'a CudaContext,
     pub(crate) blas: &'a CudaBlas,

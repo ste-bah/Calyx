@@ -7,6 +7,9 @@
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cuda_strict::strict_cuda_requested;
+#[cfg(feature = "cuda")]
+use crate::partial_correlation::correlation_inference;
 use crate::partial_correlation::{MIN_PEARSON_SAMPLES, pearson};
 
 pub const CCF_LAG_CONVENTION: &str =
@@ -38,6 +41,9 @@ pub fn cross_correlation_profile(
     y: &[f32],
     max_lag: usize,
 ) -> Result<CrossCorrelationReport> {
+    if strict_cuda_requested() {
+        return cross_correlation_profile_cuda_strict(x, y, max_lag);
+    }
     if x.len() != y.len() {
         return Err(CalyxError::assay_insufficient_samples(format!(
             "CCF requires paired series: x={} y={}",
@@ -90,6 +96,110 @@ pub fn cross_correlation_profile(
         peak_abs_correlation: peak.correlation.abs(),
         points,
     })
+}
+
+/// Strict CUDA signed cross-correlation profile. This never falls back to CPU.
+pub fn cross_correlation_profile_cuda_strict(
+    x: &[f32],
+    y: &[f32],
+    max_lag: usize,
+) -> Result<CrossCorrelationReport> {
+    cross_correlation_profile_cuda_strict_impl(x, y, max_lag)
+}
+
+#[cfg(feature = "cuda")]
+fn cross_correlation_profile_cuda_strict_impl(
+    x: &[f32],
+    y: &[f32],
+    max_lag: usize,
+) -> Result<CrossCorrelationReport> {
+    validate_ccf_request(x, y, max_lag)?;
+    let backend = calyx_forge::CudaBackend::new()
+        .map_err(|err| crate::cuda_strict::forge_to_calyx("cross-correlation", err))?;
+    let batch = calyx_forge::cross_correlation_batch_host(
+        backend.context(),
+        x,
+        y,
+        max_lag,
+        MIN_PEARSON_SAMPLES,
+    )
+    .map_err(|err| crate::cuda_strict::forge_linear_algebra_to_calyx("cross-correlation", err))?;
+    let mut points = Vec::with_capacity(max_lag * 2 + 1);
+    for (idx, (&r, &n_pairs)) in batch
+        .correlations
+        .iter()
+        .zip(batch.n_pairs.iter())
+        .enumerate()
+    {
+        let lag = idx as isize - max_lag as isize;
+        let (t_statistic, p_value, ci_low, ci_high) = correlation_inference(r as f64, n_pairs, 0)?;
+        let _ = t_statistic;
+        points.push(CrossCorrelationPoint {
+            lag,
+            correlation: r,
+            p_value: p_value as f32,
+            ci_low: ci_low as f32,
+            ci_high: ci_high as f32,
+            n_pairs,
+        });
+    }
+    let peak = points
+        .iter()
+        .max_by(|left, right| {
+            let by_abs = left.correlation.abs().total_cmp(&right.correlation.abs());
+            by_abs
+                .then_with(|| left.n_pairs.cmp(&right.n_pairs))
+                .then_with(|| right.lag.abs().cmp(&left.lag.abs()))
+        })
+        .expect("non-empty lag range");
+    Ok(CrossCorrelationReport {
+        lag_convention: CCF_LAG_CONVENTION.to_string(),
+        max_lag,
+        n_samples: x.len(),
+        peak_lag: peak.lag,
+        peak_correlation: peak.correlation,
+        peak_abs_correlation: peak.correlation.abs(),
+        points,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cross_correlation_profile_cuda_strict_impl(
+    _x: &[f32],
+    _y: &[f32],
+    _max_lag: usize,
+) -> Result<CrossCorrelationReport> {
+    Err(crate::cuda_strict::cuda_unavailable("cross-correlation"))
+}
+
+#[cfg(feature = "cuda")]
+fn validate_ccf_request(x: &[f32], y: &[f32], max_lag: usize) -> Result<()> {
+    if x.len() != y.len() {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "CCF requires paired series: x={} y={}",
+            x.len(),
+            y.len()
+        )));
+    }
+    let n = x.len();
+    if n < MIN_PEARSON_SAMPLES {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "CCF requires at least {MIN_PEARSON_SAMPLES} paired samples; got {n}"
+        )));
+    }
+    if max_lag > n - MIN_PEARSON_SAMPLES {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "CCF max_lag {max_lag} leaves fewer than {MIN_PEARSON_SAMPLES} paired samples at the boundary for n={n}"
+        )));
+    }
+    for (idx, (&left, &right)) in x.iter().zip(y.iter()).enumerate() {
+        if !(left.is_finite() && right.is_finite()) {
+            return Err(CalyxError::assay_insufficient_samples(format!(
+                "CCF sample {idx} contains NaN or infinity"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn shifted_slices<'a>(x: &'a [f32], y: &'a [f32], lag: isize) -> (&'a [f32], &'a [f32]) {

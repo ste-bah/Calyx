@@ -1,18 +1,14 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::vault::{AsterVault, VaultOptions, encode};
-use calyx_core::{
-    Asymmetry, Constellation, CxFlags, InputRef, LedgerRef, LensId, Modality, QuantPolicy, Slot,
-    SlotId, SlotKey, SlotShape, SlotState, SlotVector, VaultId,
-};
-use calyx_registry::frozen::{NormPolicy, sha256_digest};
+use calyx_core::{QuantPolicy, SlotId, SlotShape, SlotVector};
+use calyx_registry::frozen::sha256_digest;
 use calyx_registry::{
-    CALYX_VECTOR_COMPRESSION_INVALID, LensRuntime, LensSpec, StoredSlotCodec,
-    decode_stored_slot_envelope, write_compressed_slot_batch,
+    CALYX_VECTOR_COMPRESSION_INVALID, StoredSlotCodec, decode_stored_slot_envelope,
+    write_compressed_slot_batch,
 };
 use serde_json::{Value, json};
 
@@ -222,6 +218,6 @@ fn display(path: &Path) -> String {
 }
 
 #[allow(dead_code)]
-#[path = "issue790_vector_compression_fsv/support.rs"]
-mod support;
+// calyx-shared-module: path=issue790_vector_compression_fsv/support.rs alias=__calyx_shared_issue790_vector_compression_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_issue790_vector_compression_fsv_support_rs as support;
 use support::*;

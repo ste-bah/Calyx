@@ -5,7 +5,8 @@ use calyx_core::{Asymmetry, CalyxError, Result};
 
 use crate::frozen::{NormPolicy, sha256_digest};
 use crate::runtime::adapters::{allow_noncommercial_from_env, ensure_license_allowed};
-use crate::spec::{FastembedBgem3Output, LensRuntime, LensSpec};
+use crate::runtime::qwen3::DEFAULT_QWEN3_MAX_TOKENS;
+use crate::spec::{Bgem3Engine, FastembedBgem3Output, LensRuntime, LensSpec};
 
 use super::algorithmic_manifest::{
     algorithmic_kind, frozen_contract as algorithmic_frozen_contract, is_algorithmic_runtime,
@@ -45,6 +46,10 @@ pub fn lens_spec_metadata_from_manifest(
     let output = manifest.output_shape()?;
     let algorithmic_contract =
         algorithmic_frozen_contract(&manifest.name, &manifest.runtime, manifest.modality, output)?;
+    let max_tokens_hash = manifest
+        .max_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_default();
     let (output, weights_sha256, corpus_hash, norm_policy) =
         if let Some(contract) = algorithmic_contract {
             (
@@ -65,6 +70,7 @@ pub fn lens_spec_metadata_from_manifest(
                     modality_token(manifest.modality).as_bytes(),
                     manifest.pooling.as_bytes(),
                     manifest.norm.as_bytes(),
+                    max_tokens_hash.as_bytes(),
                 ]),
                 norm_policy(&manifest.norm)?,
             )
@@ -123,6 +129,11 @@ fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
         && max_batch == 0
     {
         return Err(config_invalid("lensforge manifest max_batch must be > 0"));
+    }
+    if let Some(max_tokens) = manifest.max_tokens
+        && max_tokens == 0
+    {
+        return Err(config_invalid("lensforge manifest max_tokens must be > 0"));
     }
     if let Some(truncate_dim) = manifest.truncate_dim
         && (truncate_dim == 0 || truncate_dim > manifest.dim)
@@ -200,16 +211,37 @@ fn metadata_runtime_from_manifest(
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
             output: FastembedBgem3Output::Dense,
+            engine: Bgem3Engine::FastembedCpu,
         }),
         "fastembed-bgem3-sparse" => Ok(LensRuntime::FastembedBgem3 {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
             output: FastembedBgem3Output::Sparse,
+            engine: Bgem3Engine::FastembedCpu,
         }),
         "fastembed-bgem3-colbert" => Ok(LensRuntime::FastembedBgem3 {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
             output: FastembedBgem3Output::Colbert,
+            engine: Bgem3Engine::FastembedCpu,
+        }),
+        "onnx-bgem3-dense" => Ok(LensRuntime::FastembedBgem3 {
+            model_id: manifest.source_hf_id.clone(),
+            files: file_paths,
+            output: FastembedBgem3Output::Dense,
+            engine: Bgem3Engine::OnnxCuda,
+        }),
+        "onnx-bgem3-sparse" => Ok(LensRuntime::FastembedBgem3 {
+            model_id: manifest.source_hf_id.clone(),
+            files: file_paths,
+            output: FastembedBgem3Output::Sparse,
+            engine: Bgem3Engine::OnnxCuda,
+        }),
+        "onnx-bgem3-colbert" => Ok(LensRuntime::FastembedBgem3 {
+            model_id: manifest.source_hf_id.clone(),
+            files: file_paths,
+            output: FastembedBgem3Output::Colbert,
+            engine: Bgem3Engine::OnnxCuda,
         }),
         "fastembed-reranker" => Ok(LensRuntime::FastembedReranker {
             model_id: manifest.source_hf_id.clone(),
@@ -219,6 +251,7 @@ fn metadata_runtime_from_manifest(
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
             dtype: manifest.dtype.clone(),
+            max_tokens: manifest.max_tokens.unwrap_or(DEFAULT_QWEN3_MAX_TOKENS),
         }),
         "candle" | "candle-fp16" | "candle-local" => Ok(LensRuntime::CandleLocal {
             model_id: manifest.source_hf_id.clone(),
@@ -405,6 +438,7 @@ mod tests {
             truncate_dim: None,
             recall_delta: crate::spec::default_recall_delta(),
             max_batch: None,
+            max_tokens: None,
             batch_policy: None,
         };
         let manifest_path = root.join("manifest.json");

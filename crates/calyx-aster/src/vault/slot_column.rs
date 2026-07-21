@@ -1,7 +1,7 @@
 use super::{AsterVault, encode};
 use crate::cf::ColumnFamily;
 use crate::mmap_col::MmapColumn;
-use crate::sst::arrow::{decode_column_chunk, encode_column_chunk};
+use crate::sst::arrow::{decode_column_chunk, encode_column_chunk_accelerated};
 use calyx_core::{CalyxError, Clock, CxId, Result, Seq, SlotId, SlotVector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,11 @@ pub struct SlotColumnMaterialization {
     pub manifest_sha256: String,
     pub chunk_sha256: String,
     pub cx_ids: Vec<CxId>,
+    pub transpose_backend: &'static str,
+    pub transpose_kernel_launches: u64,
+    pub transpose_h2d_bytes: u64,
+    pub transpose_d2h_bytes: u64,
+    pub transpose_peak_pinned_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +78,7 @@ where
             .iter()
             .map(|row| row.values.as_slice())
             .collect::<Vec<_>>();
-        let chunk_bytes = encode_column_chunk(&refs)?;
+        let (chunk_bytes, transpose) = encode_column_chunk_accelerated(&refs)?;
         let chunk_sha256 = sha256_hex(&chunk_bytes);
         let chunk_path = output_dir.join(CHUNK_FILE);
         write_atomic(&chunk_path, &chunk_bytes)?;
@@ -109,6 +114,11 @@ where
             manifest_sha256,
             chunk_sha256,
             cx_ids: manifest.cx_ids,
+            transpose_backend: transpose.backend,
+            transpose_kernel_launches: transpose.kernel_launches,
+            transpose_h2d_bytes: transpose.host_to_device_bytes,
+            transpose_d2h_bytes: transpose.device_to_host_bytes,
+            transpose_peak_pinned_bytes: transpose.peak_pinned_staging_bytes,
         })
     }
 

@@ -9,6 +9,9 @@ use calyx_core::{Clock, CxId, Seq};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PolyError, Result};
+use crate::exact_knn::{
+    EXACT_KNN_MAX_DEVICE_K, EXACT_KNN_RERANK_GUARD_ROWS, ExactKnnExecution, exact_cosine_top_k,
+};
 use crate::knn_base_rate::ResolvedExemplar;
 
 pub const KNN_GRAPH_SCHEMA_VERSION: &str = "poly.knn_graph_edges.v1";
@@ -83,7 +86,19 @@ pub fn persist_knn_edges_on_ingest<C: Clock>(
     corpus: &[ResolvedExemplar],
     k: usize,
 ) -> Result<KnnGraphRun> {
-    let hits = compute_knn_edges(domain, ingested, corpus, k)?;
+    persist_knn_edges_on_ingest_with_execution(vault, collection, domain, ingested, corpus, k)
+        .map(|result| result.0)
+}
+
+pub fn persist_knn_edges_on_ingest_with_execution<C: Clock>(
+    vault: &AsterVault<C>,
+    collection: &str,
+    domain: &str,
+    ingested: &ResolvedExemplar,
+    corpus: &[ResolvedExemplar],
+    k: usize,
+) -> Result<(KnnGraphRun, ExactKnnExecution)> {
+    let (hits, execution) = compute_knn_edges_with_execution(domain, ingested, corpus, k)?;
     let graph = PlainGraph::new(vault, collection)?;
     let corpus_by_cx: BTreeMap<CxId, &ResolvedExemplar> =
         corpus.iter().map(|row| (row.cx_id, row)).collect();
@@ -131,19 +146,22 @@ pub fn persist_knn_edges_on_ingest<C: Clock>(
             value_blake3: blake3::hash(&bytes).to_hex().to_string(),
         });
     }
-    Ok(KnnGraphRun {
-        schema_version: KNN_GRAPH_SCHEMA_VERSION.to_string(),
-        collection: collection.to_string(),
-        domain: domain.to_string(),
-        ingested_cx_id: ingested.cx_id,
-        k,
-        corpus_len: corpus.len(),
-        edge_count: hits.len(),
-        snapshot_seq,
-        graph_cf_row_count: vault.scan_cf_at(snapshot_seq, ColumnFamily::Graph)?.len(),
-        edges: hits,
-        readback_edges,
-    })
+    Ok((
+        KnnGraphRun {
+            schema_version: KNN_GRAPH_SCHEMA_VERSION.to_string(),
+            collection: collection.to_string(),
+            domain: domain.to_string(),
+            ingested_cx_id: ingested.cx_id,
+            k,
+            corpus_len: corpus.len(),
+            edge_count: hits.len(),
+            snapshot_seq,
+            graph_cf_row_count: vault.scan_cf_at(snapshot_seq, ColumnFamily::Graph)?.len(),
+            edges: hits,
+            readback_edges,
+        },
+        execution,
+    ))
 }
 
 pub fn compute_knn_edges(
@@ -152,46 +170,104 @@ pub fn compute_knn_edges(
     corpus: &[ResolvedExemplar],
     k: usize,
 ) -> Result<Vec<KnnGraphEdge>> {
-    validate_request(domain, ingested, corpus, k)?;
-    let corpus_by_cx: BTreeMap<CxId, &ResolvedExemplar> =
-        corpus.iter().map(|row| (row.cx_id, row)).collect();
-    Ok(direct_cosine_top_k(&ingested.vector, corpus, k)
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (dst, raw_similarity))| {
-            let neighbor = corpus_by_cx
-                .get(&dst)
-                .copied()
-                .expect("kNN hit came from corpus");
-            let similarity = canonical_score(raw_similarity as f64);
-            KnnGraphEdge {
-                src: ingested.cx_id,
-                dst,
-                edge_type: EDGE_KNN_RESOLVED.to_string(),
-                rank: idx + 1,
-                similarity,
-                weight: similarity.clamp(0.0, 1.0),
-                domain: domain.to_string(),
-                k,
-                corpus_len: corpus.len(),
-                query_outcome_yes: ingested.outcome_yes,
-                neighbor_outcome_yes: neighbor.outcome_yes,
-            }
-        })
-        .collect())
+    compute_knn_edges_with_execution(domain, ingested, corpus, k).map(|result| result.0)
 }
 
-fn direct_cosine_top_k(query: &[f32], corpus: &[ResolvedExemplar], k: usize) -> Vec<(CxId, f32)> {
-    let mut scored: Vec<_> = corpus
+pub fn compute_knn_edges_with_execution(
+    domain: &str,
+    ingested: &ResolvedExemplar,
+    corpus: &[ResolvedExemplar],
+    k: usize,
+) -> Result<(Vec<KnnGraphEdge>, ExactKnnExecution)> {
+    let (mut batches, execution) =
+        compute_knn_edges_batch_with_execution(domain, std::slice::from_ref(ingested), corpus, k)?;
+    Ok((batches.remove(0), execution))
+}
+
+pub fn compute_knn_edges_batch(
+    domain: &str,
+    ingested: &[ResolvedExemplar],
+    corpus: &[ResolvedExemplar],
+    k: usize,
+) -> Result<Vec<Vec<KnnGraphEdge>>> {
+    compute_knn_edges_batch_with_execution(domain, ingested, corpus, k).map(|result| result.0)
+}
+
+pub fn compute_knn_edges_batch_with_execution(
+    domain: &str,
+    ingested: &[ResolvedExemplar],
+    corpus: &[ResolvedExemplar],
+    k: usize,
+) -> Result<(Vec<Vec<KnnGraphEdge>>, ExactKnnExecution)> {
+    validate_batch_request(domain, ingested, corpus, k)?;
+    let corpus_by_cx: BTreeMap<CxId, &ResolvedExemplar> =
+        corpus.iter().map(|row| (row.cx_id, row)).collect();
+    let ordered = corpus_by_cx.values().copied().collect::<Vec<_>>();
+    let corpus_vectors = ordered
         .iter()
-        .map(|row| (row.cx_id, cosine(query, &row.vector)))
+        .map(|row| row.vector.as_slice())
+        .collect::<Vec<_>>();
+    let query_vectors = ingested
+        .iter()
+        .map(|row| row.vector.as_slice())
+        .collect::<Vec<_>>();
+    let candidate_k = if k > EXACT_KNN_MAX_DEVICE_K {
+        k
+    } else {
+        k.saturating_add(EXACT_KNN_RERANK_GUARD_ROWS)
+            .min(corpus.len())
+            .min(EXACT_KNN_MAX_DEVICE_K)
+    };
+    let mut exact = exact_cosine_top_k(&corpus_vectors, &query_vectors, candidate_k, None)?;
+    exact.execution.shortlist_cpu_similarity_evaluations = exact
+        .rankings
+        .iter()
+        .map(|ranking| ranking.len() as u64)
+        .sum();
+    let batches = ingested
+        .iter()
+        .zip(&exact.rankings)
+        .map(|(query, ranking)| {
+            let mut hits = ranking
+                .iter()
+                .map(|idx| {
+                    let row = ordered[*idx];
+                    (row.cx_id, cosine(&query.vector, &row.vector))
+                })
+                .collect::<Vec<_>>();
+            hits.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
+            });
+            hits.truncate(k);
+            hits.into_iter()
+                .enumerate()
+                .map(|(idx, (dst, raw_similarity))| {
+                    let neighbor = corpus_by_cx
+                        .get(&dst)
+                        .copied()
+                        .expect("kNN hit came from corpus");
+                    let similarity = canonical_score(raw_similarity as f64);
+                    KnnGraphEdge {
+                        src: query.cx_id,
+                        dst,
+                        edge_type: EDGE_KNN_RESOLVED.to_string(),
+                        rank: idx + 1,
+                        similarity,
+                        weight: similarity.clamp(0.0, 1.0),
+                        domain: domain.to_string(),
+                        k,
+                        corpus_len: corpus.len(),
+                        query_outcome_yes: query.outcome_yes,
+                        neighbor_outcome_yes: neighbor.outcome_yes,
+                    }
+                })
+                .collect()
+        })
         .collect();
-    scored.sort_by(|a, b| {
-        b.1.total_cmp(&a.1)
-            .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
-    });
-    scored.truncate(k);
-    scored
+    Ok((batches, exact.execution))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -210,9 +286,9 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-fn validate_request(
+fn validate_batch_request(
     domain: &str,
-    ingested: &ResolvedExemplar,
+    ingested: &[ResolvedExemplar],
     corpus: &[ResolvedExemplar],
     k: usize,
 ) -> Result<()> {
@@ -234,15 +310,39 @@ fn validate_request(
             format!("kNN graph k={k} must be in 1..={}", corpus.len()),
         ));
     }
-    let dim = ingested.vector.len();
+    if ingested.is_empty() {
+        return Err(invalid(
+            ERR_KNN_GRAPH_EMPTY_CORPUS,
+            "kNN graph materialization requires at least one ingested query",
+        ));
+    }
+    let dim = ingested[0].vector.len();
     if dim == 0 {
         return Err(invalid(
             ERR_KNN_GRAPH_DIM_MISMATCH,
             "ingested vector must not be empty",
         ));
     }
-    validate_vector(ERR_KNN_GRAPH_NON_FINITE, ingested.cx_id, &ingested.vector)?;
-    let mut seen = BTreeSet::from([ingested.cx_id]);
+    let mut seen = BTreeSet::new();
+    for query in ingested {
+        if !seen.insert(query.cx_id) {
+            return Err(invalid(
+                ERR_KNN_GRAPH_DUPLICATE_CX,
+                format!("ingested batch repeats cx_id {}", query.cx_id),
+            ));
+        }
+        if query.vector.len() != dim {
+            return Err(invalid(
+                ERR_KNN_GRAPH_DIM_MISMATCH,
+                format!(
+                    "ingested query {} dim {} != {dim}",
+                    query.cx_id,
+                    query.vector.len()
+                ),
+            ));
+        }
+        validate_vector(ERR_KNN_GRAPH_NON_FINITE, query.cx_id, &query.vector)?;
+    }
     for row in corpus {
         if !seen.insert(row.cx_id) {
             return Err(invalid(

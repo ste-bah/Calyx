@@ -12,6 +12,16 @@ use serde::{Deserialize, Serialize};
 
 use calyx_core::{CalyxError, Result};
 
+#[cfg(not(feature = "cuda"))]
+use crate::cuda_strict::cuda_unavailable;
+use crate::cuda_strict::{deterministic_permutations, strict_cuda_requested};
+
+mod cuda;
+mod kernel;
+
+use self::cuda::{gaussian_mmd_cuda_strict_impl, mmd_change_point_cuda_strict_impl};
+use self::kernel::{KernelMatrix, quantile, squared_distance};
+
 pub const MIN_MMD_SAMPLES: usize = 4;
 pub const MAX_MMD_SAMPLES: usize = 2_048;
 pub const DEFAULT_MMD_PERMUTATIONS: usize = 99;
@@ -69,6 +79,9 @@ pub fn gaussian_mmd_with_config(
     y: &[Vec<f64>],
     config: &MmdConfig,
 ) -> Result<MmdReport> {
+    if strict_cuda_requested() {
+        return gaussian_mmd_with_config_cuda_strict(x, y, config);
+    }
     let shape = validate_pair(x, y, config)?;
     let pooled = pooled_samples(x, y);
     let bandwidth = resolve_bandwidth(&pooled, config.bandwidth)?;
@@ -99,6 +112,9 @@ pub fn mmd_change_point(
     min_window: usize,
     config: &MmdConfig,
 ) -> Result<ChangePointReport> {
+    if strict_cuda_requested() {
+        return mmd_change_point_cuda_strict(samples, min_window, config);
+    }
     validate_single(samples, config)?;
     if min_window < MIN_MMD_SAMPLES {
         return Err(CalyxError::assay_insufficient_samples(format!(
@@ -133,7 +149,86 @@ pub fn mmd_change_point(
     })
 }
 
-#[derive(Clone, Copy)]
+pub fn gaussian_mmd_cuda_strict(x: &[Vec<f64>], y: &[Vec<f64>]) -> Result<MmdReport> {
+    gaussian_mmd_with_config_cuda_strict(x, y, &MmdConfig::default())
+}
+
+pub fn gaussian_mmd_with_config_cuda_strict(
+    x: &[Vec<f64>],
+    y: &[Vec<f64>],
+    config: &MmdConfig,
+) -> Result<MmdReport> {
+    let shape = validate_pair(x, y, config)?;
+    let pooled = pooled_samples(x, y);
+    let bandwidth = resolve_bandwidth(&pooled, config.bandwidth)?;
+    let flat = flatten_samples(&pooled, shape.dimension)?;
+    let permutations = deterministic_permutations(pooled.len(), config.permutations, config.seed)?;
+    let result = gaussian_mmd_cuda_strict_impl(
+        &flat,
+        x.len(),
+        y.len(),
+        shape.dimension,
+        bandwidth,
+        &permutations,
+    )?;
+    Ok(report_from_null(
+        x.len(),
+        y.len(),
+        shape.dimension,
+        bandwidth,
+        result.mmd2,
+        result.null,
+        config.alpha,
+    ))
+}
+
+pub fn mmd_change_point_cuda_strict(
+    samples: &[Vec<f64>],
+    min_window: usize,
+    config: &MmdConfig,
+) -> Result<ChangePointReport> {
+    validate_single(samples, config)?;
+    if min_window < MIN_MMD_SAMPLES {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "MMD change-point min_window must be >= {MIN_MMD_SAMPLES}, got {min_window}"
+        )));
+    }
+    if samples.len() < min_window * 2 {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "MMD change-point requires at least {} samples, got {}",
+            min_window * 2,
+            samples.len()
+        )));
+    }
+    let bandwidth = resolve_bandwidth(samples, config.bandwidth)?;
+    let dimension = samples[0].len();
+    let flat = flatten_samples(samples, dimension)?;
+    let permutations = deterministic_permutations(samples.len(), config.permutations, config.seed)?;
+    let result = mmd_change_point_cuda_strict_impl(
+        &flat,
+        samples.len(),
+        dimension,
+        min_window,
+        bandwidth,
+        &permutations,
+    )?;
+    let report = report_from_null(
+        result.split_index,
+        samples.len() - result.split_index,
+        dimension,
+        bandwidth,
+        result.mmd2,
+        result.null,
+        config.alpha,
+    );
+    Ok(ChangePointReport {
+        split_index: result.split_index,
+        left_n: result.split_index,
+        right_n: samples.len() - result.split_index,
+        report,
+    })
+}
+
 struct Shape {
     dimension: usize,
 }
@@ -236,6 +331,24 @@ fn pooled_samples(x: &[Vec<f64>], y: &[Vec<f64>]) -> Vec<Vec<f64>> {
     x.iter().chain(y.iter()).cloned().collect()
 }
 
+fn flatten_samples(samples: &[Vec<f64>], dimension: usize) -> Result<Vec<f64>> {
+    let len = samples
+        .len()
+        .checked_mul(dimension)
+        .ok_or_else(|| CalyxError::forge_vram_budget("MMD CUDA flattened input length overflow"))?;
+    let mut flat = Vec::with_capacity(len);
+    for row in samples {
+        if row.len() != dimension {
+            return Err(CalyxError::assay_insufficient_samples(format!(
+                "MMD row has dimension {}, expected {dimension}",
+                row.len()
+            )));
+        }
+        flat.extend_from_slice(row);
+    }
+    Ok(flat)
+}
+
 fn resolve_bandwidth(samples: &[Vec<f64>], configured: Option<f64>) -> Result<f64> {
     if let Some(bandwidth) = configured {
         return Ok(bandwidth);
@@ -318,76 +431,4 @@ fn change_point_max_null(
         null.push(max_stat);
     }
     null
-}
-
-struct KernelMatrix {
-    n: usize,
-    values: Vec<f64>,
-}
-
-impl KernelMatrix {
-    fn new(samples: &[Vec<f64>], bandwidth: f64) -> Self {
-        let n = samples.len();
-        let mut values = vec![0.0; n * n];
-        for i in 0..n {
-            values[i * n + i] = 1.0;
-            for j in (i + 1)..n {
-                let value = gaussian_kernel(&samples[i], &samples[j], bandwidth);
-                values[i * n + j] = value;
-                values[j * n + i] = value;
-            }
-        }
-        Self { n, values }
-    }
-
-    fn mmd2(&self, x: &[usize], y: &[usize]) -> f64 {
-        self.mean(x, x) + self.mean(y, y) - 2.0 * self.mean(x, y)
-    }
-
-    fn mmd2_unbiased(&self, x: &[usize], y: &[usize]) -> f64 {
-        self.off_diagonal_mean(x) + self.off_diagonal_mean(y) - 2.0 * self.mean(x, y)
-    }
-
-    fn off_diagonal_mean(&self, indices: &[usize]) -> f64 {
-        debug_assert!(indices.len() > 1);
-        let mut sum = 0.0;
-        for &i in indices {
-            for &j in indices {
-                if i != j {
-                    sum += self.values[i * self.n + j];
-                }
-            }
-        }
-        sum / (indices.len() * (indices.len() - 1)) as f64
-    }
-
-    fn mean(&self, left: &[usize], right: &[usize]) -> f64 {
-        let mut sum = 0.0;
-        for &i in left {
-            for &j in right {
-                sum += self.values[i * self.n + j];
-            }
-        }
-        sum / (left.len() * right.len()) as f64
-    }
-}
-
-fn gaussian_kernel(a: &[f64], b: &[f64], bandwidth: f64) -> f64 {
-    (-squared_distance(a, b) / (2.0 * bandwidth * bandwidth)).exp()
-}
-
-fn squared_distance(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let delta = x - y;
-            delta * delta
-        })
-        .sum()
-}
-
-fn quantile(sorted_values: &[f64], q: f64) -> f64 {
-    debug_assert!(!sorted_values.is_empty());
-    let rank = ((sorted_values.len() - 1) as f64 * q).ceil() as usize;
-    sorted_values[rank.min(sorted_values.len() - 1)]
 }

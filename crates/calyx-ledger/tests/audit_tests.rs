@@ -1,8 +1,8 @@
 use calyx_core::{CalyxWarning, CxId, FixedClock, LensId, SlotId};
 use calyx_ledger::{
-    ActorId, AuditFilter, EntryKind, FusionMode, FusionWeights, LedgerAppender, LedgerCfStore,
-    MemoryLedgerStore, QuarantineSet, SlotWeight, SubjectId, audit, get_answer_trace,
-    get_provenance,
+    ActorId, AuditFilter, DecodedLedgerSnapshot, EntryKind, FusionMode, FusionWeights,
+    LedgerAppender, LedgerCfStore, MemoryLedgerStore, QuarantineSet, SlotWeight, SubjectId, audit,
+    get_answer_trace, get_answer_trace_from_snapshot, get_provenance,
 };
 use serde_json::json;
 
@@ -80,6 +80,14 @@ fn get_answer_trace_decodes_complete_path_and_fusion_weights() {
     let store = appender.into_store();
 
     let trace = get_answer_trace(&store, &QuarantineSet::default(), &answer_id).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let decoded = DecodedLedgerSnapshot::from_snapshot(&snapshot);
+    let snapshot_trace =
+        get_answer_trace_from_snapshot(&decoded, &QuarantineSet::default(), &answer_id).unwrap();
+    assert_eq!(
+        snapshot_trace, trace,
+        "snapshot path preserves trace semantics"
+    );
 
     assert!(trace.is_trusted());
     assert_eq!(trace.path.len(), 2);

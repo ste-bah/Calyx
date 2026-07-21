@@ -4,6 +4,8 @@ mod dense;
 mod filter;
 #[path = "persisted/freshness.rs"]
 mod freshness;
+#[path = "persisted/generation.rs"]
+mod generation;
 #[path = "persisted/marker.rs"]
 pub mod marker;
 #[cfg(test)]
@@ -24,32 +26,34 @@ mod sparse;
 #[cfg(test)]
 #[path = "persisted/tests.rs"]
 mod tests;
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
-
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotVector};
 use calyx_sextant::QueryFilters;
 use calyx_sextant::index::IndexSearchHit;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use crate::error::{CliError, CliResult};
+pub use generation::{PersistedSearchGeneration, PersistedSearchSlot};
 pub use marker::{
     MarkerClearOutcome, REBUILD_REQUIRED_REMEDIATION, REBUILD_REQUIRED_SCHEMA,
     RebuildRequiredMarker, clear_rebuild_required_marker, clear_rebuild_required_marker_if_owned,
     read_rebuild_required_marker, rebuild_required_marker_path, write_rebuild_required_marker,
 };
+#[cfg(feature = "cuda")]
+pub(crate) use multi::take_maxsim_cuda_detail;
 pub(crate) use pinned::canonical_vault_dir as canonical_pin_vault_dir;
 pub(crate) use rebuild::load_docs_at;
 #[cfg(test)]
 use rebuild::rebuild_from_docs;
 pub use rebuild::{
     RebuildProgress, load_docs, rebuild_for_vault, rebuild_for_vault_with_fallible_progress,
-    rebuild_for_vault_with_progress,
+    rebuild_for_vault_with_panel_state, rebuild_for_vault_with_panel_state_fallible_progress,
+    rebuild_for_vault_with_panel_state_progress, rebuild_for_vault_with_progress,
 };
 
 const MANIFEST_FORMAT: &str = "calyx-search-index-manifest-v1";
@@ -61,6 +65,12 @@ const MANIFEST_NAME: &str = "manifest.json";
 pub(crate) struct SearchIndexManifest {
     format: String,
     base_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diskann_build_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diskann_build_backend_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sextant_cuvs_compiled: Option<bool>,
     #[serde(default)]
     filter: Option<FilterIndexEntry>,
     slots: Vec<SearchIndexEntry>,
@@ -151,8 +161,12 @@ impl PersistedSearchIndexes {
         k: usize,
     ) -> CliResult<Vec<IndexSearchHit>> {
         let entry = self.require_entry(slot)?;
+        let gpu_serving =
+            dense::gpu_serving_required(self.manifest.diskann_build_backend.as_deref())?;
         match query {
-            SlotVector::Dense { .. } => dense::search(&self.vault_dir, entry, slot, query, k),
+            SlotVector::Dense { .. } => {
+                dense::search(&self.vault_dir, entry, slot, query, k, gpu_serving)
+            }
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,
                 entry,
@@ -188,10 +202,18 @@ impl PersistedSearchIndexes {
             return Ok(Vec::new());
         }
         let entry = self.require_entry(slot)?;
+        let gpu_serving =
+            dense::gpu_serving_required(self.manifest.diskann_build_backend.as_deref())?;
         match query {
-            SlotVector::Dense { .. } => {
-                dense::search_filtered(&self.vault_dir, entry, slot, query, k, candidates)
-            }
+            SlotVector::Dense { .. } => dense::search_filtered(
+                &self.vault_dir,
+                entry,
+                slot,
+                query,
+                k,
+                candidates,
+                gpu_serving,
+            ),
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,
                 entry,
@@ -225,6 +247,15 @@ impl PersistedSearchIndexes {
         )
     }
 
+    pub fn exact_metadata_candidates(&self, query: &str) -> CliResult<BTreeSet<CxId>> {
+        filter::exact_metadata_candidates(
+            &self.vault_dir,
+            self.manifest.filter.as_ref(),
+            self.manifest.base_seq,
+            query,
+        )
+    }
+
     pub fn max_len(&self) -> usize {
         self.max_len_for_slots(None)
     }
@@ -253,6 +284,44 @@ impl PersistedSearchIndexes {
 
     pub fn ensure_search_bounded(&self) -> CliResult {
         self.ensure_search_bounded_for_slots(None)
+    }
+
+    pub(crate) fn pin_budget_preflight_for_slots(
+        &self,
+        allowed_slots: Option<&BTreeSet<SlotId>>,
+    ) -> CliResult<pinned::PinBudgetPreflight> {
+        let mut requirements = Vec::new();
+        for entry in &self.manifest.slots {
+            let slot = SlotId::new(entry.slot);
+            if allowed_slots
+                .map(|allowed| !allowed.contains(&slot))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let requirement = match entry.kind.as_str() {
+                "flat_dense" => Some((
+                    entry.slot,
+                    "flat_dense",
+                    fs::metadata(self.vault_dir.join(entry.require_index_rel(slot)?))?.len(),
+                )),
+                "sparse_inverted" => Some((
+                    entry.slot,
+                    "sparse_inverted",
+                    fs::metadata(self.vault_dir.join(entry.require_index_rel(slot)?))?.len(),
+                )),
+                "multi_maxsim_segments" => Some((
+                    entry.slot,
+                    "multi_maxsim",
+                    multi::predicted_pin_bytes(entry, entry.require_token_dim(slot)?)?,
+                )),
+                _ => None,
+            };
+            if let Some(requirement) = requirement {
+                requirements.push(requirement);
+            }
+        }
+        pinned::preflight(&self.vault_dir, &requirements)
     }
 
     pub fn ensure_search_bounded_for_slots(
@@ -468,13 +537,9 @@ impl SearchIndexEntry {
     }
 }
 
-fn manifest_path(vault_dir: &Path) -> PathBuf {
-    vault_dir.join(INDEX_ROOT).join(MANIFEST_NAME)
-}
-
 #[path = "persisted/io.rs"]
 mod fs_io;
 use fs_io::{
-    rel, sha256_hex, stale, write_atomic_hashed, write_json_atomic, write_json_atomic_durable,
-    write_json_atomic_hashed,
+    manifest_path, rel, sha256_hex, stale, write_atomic_hashed, write_json_atomic,
+    write_json_atomic_durable, write_json_atomic_hashed,
 };

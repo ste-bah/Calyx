@@ -4,6 +4,8 @@
 //! NVMe-resident Vamana graph used by server-scale slots.
 
 pub mod build;
+mod cagra_dataset;
+mod cagra_serve;
 pub mod concat;
 #[cfg(sextant_cuvs)]
 mod cuvs_cagra;
@@ -17,6 +19,14 @@ mod token_sidecar;
 pub use build::{
     DiskAnnBuildBackend, DiskAnnBuildParams, DiskAnnBuildProgress, build_diskann_graph,
     build_diskann_graph_with_backend, build_diskann_graph_with_backend_and_progress,
+    cagra_dataset_sidecar_path, cagra_sidecar_path,
+};
+pub use cagra_serve::{
+    CAGRA_PARTITIONED_MAX_DIM, CAGRA_PARTITIONED_MAX_REGIONS, CAGRA_PARTITIONED_MAX_SCRATCH_BYTES,
+    CAGRA_SERVING_MAX_BATCH, CAGRA_SERVING_MAX_K, CagraPartitionRegion,
+    CagraPartitionSearchRequest, CagraSearchRequest, CagraServingDiagnostics, CagraServingMetric,
+    CagraServingRegion, cagra_partitioned_search, cagra_search_batch, cagra_serving_diagnostics,
+    cagra_serving_region,
 };
 pub use concat::{ConcatCrossTermDiskAnn, ConcatCrossTermHit, ConcatCrossTermKey};
 pub use dual::{
@@ -27,6 +37,9 @@ pub use graph::{
     DiskAnnGraphReader, DiskAnnGraphWriter, DiskAnnHeader, DiskAnnNodeRef, node_block_size,
     open_diskann_graph,
 };
-pub use pq::{DiskAnnPqBuildParams, DiskAnnPqIndex};
+pub use pq::{
+    DISKANN_PQ_SMALL_CORPUS_ROWS, DiskAnnPqBuildDiagnostics, DiskAnnPqBuildExecution,
+    DiskAnnPqBuildParams, DiskAnnPqIndex,
+};
 pub use search::{DiskAnnPqSearchBuild, DiskAnnSearch, DiskAnnSearchParams};
 pub use token::TokenDiskAnnMaxSim;

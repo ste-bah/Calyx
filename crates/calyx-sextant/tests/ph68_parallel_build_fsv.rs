@@ -7,16 +7,16 @@
 //!   2. RECALL preserved: recall@10 of the parallel-built graph vs brute-force
 //!      cosine ground truth stays at/above a high bar on a planted corpus.
 
-use std::path::{Path, PathBuf};
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
 
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{CxId, SlotId};
 use calyx_sextant::index::{DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sextant_support::cx_usize_be as cx;
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("calyx-ph68-712").join(tag);

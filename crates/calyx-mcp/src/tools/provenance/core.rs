@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use calyx_aster::ledger_view::AsterLedgerCfStore;
+use calyx_aster::ledger_view::LedgerQuerySnapshot;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{Anchor, AnchorKind, CalyxError, CxId, SlotId, SlotVector, VaultStore};
 use calyx_ledger::{
-    EntryKind, LedgerCfStore, LedgerEntry, REPRODUCE_PAYLOAD_TAG, SubjectId, VerifyResult, decode,
-    get_answer_trace, get_provenance, verify_chain,
+    EntryKind, LedgerCfStore, LedgerEntry, REPRODUCE_PAYLOAD_TAG, SubjectId, VerifyResult,
+    answer_trace_from_entries, verify_snapshot,
 };
 use calyx_registry::load_vault_panel_state;
 use serde::Serialize;
@@ -17,6 +15,8 @@ use serde_json::Value;
 use crate::server::{ToolError, ToolResult};
 use crate::tools::vault::store::{ResolvedVault, home_dir, resolve_vault_info, vault_salt};
 
+use super::answer_directory::resolve_answer_vaults;
+use super::answer_entries::indexed_answer_entries;
 pub(super) use super::ids::hex;
 use super::ids::parse_answer_id;
 use super::quarantine::NoQuarantine;
@@ -106,22 +106,59 @@ pub(super) fn verify_chain_report(
 
 pub(super) fn answer_trace(answer_id: &str) -> ToolResult<AnswerTraceOut> {
     let answer_id = parse_answer_id(answer_id)?;
-    for path in vault_paths()? {
-        let Ok(store) = AsterLedgerCfStore::open(&path) else {
-            continue;
-        };
-        let trace = get_answer_trace(&store, &NoQuarantine, &answer_id)?;
-        if trace.answer_entry.is_some() {
-            return answer_trace_out(&answer_id, trace);
+    let vault_root = home_dir()?.join("vaults");
+    let (paths, _) = resolve_answer_vaults(&vault_root, &answer_id)?;
+    let path = match paths.as_slice() {
+        [] => {
+            return Err(CalyxError::vault_access_denied(format!(
+                "answer_id {} not found",
+                hex(&answer_id)
+            ))
+            .into());
         }
+        [path] => path,
+        paths => {
+            let candidates = paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(CalyxError::ledger_corrupt(format!(
+                "answer_id {} is ambiguous across {} authoritative vaults: {candidates}",
+                hex(&answer_id),
+                paths.len()
+            ))
+            .into());
+        }
+    };
+    let query = LedgerQuerySnapshot::open(path)?;
+    if !query.contains_answer(&answer_id) {
+        return Err(CalyxError::ledger_corrupt(format!(
+            "answer directory points to vault {} without answer_id {}",
+            path.display(),
+            hex(&answer_id)
+        ))
+        .into());
     }
-    Err(CalyxError::vault_access_denied(format!("answer_id {} not found", hex(&answer_id))).into())
+    let entries = indexed_answer_entries(&query, &answer_id)?;
+    let trace = answer_trace_from_entries(&entries, &NoQuarantine, &answer_id)?;
+    if trace.answer_entry.is_some() {
+        return answer_trace_out(&answer_id, trace);
+    }
+    Err(CalyxError::ledger_corrupt(format!(
+        "answer index in vault {} did not resolve answer_id {}",
+        path.display(),
+        hex(&answer_id)
+    ))
+    .into())
 }
 
 pub(super) fn reproduce(vault: &str, answer_id: &str) -> ToolResult<ReproduceOut> {
     let resolved = resolve_requested_vault(vault)?;
-    let entries = ledger_entries(&resolved.path)?;
-    reproduce_report(&entries, &parse_answer_id(answer_id)?)
+    let answer_id = parse_answer_id(answer_id)?;
+    let query = LedgerQuerySnapshot::open(&resolved.path)?;
+    let entries = query.entries_for_subject(&SubjectId::Query(answer_id.clone()))?;
+    reproduce_report(&entries, &answer_id)
 }
 
 pub(super) fn resolve_requested_vault(vault: &str) -> ToolResult<ResolvedVault> {
@@ -149,15 +186,15 @@ pub(super) fn lineage_for_resolved(
             error
         }
     })?;
-    let store = AsterLedgerCfStore::open(&resolved.path)?;
-    let entries = get_provenance(&store, &NoQuarantine, cx_id)?;
-    verify_current_base_ref(
+    let query = LedgerQuerySnapshot::open(&resolved.path)?;
+    let entries = query.entries_for_cx(cx_id)?;
+    let projection = project_lineage_entries(
         cx_id,
         stored.provenance.seq,
         &stored.provenance.hash,
+        &stored.anchors,
         &entries,
     )?;
-    let ingest = ingest_entry(cx_id, &entries)?;
     let state = load_vault_panel_state(&resolved.path)?;
     let lens_measures = state
         .panel
@@ -171,13 +208,12 @@ pub(super) fn lineage_for_resolved(
             })
         })
         .collect();
-    let anchors = anchor_outputs(cx_id, ingest.seq, &stored.anchors, &entries)?;
     Ok(LineageOut {
         cx_id: cx_id.to_string(),
-        ingest_seq: ingest.seq,
-        ledger_chain_hash: hex(&ingest.entry_hash),
+        ingest_seq: projection.ingest_seq,
+        ledger_chain_hash: hex(&projection.ingest_hash),
         lens_measures,
-        anchors,
+        anchors: projection.anchors,
     })
 }
 
@@ -186,14 +222,19 @@ pub(super) fn verify_chain_for_store(
     from_seq: Option<u64>,
     to_seq: Option<u64>,
 ) -> ToolResult<VerifyChainOut> {
+    let snapshot = store.snapshot()?;
     let from = from_seq.unwrap_or(0);
-    let to = to_seq.map_or_else(|| chain_end(store), Ok)?;
+    let to = to_seq.unwrap_or_else(|| {
+        snapshot
+            .head_anchor()
+            .map_or(snapshot.len() as u64, |anchor| anchor.height)
+    });
     if from > to {
         return Err(ToolError::invalid_params(format!(
             "verify_chain from_seq {from} must be <= to_seq {to}"
         )));
     }
-    match verify_chain(store, from..to)? {
+    match verify_snapshot(&snapshot, from..to)? {
         VerifyResult::Intact { count } => Ok(VerifyChainOut {
             status: "ok",
             checked: count,
@@ -293,91 +334,82 @@ fn answer_trace_out(
     })
 }
 
-fn verify_current_base_ref(
-    cx_id: CxId,
-    seq: u64,
-    hash: &[u8; 32],
-    entries: &[LedgerEntry],
-) -> ToolResult<()> {
-    if entries
-        .iter()
-        .any(|entry| entry.seq == seq && entry.entry_hash == *hash)
-    {
-        return Ok(());
-    }
-    Err(CalyxError::ledger_chain_broken(format!(
-        "base provenance hash for {cx_id} does not match ledger seq {seq}"
-    ))
-    .into())
+struct LineageLedgerProjection {
+    ingest_seq: u64,
+    ingest_hash: [u8; 32],
+    anchors: Vec<AnchorOut>,
 }
 
-fn ingest_entry(cx_id: CxId, entries: &[LedgerEntry]) -> ToolResult<&LedgerEntry> {
-    let mut ingest = None;
+fn project_lineage_entries(
+    cx_id: CxId,
+    base_seq: u64,
+    base_hash: &[u8; 32],
+    anchors: &[Anchor],
+    entries: &[LedgerEntry],
+) -> ToolResult<LineageLedgerProjection> {
+    let mut base_found = false;
+    let mut ingest = None::<(u64, [u8; 32])>;
+    let mut anchor_seqs = BTreeMap::<String, Vec<u64>>::new();
     for entry in entries {
-        if entry.kind != EntryKind::Ingest
-            || !matches!(entry.subject, SubjectId::Cx(id) if id == cx_id)
-        {
+        base_found |= entry.seq == base_seq && entry.entry_hash == *base_hash;
+        if entry.kind != EntryKind::Ingest {
             continue;
         }
         let payload = json_payload(entry)?;
-        if payload.get("anchor_kind").and_then(Value::as_str).is_some() {
+        let Some(anchor_kind) = payload.get("anchor_kind").and_then(Value::as_str) else {
+            if ingest.is_none_or(|current| entry.seq < current.0) {
+                ingest = Some((entry.seq, entry.entry_hash));
+            }
             continue;
-        }
-        if ingest.is_none_or(|current: &LedgerEntry| entry.seq < current.seq) {
-            ingest = Some(entry);
+        };
+        if matches!(
+            payload.get("mode").and_then(Value::as_str),
+            Some("mcp-anchor" | "cli-anchor")
+        ) {
+            anchor_seqs
+                .entry(anchor_kind.to_string())
+                .or_default()
+                .push(entry.seq);
         }
     }
-    ingest.ok_or_else(|| {
-        CalyxError::ledger_corrupt(format!("missing ingest ledger row for {cx_id}")).into()
-    })
-}
-
-fn anchor_outputs(
-    cx_id: CxId,
-    ingest_seq: u64,
-    anchors: &[Anchor],
-    entries: &[LedgerEntry],
-) -> ToolResult<Vec<AnchorOut>> {
-    let mut used = BTreeSet::new();
+    if !base_found {
+        return Err(CalyxError::ledger_chain_broken(format!(
+            "base provenance hash for {cx_id} does not match ledger seq {base_seq}"
+        ))
+        .into());
+    }
+    let (ingest_seq, ingest_hash) = ingest.ok_or_else(|| {
+        CalyxError::ledger_corrupt(format!("missing ingest ledger row for {cx_id}"))
+    })?;
+    let mut used_per_kind = BTreeMap::<String, usize>::new();
     let mut out = Vec::with_capacity(anchors.len());
     for anchor in anchors {
         let kind = anchor_kind_key(&anchor.kind);
+        let used = used_per_kind.entry(kind.clone()).or_default();
+        let seq = anchor_seqs
+            .get(&kind)
+            .and_then(|seqs| {
+                seqs.iter()
+                    .copied()
+                    .filter(|seq| *seq > ingest_seq)
+                    .nth(*used)
+            })
+            .ok_or_else(|| {
+                CalyxError::ledger_corrupt(format!(
+                    "anchor {kind} for {cx_id} has no exact mcp/cli anchor ledger row"
+                ))
+            })?;
+        *used += 1;
         out.push(AnchorOut {
-            ledger_seq: match_anchor_entry(cx_id, ingest_seq, &kind, entries, &mut used)?,
+            ledger_seq: seq,
             kind,
         });
     }
-    Ok(out)
-}
-
-fn match_anchor_entry(
-    cx_id: CxId,
-    ingest_seq: u64,
-    kind: &str,
-    entries: &[LedgerEntry],
-    used: &mut BTreeSet<u64>,
-) -> ToolResult<u64> {
-    for entry in entries {
-        if used.contains(&entry.seq) || entry.seq <= ingest_seq {
-            continue;
-        }
-        if entry.kind != EntryKind::Ingest
-            || !matches!(entry.subject, SubjectId::Cx(id) if id == cx_id)
-        {
-            continue;
-        }
-        let payload = json_payload(entry)?;
-        let mode = payload.get("mode").and_then(Value::as_str);
-        let anchor_kind = payload.get("anchor_kind").and_then(Value::as_str);
-        if matches!(mode, Some("mcp-anchor" | "cli-anchor")) && anchor_kind == Some(kind) {
-            used.insert(entry.seq);
-            return Ok(entry.seq);
-        }
-    }
-    Err(CalyxError::ledger_corrupt(format!(
-        "anchor {kind} for {cx_id} has no exact mcp/cli anchor ledger row"
-    ))
-    .into())
+    Ok(LineageLedgerProjection {
+        ingest_seq,
+        ingest_hash,
+        anchors: out,
+    })
 }
 
 fn latest_reproduce_payload(
@@ -413,47 +445,6 @@ fn reproduce_from_payload(payload: &Value) -> ToolResult<ReproduceOut> {
         original_hash,
         reproduced_hash,
     })
-}
-
-pub(super) fn ledger_entries(path: &Path) -> ToolResult<Vec<LedgerEntry>> {
-    let store = AsterLedgerCfStore::open(path)?;
-    let mut entries = Vec::new();
-    for row in store.scan()? {
-        entries.push(decode(&row.bytes)?);
-    }
-    entries.sort_by_key(|entry| entry.seq);
-    Ok(entries)
-}
-
-fn chain_end(store: &dyn LedgerCfStore) -> ToolResult<u64> {
-    Ok(store
-        .scan()?
-        .into_iter()
-        .map(|row| row.seq)
-        .max()
-        .map_or(0, |seq| seq.saturating_add(1)))
-}
-
-fn vault_paths() -> ToolResult<Vec<PathBuf>> {
-    let root = home_dir()?.join("vaults");
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for entry in fs::read_dir(&root)
-        .map_err(|err| CalyxError::disk_pressure(format!("read vaults dir: {err}")))?
-    {
-        let entry = entry.map_err(|err| CalyxError::disk_pressure(format!("read vault: {err}")))?;
-        if entry
-            .file_type()
-            .map_err(|err| CalyxError::disk_pressure(format!("read vault file type: {err}")))?
-            .is_dir()
-        {
-            out.push(entry.path());
-        }
-    }
-    out.sort();
-    Ok(out)
 }
 
 fn measured_slot(slots: &BTreeMap<SlotId, SlotVector>, slot: SlotId) -> Option<()> {

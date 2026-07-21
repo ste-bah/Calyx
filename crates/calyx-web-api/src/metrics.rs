@@ -253,7 +253,7 @@ pub(super) fn render_metrics(s: &MetricsSnapshot) -> String {
 
 /// `GET /metrics` — Prometheus exposition of engine-native health surfaces
 /// (#1249 G11, #597). Gathers the live vault/gpu/faithfulness probe and a
-/// source-of-truth ledger `scan()` + `verify_chain()`, then renders via the
+/// source-of-truth ledger snapshot + chain verification, then renders via the
 /// pure [`render_metrics`]. Bearer-locked like every other route (the box
 /// Prometheus presents the shared secret via `bearer_token_file`); served only
 /// on the loopback bind, never exposed through the public tunnel ingress.
@@ -277,31 +277,12 @@ pub(super) async fn metrics_handler(State(ctx): State<Arc<MetricsCtx>>) -> Respo
     });
     let panel_version = u64::from(ctx.measure.state.panel.version);
 
-    // Source-of-truth: scan the on-disk ledger and verify the hash chain on
+    // Source-of-truth: snapshot the on-disk ledger and verify the hash chain on
     // every scrape (the ledger is small; #1898 caches the per-answer path, but
     // the chain verdict must be live so a tamper is observable within one
     // scrape interval).
     let prov_ctx = Arc::clone(&ctx.prov);
-    let ledger_probe = run_blocking("metrics_ledger", move || {
-        Ok(match prov_ctx.store.scan() {
-            Ok(entries) => {
-                let rows = entries.len() as u64;
-                match verify_chain(&prov_ctx.store, 0..rows) {
-                    Ok(VerifyResult::Intact { count }) => (1, count, 1, -1),
-                    Ok(VerifyResult::Broken { at_seq, .. }) => (1, rows, 0, at_seq as i64),
-                    Ok(VerifyResult::Corrupt { at_seq, .. }) => (1, rows, 0, at_seq as i64),
-                    Err(error) => {
-                        tracing::error!(error = ?error, "CALYX_WEB_API_METRICS_VERIFY_FAILED");
-                        (1, rows, 0, -1)
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::error!(error = ?error, "CALYX_WEB_API_METRICS_SCAN_FAILED");
-                (0, 0, 0, -1)
-            }
-        })
-    });
+    let ledger_probe = run_blocking("metrics_ledger", move || Ok(probe_ledger(&prov_ctx.store)));
     let (gpu_result, ledger_result, faithfulness) =
         tokio::join!(gpu_probe, ledger_probe, probe_hhem_faithfulness());
     let (gpu_ready, vault_ready) = gpu_result.unwrap_or((0, 0));
@@ -330,4 +311,25 @@ pub(super) async fn metrics_handler(State(ctx): State<Arc<MetricsCtx>>) -> Respo
         body,
     )
         .into_response()
+}
+
+pub(super) fn probe_ledger(store: &dyn LedgerCfStore) -> (i64, u64, i64, i64) {
+    match store.snapshot() {
+        Ok(snapshot) => {
+            let rows = snapshot.len() as u64;
+            match verify_snapshot(&snapshot, 0..rows) {
+                Ok(VerifyResult::Intact { count }) => (1, count, 1, -1),
+                Ok(VerifyResult::Broken { at_seq, .. }) => (1, rows, 0, at_seq as i64),
+                Ok(VerifyResult::Corrupt { at_seq, .. }) => (1, rows, 0, at_seq as i64),
+                Err(error) => {
+                    tracing::error!(error = ?error, "CALYX_WEB_API_METRICS_VERIFY_FAILED");
+                    (1, rows, 0, -1)
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(error = ?error, "CALYX_WEB_API_METRICS_SNAPSHOT_FAILED");
+            (0, 0, 0, -1)
+        }
+    }
 }

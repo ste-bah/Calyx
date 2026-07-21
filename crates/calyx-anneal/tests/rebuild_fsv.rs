@@ -17,7 +17,9 @@ use calyx_core::{CxId, FixedClock, SlotId, SystemClock};
 use calyx_ledger::{ActorId, EntryKind, LedgerAppender, decode as decode_ledger};
 use serde_json::{Value, json};
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::vault_id;
 
 const TEST_TS: u64 = 1_785_600_902;

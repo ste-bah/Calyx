@@ -14,8 +14,8 @@ use calyx_core::{Anchor, AnchorKind, AnchorValue, FixedClock, LensId, Result, Va
 use serde_json::{Value, json};
 
 #[allow(dead_code)]
-#[path = "support/fsv_bad_change.rs"]
-mod support;
+// calyx-shared-module: path=support/fsv_bad_change.rs alias=__calyx_shared_support_fsv_bad_change_rs local=support visibility=private
+use crate::__calyx_shared_support_fsv_bad_change_rs as support;
 
 #[allow(dead_code)]
 #[path = "support/fsv_mistake_closure_support.rs"]

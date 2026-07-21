@@ -103,5 +103,7 @@ fn anchor_json(anchor: &Anchor) -> serde_json::Value {
 }
 
 fn fsv_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/fsv/issue076_proxy_anchors")
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue076-proxy-anchors", || {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/fsv/issue076_proxy_anchors")
+    })
 }

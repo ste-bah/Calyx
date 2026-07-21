@@ -15,12 +15,36 @@ const LENS_UNREACHABLE: &str = "CALYX_LENS_UNREACHABLE";
 const CANDLE_CUDA_FEATURE_MISSING_REASON: &str =
     "candle CUDA requested but calyx-registry was built without feature `candle-cuda`";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FastembedBgem3Output {
     Dense,
     Sparse,
     Colbert,
+}
+
+/// Frozen execution engine for a joint BGE-M3 projection set.
+///
+/// `FastembedCpu` is retained only to decode existing persisted specs.  Its
+/// INT8 graph is CPU-only and must never be admitted as a CUDA resident.
+/// New GPU panels use `OnnxCuda`, which binds the three joint outputs to CUDA
+/// memory and performs projection postprocessing on the device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bgem3Engine {
+    #[default]
+    FastembedCpu,
+    OnnxCuda,
+}
+
+impl Bgem3Engine {
+    pub const fn is_legacy_cpu(self) -> bool {
+        matches!(self, Self::FastembedCpu)
+    }
+}
+
+const fn is_default_bgem3_engine(engine: &Bgem3Engine) -> bool {
+    matches!(engine, Bgem3Engine::FastembedCpu)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +80,12 @@ pub enum LensRuntime {
         model_id: String,
         files: Vec<PathBuf>,
         output: FastembedBgem3Output,
+        // Keep the legacy default absent on serialization. Persisted specs and
+        // immutable template snapshots created before the engine discriminator
+        // existed must deserialize and reserialize to the same canonical JSON.
+        // Non-default engines remain explicit and therefore content-addressed.
+        #[serde(default, skip_serializing_if = "is_default_bgem3_engine")]
+        engine: Bgem3Engine,
     },
     FastembedReranker {
         model_id: String,
@@ -66,6 +96,11 @@ pub enum LensRuntime {
         files: Vec<PathBuf>,
         #[serde(default = "default_qwen3_dtype")]
         dtype: String,
+        #[serde(
+            default = "default_qwen3_max_tokens",
+            skip_serializing_if = "is_default_qwen3_max_tokens"
+        )]
+        max_tokens: usize,
     },
     StaticLookup {
         embeddings_file: PathBuf,
@@ -132,8 +167,10 @@ impl LensSpec {
 
     pub fn lens_id(&self) -> LensId {
         let output = format!(
-            "shape={:?};norm={:?};runtime={:?}",
-            self.output, self.norm_policy, self.runtime
+            "shape={:?};norm={:?};runtime={}",
+            self.output,
+            self.norm_policy,
+            runtime_identity(&self.runtime)
         );
         LensId::from_bytes(content_address([
             self.name.as_bytes(),
@@ -192,6 +229,25 @@ impl LensSpec {
     }
 }
 
+fn runtime_identity(runtime: &LensRuntime) -> String {
+    match runtime {
+        // Lens identities historically used Rust's Debug representation. The
+        // engine discriminator was added after legacy BGE-M3 specs had been
+        // persisted, so preserve that exact pre-field representation for the
+        // default CPU engine. CUDA remains explicit and domain-separated by
+        // the ordinary Debug representation containing `engine: OnnxCuda`.
+        LensRuntime::FastembedBgem3 {
+            model_id,
+            files,
+            output,
+            engine: Bgem3Engine::FastembedCpu,
+        } => format!(
+            "FastembedBgem3 {{ model_id: {model_id:?}, files: {files:?}, output: {output:?} }}"
+        ),
+        runtime => format!("{runtime:?}"),
+    }
+}
+
 fn default_candle_dtype() -> String {
     "f32".to_string()
 }
@@ -202,6 +258,14 @@ fn default_candle_pooling() -> String {
 
 fn default_qwen3_dtype() -> String {
     "f16".to_string()
+}
+
+pub const fn default_qwen3_max_tokens() -> usize {
+    crate::runtime::qwen3::DEFAULT_QWEN3_MAX_TOKENS
+}
+
+fn is_default_qwen3_max_tokens(value: &usize) -> bool {
+    *value == default_qwen3_max_tokens()
 }
 
 pub const fn default_quant_default() -> QuantPolicy {
@@ -369,5 +433,58 @@ mod tests {
     #[test]
     fn qwen3_default_dtype_is_fp16_for_blackwell() {
         assert_eq!(default_qwen3_dtype(), "f16");
+    }
+
+    #[test]
+    fn bgem3_legacy_default_round_trips_without_changing_canonical_json() {
+        let legacy = serde_json::json!({
+            "fastembed_bgem3": {
+                "model_id": "BAAI/bge-m3",
+                "files": ["model.onnx"],
+                "output": "dense"
+            }
+        });
+
+        let runtime: LensRuntime = serde_json::from_value(legacy.clone()).unwrap();
+
+        assert_eq!(
+            runtime,
+            LensRuntime::FastembedBgem3 {
+                model_id: "BAAI/bge-m3".to_string(),
+                files: vec![PathBuf::from("model.onnx")],
+                output: FastembedBgem3Output::Dense,
+                engine: Bgem3Engine::FastembedCpu,
+            }
+        );
+        assert_eq!(serde_json::to_value(runtime).unwrap(), legacy);
+    }
+
+    #[test]
+    fn bgem3_cuda_engine_is_explicit_in_canonical_json() {
+        let runtime = LensRuntime::FastembedBgem3 {
+            model_id: "BAAI/bge-m3".to_string(),
+            files: vec![PathBuf::from("model.onnx")],
+            output: FastembedBgem3Output::Dense,
+            engine: Bgem3Engine::OnnxCuda,
+        };
+
+        let value = serde_json::to_value(runtime).unwrap();
+
+        assert_eq!(value["fastembed_bgem3"]["engine"], "onnx_cuda");
+    }
+
+    #[test]
+    fn legacy_bgem3_identity_preserves_the_pre_engine_format() {
+        let runtime = LensRuntime::FastembedBgem3 {
+            model_id: "BAAI/bge-m3".to_string(),
+            files: vec![PathBuf::from("model.onnx")],
+            output: FastembedBgem3Output::Dense,
+            engine: Bgem3Engine::FastembedCpu,
+        };
+
+        assert_eq!(
+            runtime_identity(&runtime),
+            "FastembedBgem3 { model_id: \"BAAI/bge-m3\", files: [\"model.onnx\"], output: Dense }"
+        );
     }
 }

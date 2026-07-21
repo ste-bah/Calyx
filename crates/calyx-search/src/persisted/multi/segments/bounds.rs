@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::ops::Range;
 
 use calyx_core::{CxId, SlotId};
@@ -8,9 +9,28 @@ use crate::error::CliResult;
 
 pub(super) const DEFAULT_MAX_MULTI_BINARY_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
-const BINARY_HEADER_BYTES: u64 = 16 + 2 + 4 + 8 + 8 + 8;
+pub(super) const BINARY_HEADER_BYTES: u64 = 16 + 2 + 4 + 8 + 8 + 8;
 const ROW_HEADER_BYTES: u64 = 16 + 4;
 const F32_BYTES: u64 = 4;
+
+pub(in crate::persisted) fn ensure_streaming_row_bounded(
+    slot: SlotId,
+    cx_id: CxId,
+    token_dim: u32,
+    token_count: u32,
+    encoded_bytes: usize,
+) -> CliResult {
+    let estimated = BINARY_HEADER_BYTES
+        .checked_add(row_estimated_bytes(token_dim, token_count as usize)?)
+        .ok_or_else(|| stale("persistent binary multi row byte count overflow"))?;
+    if estimated > DEFAULT_MAX_MULTI_BINARY_SEGMENT_BYTES {
+        return Err(unbounded_multi_sidecar(format!(
+            "encoded multi row {cx_id} for slot {slot} has {encoded_bytes} source bytes and is estimated {estimated} sidecar bytes; exceeds search binary segment limit {} bytes before decode (tokens={token_count}, token_dim={token_dim})",
+            DEFAULT_MAX_MULTI_BINARY_SEGMENT_BYTES
+        )));
+    }
+    Ok(())
+}
 
 pub(in crate::persisted::multi) fn ensure_entry_bounded(
     slot: SlotId,
@@ -44,6 +64,7 @@ pub(super) fn ensure_segment_ref_bounded(
     )
 }
 
+#[cfg(test)]
 pub(super) fn segment_ref_is_bounded(
     slot: SlotId,
     token_dim: u32,
@@ -52,6 +73,7 @@ pub(super) fn segment_ref_is_bounded(
     ensure_segment_ref_bounded(slot, token_dim, segment).is_ok()
 }
 
+#[cfg(test)]
 pub(super) fn split_row_ranges_by_segment_budget(
     slot: SlotId,
     token_dim: u32,
@@ -118,7 +140,7 @@ pub(super) fn segment_estimated_bytes(
         .ok_or_else(|| stale("persistent binary multi segment byte count overflow"))
 }
 
-fn row_estimated_bytes(token_dim: u32, token_count: usize) -> CliResult<u64> {
+pub(super) fn row_estimated_bytes(token_dim: u32, token_count: usize) -> CliResult<u64> {
     let payload = (token_count as u64)
         .checked_mul(token_dim as u64)
         .and_then(|components| components.checked_mul(F32_BYTES))

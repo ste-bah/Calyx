@@ -9,6 +9,7 @@ use crate::spec::LensHealth;
 mod assay;
 mod cost;
 mod dense_card;
+mod dense_matrix;
 mod gating;
 mod reliability;
 mod signal_kind;
@@ -17,6 +18,9 @@ pub use cost::CostMetrics;
 pub(crate) use dense_card::Observation;
 use dense_card::{DenseCapabilityRequest, dense_capability_card};
 pub use dense_card::{DenseProfileRequest, profile_dense_vectors};
+pub use dense_matrix::{
+    CALYX_PROFILE_CUDA_MIN_ROWS_ENV, CALYX_PROFILE_REQUIRE_CUDA_ENV, DEFAULT_PROFILE_CUDA_MIN_ROWS,
+};
 pub use gating::{
     CAPABILITY_MAX_PAIRWISE_CORR_ENV, CAPABILITY_MIN_SIGNAL_BITS_ENV, CapabilityGateDecision,
     CapabilityGateEvaluation, CapabilityGateThresholds, append_capability_gate_ledger,
@@ -66,6 +70,31 @@ pub struct CapabilityCard {
     pub coverage: CoverageMetrics,
     pub health: LensHealth,
     pub low_spread: bool,
+    #[serde(default)]
+    pub execution: ProfileExecutionStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileMathBackend {
+    #[default]
+    CpuFullMatrix,
+    CudaCublasTiledGram,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileExecutionStats {
+    pub measurement_passes: usize,
+    pub batch_measure_calls: usize,
+    pub scalar_measure_calls: usize,
+    pub resident_matrices: usize,
+    pub pairwise_distance_matrices: usize,
+    pub pairwise_distance_values: usize,
+    pub pairwise_distance_backend: ProfileMathBackend,
+    pub pairwise_tile_rows: usize,
+    pub pairwise_tiles: usize,
+    pub measured_rows: usize,
+    pub vector_dim: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,18 +179,35 @@ impl Profiler {
 
         let vram_before = vram_bytes();
         let started = Instant::now();
-        let mut observations = Vec::new();
+        let modality = registry.lens_modality(lens_id)?;
+        let mut inputs = Vec::new();
+        let mut labels = Vec::new();
         let mut failed = 0_usize;
         for probe in probes {
-            match registry.measure(lens_id, &probe.input) {
-                Ok(vector) => match dense_projection(&vector)? {
+            if probe.input.modality == modality {
+                inputs.push(probe.input.clone());
+                labels.push(probe.label.clone());
+            } else {
+                failed += 1;
+            }
+        }
+        let mut execution = ProfileExecutionStats {
+            scalar_measure_calls: 0,
+            ..ProfileExecutionStats::default()
+        };
+        let mut observations = Vec::new();
+        if !inputs.is_empty() {
+            execution.measurement_passes = 1;
+            execution.batch_measure_calls = 1;
+            let measured = registry.measure_batch(lens_id, &inputs)?;
+            for (idx, vector) in measured.into_iter().enumerate() {
+                match dense_projection(&vector)? {
                     Some(data) => observations.push(Observation {
                         data,
-                        label: probe.label.clone(),
+                        label: labels[idx].clone(),
                     }),
                     None => failed += 1,
-                },
-                Err(_) => failed += 1,
+                }
             }
         }
         let total_ms = started.elapsed().as_secs_f64() as f32 * 1000.0;
@@ -183,6 +229,7 @@ impl Profiler {
             signal_kind: registry_signal_kind(registry, lens_id),
             health: registry.health(lens_id)?,
             options: self.options,
+            execution,
         })?;
         card.coverage.failed = failed;
         card.coverage.rate = card.coverage.measured as f32 / probes.len() as f32;

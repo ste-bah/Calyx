@@ -30,7 +30,17 @@
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cuda_strict::strict_cuda_requested;
 use crate::special_fn::student_t_two_sided_p;
+
+mod cuda;
+
+#[cfg(feature = "cuda")]
+pub(crate) use self::cuda::{correlation_precision_cuda, variable_major_columns};
+use self::cuda::{
+    partial_correlation_controlling_cuda_strict_impl, partial_correlation_cuda_strict_impl,
+    pearson_cuda_strict_impl,
+};
 
 /// Minimum samples for a defined zero-order Pearson test (`df = n − 2 ≥ 1`).
 pub const MIN_PEARSON_SAMPLES: usize = 3;
@@ -78,6 +88,13 @@ pub struct PartialReport {
 
 /// Pearson correlation over paired samples with exact-t inference.
 pub fn pearson(x: &[f32], y: &[f32]) -> Result<PearsonReport> {
+    if strict_cuda_requested() {
+        return pearson_cuda_strict(x, y);
+    }
+    pearson_cpu(x, y)
+}
+
+fn pearson_cpu(x: &[f32], y: &[f32]) -> Result<PearsonReport> {
     if x.len() != y.len() {
         return Err(CalyxError::assay_insufficient_samples(format!(
             "Pearson requires paired samples: x={} y={}",
@@ -109,9 +126,21 @@ pub fn pearson(x: &[f32], y: &[f32]) -> Result<PearsonReport> {
     })
 }
 
+/// Strict CUDA Pearson correlation. This never falls back to CPU.
+pub fn pearson_cuda_strict(x: &[f32], y: &[f32]) -> Result<PearsonReport> {
+    pearson_cuda_strict_impl(x, y)
+}
+
 /// First-order partial correlation of `X` and `Y` controlling for a single `Z`,
 /// via the closed-form residual formula.
 pub fn partial_correlation(x: &[f32], y: &[f32], z: &[f32]) -> Result<PartialReport> {
+    if strict_cuda_requested() {
+        return partial_correlation_cuda_strict(x, y, z);
+    }
+    partial_correlation_cpu(x, y, z)
+}
+
+fn partial_correlation_cpu(x: &[f32], y: &[f32], z: &[f32]) -> Result<PartialReport> {
     if x.len() != y.len() || x.len() != z.len() {
         return Err(CalyxError::assay_insufficient_samples(format!(
             "partial correlation requires equal-length x/y/z: x={} y={} z={}",
@@ -165,10 +194,26 @@ pub fn partial_correlation(x: &[f32], y: &[f32], z: &[f32]) -> Result<PartialRep
     })
 }
 
+/// Strict CUDA first-order partial correlation. This never falls back to CPU.
+pub fn partial_correlation_cuda_strict(x: &[f32], y: &[f32], z: &[f32]) -> Result<PartialReport> {
+    partial_correlation_cuda_strict_impl(x, y, z)
+}
+
 /// General partial correlation of `X` and `Y` controlling for every column in
 /// `controls` simultaneously, via the inverse (precision) of the correlation
 /// matrix over `[X, Y, controls…]`.
 pub fn partial_correlation_controlling(
+    x: &[f32],
+    y: &[f32],
+    controls: &[&[f32]],
+) -> Result<PartialReport> {
+    if strict_cuda_requested() {
+        return partial_correlation_controlling_cuda_strict(x, y, controls);
+    }
+    partial_correlation_controlling_cpu(x, y, controls)
+}
+
+fn partial_correlation_controlling_cpu(
     x: &[f32],
     y: &[f32],
     controls: &[&[f32]],
@@ -232,10 +277,15 @@ pub fn partial_correlation_controlling(
     partial_report_from_precision(r_mat[1], p[1], p[0], p[d + 1], n, k)
 }
 
-// ----- shared numerics -------------------------------------------------------
+/// Strict CUDA general partial correlation. This never falls back to CPU.
+pub fn partial_correlation_controlling_cuda_strict(
+    x: &[f32],
+    y: &[f32],
+    controls: &[&[f32]],
+) -> Result<PartialReport> {
+    partial_correlation_controlling_cuda_strict_impl(x, y, controls)
+}
 
-/// Exact-t significance and Fisher-z 95% CI for a (partial) correlation `r` with
-/// `k` controls on `n` samples. `df = n − 2 − k`; Fisher SE = `1/√(n − 3 − k)`.
 pub(crate) fn partial_report_from_precision(
     zero_order: f64,
     pxy: f64,

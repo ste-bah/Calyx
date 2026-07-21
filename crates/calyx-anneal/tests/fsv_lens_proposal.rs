@@ -2,6 +2,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     AdmissionRecord, AnnealLedger, AsterAnnealLedgerStore, CALYX_ASSAY_INVALID_METRIC, ChangeId,
     GateOutcome, LensAdmittedEntry, ProposalTerminalState, ProposeLens, ProposeLensRequest,
@@ -12,12 +15,8 @@ use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::FixedClock;
 use calyx_ledger::{ActorId, EntryKind, LedgerAppender, decode as decode_ledger};
 use serde_json::{Value, json};
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
-#[path = "support/propose_lens.rs"]
-#[allow(dead_code)]
-mod support;
+// calyx-shared-module: path=support/propose_lens.rs alias=__calyx_shared_support_propose_lens_rs local=support visibility=private
+use crate::__calyx_shared_support_propose_lens_rs as support;
 use fsv_support::{reset_dir, vault_id, write_json, write_manifest, write_physical_size_list};
 use support::*;
 

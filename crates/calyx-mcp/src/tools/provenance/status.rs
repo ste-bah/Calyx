@@ -1,11 +1,12 @@
 use calyx_anneal::{ComponentHealth, TripwireMetric, decode_anneal_ledger_payload};
 use calyx_aster::cf::ColumnFamily;
+use calyx_aster::ledger_view::LedgerQuerySnapshot;
 use calyx_core::{CalyxError, VaultStore};
 use calyx_ledger::EntryKind;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::core::{ledger_entries, open_vault, resolve_requested_vault};
+use super::core::{open_vault, resolve_requested_vault};
 use crate::server::ToolResult;
 
 #[derive(Debug, Serialize)]
@@ -41,7 +42,7 @@ struct HealthOut {
 }
 
 #[derive(Debug, Serialize)]
-struct RecentAnnealOut {
+pub(super) struct RecentAnnealOut {
     seq: u64,
     action: String,
     ts: u64,
@@ -60,7 +61,7 @@ pub(super) fn anneal_status_for_resolved(
     let tripwires = tripwire_rows(&resolved.path)?;
     let proposals = proposal_rows(&vault)?;
     let health = health_rows(&vault)?;
-    let recent_changes = recent_anneal(&resolved.path)?;
+    let (recent_changes, p99_latency_ms, _) = anneal_ledger_status(&resolved.path)?;
     if tripwires.is_empty()
         && proposals.is_empty()
         && health.is_empty()
@@ -89,7 +90,7 @@ pub(super) fn anneal_status_for_resolved(
         tripwires,
         proposals,
         last_soak_at,
-        p99_latency_ms: latest_p99(&resolved.path)?,
+        p99_latency_ms,
         health,
         recent_changes,
     })
@@ -145,40 +146,39 @@ fn health_rows(vault: &calyx_aster::vault::AsterVault) -> ToolResult<Vec<HealthO
     Ok(out)
 }
 
-fn recent_anneal(path: &std::path::Path) -> ToolResult<Vec<RecentAnnealOut>> {
-    let mut out = Vec::new();
-    for entry in ledger_entries(path)? {
-        if entry.kind != EntryKind::Anneal {
-            continue;
-        }
+pub(super) fn anneal_ledger_status(
+    path: &std::path::Path,
+) -> ToolResult<(
+    Vec<RecentAnnealOut>,
+    Option<f64>,
+    calyx_aster::ledger_view::LedgerQueryVisitStats,
+)> {
+    let query = LedgerQuerySnapshot::open(path)?;
+    let mut recent = Vec::with_capacity(16);
+    let mut latest_p99 = None;
+    let stats = query.visit_kind_reverse(EntryKind::Anneal, 256, |entry| {
         let anneal = decode_anneal_ledger_payload(&entry.payload)?;
-        out.push(RecentAnnealOut {
-            seq: entry.seq,
-            action: format!("{:?}", anneal.action),
-            ts: anneal.ts,
-            description: anneal.description,
-        });
-    }
-    if out.len() > 16 {
-        out.drain(0..out.len() - 16);
-    }
-    Ok(out)
-}
-
-fn latest_p99(path: &std::path::Path) -> ToolResult<Option<f64>> {
-    let mut latest = None;
-    for entry in ledger_entries(path)? {
-        if entry.kind != EntryKind::Anneal {
-            continue;
+        if latest_p99.is_none() {
+            latest_p99 = anneal
+                .metrics
+                .metrics
+                .iter()
+                .rev()
+                .find(|metric| metric.metric == TripwireMetric::SearchP99)
+                .map(|metric| metric.candidate_value);
         }
-        let anneal = decode_anneal_ledger_payload(&entry.payload)?;
-        for metric in anneal.metrics.metrics {
-            if metric.metric == TripwireMetric::SearchP99 {
-                latest = Some(metric.candidate_value);
-            }
+        if recent.len() < 16 {
+            recent.push(RecentAnnealOut {
+                seq: entry.seq,
+                action: format!("{:?}", anneal.action),
+                ts: anneal.ts,
+                description: anneal.description,
+            });
         }
-    }
-    Ok(latest)
+        Ok(recent.len() == 16 && latest_p99.is_some())
+    })?;
+    recent.reverse();
+    Ok((recent, latest_p99, stats))
 }
 
 fn tripwire_metric_name(metric: TripwireMetric) -> String {

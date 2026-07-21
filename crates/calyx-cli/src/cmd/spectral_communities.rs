@@ -91,6 +91,9 @@ pub(crate) fn run_spectral_communities_with_home(
             centrality_tol: args.centrality_tol,
             max_bridge_candidates: args.max_bridge_candidates,
             max_centrality_candidates: args.max_centrality_candidates,
+            // upstream added community_count/cluster_max_iter; take their
+            // defaults (2 / 100) for this CLI path which does not expose them.
+            ..SpectralCommunityParams::default()
         },
     )?;
     ensure_useful_report(&report)?;

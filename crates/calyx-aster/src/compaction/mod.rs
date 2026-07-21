@@ -6,7 +6,7 @@ mod scheduler;
 mod tiering;
 
 use crate::cf::ColumnFamily;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::storage_names::{SstName, classify_sst};
 use calyx_core::{CalyxError, Result};
 use std::fs;
@@ -62,7 +62,7 @@ pub struct CompactionSnapshot {
 impl CompactionSnapshot {
     pub fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
         for shard in self.shards.iter().rev().filter(|shard| shard.cf == cf) {
-            if let Some(value) = SstReader::open(&shard.path)?.get(key)? {
+            if let Some(value) = shared_reader(&shard.path)?.get(key)? {
                 return Ok(Some(value));
             }
         }

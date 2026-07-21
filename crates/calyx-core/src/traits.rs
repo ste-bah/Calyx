@@ -1,5 +1,7 @@
 //! Engine trait boundaries shared by Calyx crates.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -34,6 +36,28 @@ impl Input {
     }
 }
 
+/// Exact identity of a runtime that can measure multiple frozen lens
+/// projections in one forward pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MeasurementGroupKey([u8; 32]);
+
+impl MeasurementGroupKey {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// One independently frozen projection requested from a grouped runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupedLensRequest {
+    pub lens_id: LensId,
+    pub shape: SlotShape,
+}
+
 /// Implemented by Registry lens runtimes as frozen measurement instruments.
 pub trait Lens: Send + Sync {
     /// Stable frozen lens id.
@@ -51,6 +75,23 @@ pub trait Lens: Send + Sync {
     /// Deterministically measures a batch of inputs.
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
         inputs.iter().map(|input| self.measure(input)).collect()
+    }
+
+    /// Returns an exact multi-output runtime identity when this lens supports
+    /// grouped measurement. The default preserves standalone lens behavior.
+    fn measurement_group_key(&self) -> Result<Option<MeasurementGroupKey>> {
+        Ok(None)
+    }
+
+    /// Measures compatible projections in one runtime call. `None` means this
+    /// lens does not implement grouped output; callers must not silently retry
+    /// projections independently after a grouped failure.
+    fn measure_grouped_batch(
+        &self,
+        _requests: &[GroupedLensRequest],
+        _inputs: &[Input],
+    ) -> Result<Option<BTreeMap<LensId, Vec<SlotVector>>>> {
+        Ok(None)
     }
 }
 

@@ -20,6 +20,9 @@ from scipy import signal
 
 CUDA_FAIL_LOUD_DETAIL = "cuda:0,error_on_failure,no_cpu_fallback"
 TENSORRT_CUDA_FAIL_LOUD_DETAIL = "tensorrt:0,cuda:0,error_on_failure,no_cpu_fallback"
+DEFAULT_PROVIDER = "cuda_fail_loud"
+ALLOW_CPU_ENV = "CALYX_MULTIMODAL_ALLOW_CPU_ADAPTER"
+DEFAULT_MAX_BATCH = 32
 
 
 def main() -> int:
@@ -54,6 +57,7 @@ class AdapterState:
         self.axis = axis
         self.session = session
         self.processor = processor
+        self.session_runs = 0
 
 
 def load_adapter_state(config_path: Path) -> AdapterState:
@@ -84,11 +88,8 @@ def run_adapter_loop(state: AdapterState) -> None:
         request = read_frame(sys.stdin.buffer)
         if request is None:
             break
-        vectors = [
-            embed_one(state.axis, state.processor, state.session, bytes(row)).tolist()
-            for row in request.get("inputs", [])
-        ]
-        write_frame(sys.stdout.buffer, {"vectors": vectors})
+        vectors, stats = embed_many(state, [bytes(row) for row in request.get("inputs", [])])
+        write_frame(sys.stdout.buffer, {"vectors": vectors, "adapter_stats": stats})
 
 
 def run_mux() -> int:
@@ -119,46 +120,55 @@ def run_mux() -> int:
                 file=sys.stderr,
                 flush=True,
             )
-        vectors = [
-            embed_one(state.axis, state.processor, state.session, bytes(row)).tolist()
-            for row in request.get("inputs", [])
-        ]
-        write_frame(sys.stdout.buffer, {"vectors": vectors, "loaded_configs": len(states)})
+        vectors, stats = embed_many(state, [bytes(row) for row in request.get("inputs", [])])
+        write_frame(
+            sys.stdout.buffer,
+            {"vectors": vectors, "loaded_configs": len(states), "adapter_stats": stats},
+        )
     return 0
 
 
 def load_session(model_file: Path, provider: str | None) -> ort.InferenceSession:
-    if provider is None or provider == "cpu_explicit":
+    provider = provider or DEFAULT_PROVIDER
+    if provider == "cpu_explicit":
         return load_cpu_session(model_file)
     if provider in {"tensorrt_cuda_fail_loud", TENSORRT_CUDA_FAIL_LOUD_DETAIL}:
         return load_tensorrt_cuda_session(model_file)
     if provider in {"cuda_fail_loud", CUDA_FAIL_LOUD_DETAIL}:
-        return load_cuda_session(model_file, allow_cpu_fallback=False)
+        return load_cuda_session(model_file)
     if provider in {"cuda_preferred", "cuda:0,allow_cpu_fallback"}:
-        return load_cuda_session(model_file, allow_cpu_fallback=True)
+        raise RuntimeError(
+            "unsupported provider policy cuda_preferred: CPU fallback is forbidden for "
+            "multimodal adapters; use cuda_fail_loud or set "
+            f"{ALLOW_CPU_ENV}=1 with cpu_explicit for an audited CPU-only run"
+        )
     raise RuntimeError(f"unsupported provider {provider!r}")
 
 
 def load_cpu_session(model_file: Path) -> ort.InferenceSession:
+    if not env_truthy(ALLOW_CPU_ENV):
+        raise RuntimeError(
+            f"cpu_explicit multimodal adapter requires {ALLOW_CPU_ENV}=1; "
+            "GPU adapters default to cuda_fail_loud and CPU-only mode must be audited"
+        )
     available = ort.get_available_providers()
     if "CPUExecutionProvider" not in available:
         raise RuntimeError(f"CPUExecutionProvider unavailable: {available}")
     return ort.InferenceSession(str(model_file), providers=["CPUExecutionProvider"])
 
 
-def load_cuda_session(model_file: Path, allow_cpu_fallback: bool) -> ort.InferenceSession:
+def load_cuda_session(model_file: Path) -> ort.InferenceSession:
     available = ort.get_available_providers()
     if "CUDAExecutionProvider" not in available:
         raise RuntimeError(f"CUDAExecutionProvider unavailable: {available}")
     options = ort.SessionOptions()
     providers: list[Any] = [("CUDAExecutionProvider", {"device_id": 0})]
-    if allow_cpu_fallback:
-        providers.append("CPUExecutionProvider")
-    else:
-        options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     session = ort.InferenceSession(str(model_file), sess_options=options, providers=providers)
-    if "CUDAExecutionProvider" not in session.get_providers():
-        raise RuntimeError(f"CUDAExecutionProvider did not load: {session.get_providers()}")
+    disable_ort_fallback(session)
+    loaded = session.get_providers()
+    if not loaded or loaded[0] != "CUDAExecutionProvider":
+        raise RuntimeError(f"CUDAExecutionProvider did not load as primary provider: {loaded}")
     return session
 
 
@@ -187,10 +197,27 @@ def load_tensorrt_cuda_session(model_file: Path) -> ort.InferenceSession:
         ("CUDAExecutionProvider", {"device_id": 0}),
     ]
     session = ort.InferenceSession(str(model_file), sess_options=options, providers=providers)
+    disable_ort_fallback(session)
     loaded = session.get_providers()
-    if "TensorrtExecutionProvider" not in loaded or "CUDAExecutionProvider" not in loaded:
+    if (
+        "TensorrtExecutionProvider" not in loaded
+        or "CUDAExecutionProvider" not in loaded
+    ):
         raise RuntimeError(f"TensorRT/CUDA providers did not load: {loaded}")
     return session
+
+
+def disable_ort_fallback(session: ort.InferenceSession) -> None:
+    disable = getattr(session, "disable_fallback", None)
+    if callable(disable):
+        disable()
+
+
+def env_truthy(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "allow", "allowed"}
 
 
 def load_processor(axis: str, model_id: str, config: dict[str, Any]) -> Any:
@@ -300,12 +327,67 @@ class TokenizersBackend:
         return output
 
 
-def embed_one(axis: str, processor: Any, session: ort.InferenceSession, payload: bytes) -> np.ndarray:
-    features = preprocess(axis, processor, payload)
-    feed = build_feed(session, features)
-    outputs = session.run(None, feed)
-    vector = select_vector(axis, session, outputs)
-    return normalize(vector.astype(np.float32, copy=False))
+def embed_many(state: AdapterState, payloads: list[bytes]) -> tuple[list[list[float]], dict[str, Any]]:
+    max_batch = int(state.config.get("max_batch", DEFAULT_MAX_BATCH))
+    if max_batch <= 0:
+        raise RuntimeError(f"multimodal adapter max_batch must be > 0, got {max_batch}")
+    if not payloads:
+        return [], adapter_stats(state, 0, 0, 0, max_batch)
+
+    before_runs = state.session_runs
+    vectors: list[list[float]] = []
+    padded_rows = 0
+    batch_count = 0
+    for start in range(0, len(payloads), max_batch):
+        chunk = payloads[start : start + max_batch]
+        features = [preprocess(state.axis, state.processor, payload) for payload in chunk]
+        feed, padded_batch = build_batched_feed(state.session, features, max_batch)
+        outputs = state.session.run(None, feed)
+        state.session_runs += 1
+        batch_count += 1
+        padded_rows += padded_batch
+        for vector in select_vectors(state.axis, state.session, outputs, len(chunk)):
+            vectors.append(normalize(vector.astype(np.float32, copy=False)).tolist())
+
+    return vectors, adapter_stats(
+        state,
+        len(payloads),
+        padded_rows,
+        batch_count,
+        max_batch,
+        session_runs_delta=state.session_runs - before_runs,
+    )
+
+
+def adapter_stats(
+    state: AdapterState,
+    input_rows: int,
+    padded_rows: int,
+    batch_count: int,
+    max_batch: int,
+    *,
+    session_runs_delta: int = 0,
+) -> dict[str, Any]:
+    return {
+        "provider": state.config.get("provider") or DEFAULT_PROVIDER,
+        "loaded_providers": state.session.get_providers(),
+        "cpu_fallback_policy": cpu_fallback_policy(
+            state.config.get("provider") or DEFAULT_PROVIDER
+        ),
+        "batch_policy": state.config.get("batch_policy") or "dynamic_padded",
+        "input_rows": input_rows,
+        "padded_rows": padded_rows,
+        "batches": batch_count,
+        "session_runs_delta": session_runs_delta,
+        "session_runs_total": state.session_runs,
+        "max_batch": max_batch,
+    }
+
+
+def cpu_fallback_policy(provider: str) -> str:
+    if provider == "cpu_explicit":
+        return "cpu_explicit_audited"
+    return "disabled"
 
 
 def preprocess(axis: str, processor: Any, payload: bytes) -> dict[str, np.ndarray]:
@@ -658,23 +740,81 @@ def resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndar
 
 
 def build_feed(session: ort.InferenceSession, features: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    feed, _ = build_batched_feed(session, [features], 1)
+    return feed
+
+
+def build_batched_feed(
+    session: ort.InferenceSession,
+    feature_rows: list[dict[str, np.ndarray]],
+    max_batch: int,
+) -> tuple[dict[str, np.ndarray], int]:
+    if not feature_rows:
+        raise RuntimeError("cannot build ONNX feed for empty multimodal batch")
+    padded_batch = padded_batch_len(len(feature_rows), max_batch)
     feed = {}
     for spec in session.get_inputs():
-        if spec.name not in features:
-            features[spec.name] = synthesize_feature(spec.name, features)
-        value = np.asarray(features[spec.name])
-        if spec.name == "pixel_values" and value.ndim == 4 and len(spec.shape) == 5:
-            value = value[:, np.newaxis, ...]
-        if "int64" in spec.type:
-            value = value.astype(np.int64, copy=False)
-        elif "float" in spec.type:
-            value = value.astype(np.float32, copy=False)
-        elif "bool" in spec.type:
-            value = value.astype(np.bool_, copy=False)
-        else:
-            raise RuntimeError(f"unsupported ONNX input type {spec.type} for {spec.name}")
-        feed[spec.name] = value
-    return feed
+        values = [prepare_feature_value(spec, row) for row in feature_rows]
+        feed[spec.name] = pad_feature_values(spec.name, values, padded_batch)
+    return feed, padded_batch
+
+
+def prepare_feature_value(spec: Any, features: dict[str, np.ndarray]) -> np.ndarray:
+    if spec.name not in features:
+        features[spec.name] = synthesize_feature(spec.name, features)
+    value = np.asarray(features[spec.name])
+    if spec.name == "pixel_values" and value.ndim == 4 and len(spec.shape) == 5:
+        value = value[:, np.newaxis, ...]
+    if value.ndim == 0:
+        raise RuntimeError(f"ONNX input {spec.name} produced scalar value")
+    if value.shape[0] != 1:
+        raise RuntimeError(
+            f"multimodal preprocessor for {spec.name} must produce one row per payload, "
+            f"got shape {value.shape}"
+        )
+    if "int64" in spec.type:
+        return value.astype(np.int64, copy=False)
+    if "float" in spec.type:
+        return value.astype(np.float32, copy=False)
+    if "bool" in spec.type:
+        return value.astype(np.bool_, copy=False)
+    raise RuntimeError(f"unsupported ONNX input type {spec.type} for {spec.name}")
+
+
+def padded_batch_len(real_rows: int, max_batch: int) -> int:
+    if real_rows <= 0:
+        raise RuntimeError("multimodal batch must contain at least one row")
+    if max_batch <= 0:
+        raise RuntimeError(f"multimodal max_batch must be > 0, got {max_batch}")
+    if real_rows > max_batch:
+        raise RuntimeError(f"multimodal batch {real_rows} exceeds max_batch {max_batch}")
+    return min(max(1, 1 << (real_rows - 1).bit_length()), max_batch)
+
+
+def pad_feature_values(name: str, values: list[np.ndarray], padded_batch: int) -> np.ndarray:
+    rank = values[0].ndim
+    dtype = values[0].dtype
+    for value in values:
+        if value.ndim != rank:
+            raise RuntimeError(
+                f"ONNX input {name} has mixed ranks in one batch: {rank} and {value.ndim}"
+            )
+        if value.dtype != dtype:
+            raise RuntimeError(
+                f"ONNX input {name} has mixed dtypes in one batch: {dtype} and {value.dtype}"
+            )
+    max_shape = [padded_batch]
+    for axis in range(1, rank):
+        max_shape.append(max(int(value.shape[axis]) for value in values))
+    out = np.zeros(tuple(max_shape), dtype=dtype)
+    first_payload = values[0][0]
+    for row, value in enumerate(values):
+        slices = tuple(slice(0, int(size)) for size in value.shape[1:])
+        out[(row, *slices)] = value[0]
+    for row in range(len(values), padded_batch):
+        slices = tuple(slice(0, int(size)) for size in first_payload.shape)
+        out[(row, *slices)] = first_payload
+    return out
 
 
 def synthesize_feature(name: str, features: dict[str, np.ndarray]) -> np.ndarray:
@@ -695,6 +835,16 @@ def synthesize_feature(name: str, features: dict[str, np.ndarray]) -> np.ndarray
 
 
 def select_vector(axis: str, session: ort.InferenceSession, outputs: list[np.ndarray]) -> np.ndarray:
+    vectors = select_vectors(axis, session, outputs, 1)
+    return vectors[0]
+
+
+def select_vectors(
+    axis: str,
+    session: ort.InferenceSession,
+    outputs: list[np.ndarray],
+    real_rows: int,
+) -> list[np.ndarray]:
     by_name = {meta.name: np.asarray(value) for meta, value in zip(session.get_outputs(), outputs)}
     if axis == "image":
         names = [
@@ -725,18 +875,36 @@ def select_vector(axis: str, session: ort.InferenceSession, outputs: list[np.nda
         ]
     for name in names:
         if name in by_name:
-            return flatten_output(by_name[name])
+            return flatten_output_rows(by_name[name], real_rows)
     raise RuntimeError(f"no supported embedding output in {list(by_name)}")
 
 
 def flatten_output(value: np.ndarray) -> np.ndarray:
+    return flatten_output_rows(value, 1)[0]
+
+
+def flatten_output_rows(value: np.ndarray, real_rows: int) -> list[np.ndarray]:
+    if real_rows <= 0:
+        raise RuntimeError("cannot select vectors for empty multimodal batch")
     value = np.asarray(value)
     if value.ndim == 1:
-        return value
+        if real_rows != 1:
+            raise RuntimeError(
+                f"rank-1 embedding output cannot represent {real_rows} multimodal rows"
+            )
+        return [value]
     if value.ndim == 2:
-        return value[0]
+        if value.shape[0] < real_rows:
+            raise RuntimeError(
+                f"rank-2 embedding output has {value.shape[0]} rows for {real_rows} inputs"
+            )
+        return [value[index] for index in range(real_rows)]
     if value.ndim == 3:
-        return value[0].mean(axis=0)
+        if value.shape[0] < real_rows:
+            raise RuntimeError(
+                f"rank-3 embedding output has {value.shape[0]} rows for {real_rows} inputs"
+            )
+        return [value[index].mean(axis=0) for index in range(real_rows)]
     raise RuntimeError(f"unsupported embedding output rank {value.ndim}")
 
 

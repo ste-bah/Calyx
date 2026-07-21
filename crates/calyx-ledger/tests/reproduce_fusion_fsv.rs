@@ -9,7 +9,9 @@ use calyx_ledger::{
 };
 use serde_json::{Value, json};
 
-mod reproduce_support;
+// calyx-shared-module: path=reproduce_support/mod.rs alias=__calyx_shared_reproduce_support_mod_rs local=reproduce_support visibility=private
+
+use crate::__calyx_shared_reproduce_support_mod_rs as reproduce_support;
 use reproduce_support::{
     RecordingForge, RecordingRegistry, SlotInputResolver, cx, dense, hex, reset_child_dir, rrf,
 };

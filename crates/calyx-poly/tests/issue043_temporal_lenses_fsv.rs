@@ -298,6 +298,8 @@ fn assert_close_slice(actual: &[f32], expected: &[f32]) {
 }
 
 fn fsv_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../target/fsv/issue043_temporal_lenses_20260705_001")
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue043-temporal-lenses", || {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/fsv/issue043_temporal_lenses_20260705_001")
+    })
 }

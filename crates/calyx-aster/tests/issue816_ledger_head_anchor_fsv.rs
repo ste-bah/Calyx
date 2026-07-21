@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_aster::ledger_head::{head_anchor_path, read_head_anchor};
 use calyx_aster::ledger_view::{AsterLedgerCfStore, parse_aster_ledger_seq};
 use calyx_aster::sst::SstReader;
@@ -9,7 +12,6 @@ use calyx_core::{FixedClock, VaultId};
 use calyx_ledger::{
     ActorId, EntryKind, LedgerAppender, LedgerCfStore, SubjectId, VerifyResult, verify_chain,
 };
-mod fsv_support;
 use fsv_support::{fsv_root_env_subdir, reset_dir};
 use serde_json::json;
 use ulid::Ulid;

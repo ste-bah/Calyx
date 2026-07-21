@@ -1,5 +1,7 @@
 //! Ross mixed continuous-discrete KSG point and subsampling-root interval.
 
+mod cuda;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_core::{CalyxError, Result};
@@ -42,6 +44,15 @@ pub(super) fn estimate(
     let raw_bits = raw_bits_from_validated_samples(x, labels, k, &class_counts);
     let ci = subsample_ci(x, labels, raw_bits, k, MIXED_KSG_CI_CONFIG)?;
     finalize_estimate(raw_bits, ci, x.len(), trust)
+}
+
+pub(super) fn estimate_cuda_strict(
+    x: &[Vec<f32>],
+    labels: &[usize],
+    k: usize,
+    trust: TrustTag,
+) -> Result<MiEstimate> {
+    cuda::estimate_cuda_strict(x, labels, k, trust)
 }
 
 pub(super) fn validate_classes(labels: &[usize], k: usize) -> Result<BTreeMap<usize, usize>> {

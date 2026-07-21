@@ -11,6 +11,8 @@ pub mod conditional_mi;
 pub mod contract;
 pub mod copula;
 pub mod cross_correlation;
+mod cuda_strict;
+pub mod dependence_dispatch;
 pub mod distance_correlation;
 pub mod ensemble;
 pub mod estimate;
@@ -66,34 +68,43 @@ pub use calibration::{
     PowerCalibrationStatus, ensure_informative_binary_labels,
 };
 pub use categorical_association::{
-    CategoricalReport, MIN_CATEGORICAL_SAMPLES, categorical_association, point_biserial,
+    CATEGORICAL_CUDA_MIN_SAMPLES, CategoricalReport, MIN_CATEGORICAL_SAMPLES,
+    categorical_association, categorical_association_cuda_strict,
+    categorical_association_cuda_strict_with_stats, point_biserial,
 };
 pub use causal_pc::{
     DEFAULT_PC_ALPHA, PcEdge, PcRemovedEdge, PcSeries, PcStableReport, pc_stable_gaussian,
+    pc_stable_gaussian_cuda_strict,
 };
 pub use ccm::{
     CcmConfig, CcmDirectionReport, CcmLibrarySkill, CcmReport, CcmVerdict,
     DEFAULT_CCM_EMBEDDING_DIM, DEFAULT_CCM_MIN_CONVERGENCE_DELTA, DEFAULT_CCM_MIN_SKILL_GAP,
-    DEFAULT_CCM_TAU, convergent_cross_mapping,
+    DEFAULT_CCM_TAU, convergent_cross_mapping, convergent_cross_mapping_cuda_strict,
 };
 pub use conditional_mi::{
     ConditionalIndependence, ConditionalMiReport, DEFAULT_CMI_ALPHA, GAUSSIAN_CMI_FORMULA,
     conditional_mutual_information_gaussian, conditional_mutual_information_gaussian_with_alpha,
+    conditional_mutual_information_gaussian_with_alpha_cuda_strict,
 };
 pub use contract::{
     AdmissionDecision, CALYX_ASSAY_UNRESOLVED, CorrelationEvidence, admit_lens,
     admit_lens_estimate, admit_lens_estimate_with_signal_kind, admit_lens_with_strata,
 };
 pub use copula::{
-    CopulaTailReport, DEFAULT_TAIL_Q, MIN_COPULA_SAMPLES, empirical_copula_tail_dependence,
-    empirical_copula_tail_dependence_with_q,
+    COPULA_CUDA_MIN_SAMPLES, CopulaTailReport, DEFAULT_TAIL_Q, MIN_COPULA_SAMPLES,
+    empirical_copula_tail_dependence, empirical_copula_tail_dependence_cuda_strict,
+    empirical_copula_tail_dependence_with_q, empirical_copula_tail_dependence_with_q_cuda_strict,
+    empirical_copula_tail_dependence_with_q_cuda_strict_with_stats,
 };
 pub use cross_correlation::{
     CCF_LAG_CONVENTION, CrossCorrelationPoint, CrossCorrelationReport, cross_correlation_profile,
+    cross_correlation_profile_cuda_strict,
 };
+pub use dependence_dispatch::{DEPENDENCE_CUDA_AUTO_ENV, DependenceCudaStats};
 pub use distance_correlation::{
     DEFAULT_DCOR_PERMUTATIONS, DEFAULT_DCOR_SEED, DcorPermConfig, DcorReport, DcorTest,
-    MIN_DCOR_SAMPLES, distance_correlation, distance_correlation_test,
+    MIN_DCOR_SAMPLES, distance_correlation, distance_correlation_cuda_strict,
+    distance_correlation_test, distance_correlation_test_cuda_strict,
 };
 pub use ensemble::{
     A37_DIVERSITY_DIAGNOSTIC_ONLY, A37_DIVERSITY_GATE_PASSED, A37_DIVERSITY_SCHEMA_VERSION,
@@ -107,8 +118,9 @@ pub use ensemble::{
     LinearCkaTuplePlan, MAX_LINEAR_CKA_TUPLES, MIN_ENSEMBLE_PANEL_LENSES, MIN_LINEAR_CKA_TUPLES,
     PidBits, a37_association_family, a37_diversity_gate, ensemble_card,
     ensemble_card_with_redundancy, ensemble_redundancy_from_lenses,
-    ensemble_redundancy_from_sketches, linear_cka_sketch_from_row_fn, linear_cka_sketch_from_rows,
-    linear_cka_tuple_plan, validate_ensemble_card_redundancy, validate_redundancy_method_metadata,
+    ensemble_redundancy_from_lenses_cuda_strict, ensemble_redundancy_from_sketches,
+    linear_cka_sketch_from_row_fn, linear_cka_sketch_from_rows, linear_cka_tuple_plan,
+    validate_ensemble_card_redundancy, validate_redundancy_method_metadata,
 };
 pub use estimate::{
     EstimateBound, EstimateReliability, EstimatorKind, MiEstimate, TrustTag,
@@ -125,59 +137,84 @@ pub use formulas::{dpi_ceiling, lens_signal, marginal_value, pair_redundancy};
 pub use gate::{AssayGate, LensSignal, PairGain};
 pub use granger::{
     DEFAULT_GRANGER_LAG_SWEEP, DEFAULT_GRANGER_LAGS, GrangerReport, granger_causality,
-    granger_causality_lags, granger_causality_sweep, granger_causality_sweep_lags,
+    granger_causality_cuda_strict, granger_causality_lags, granger_causality_lags_cuda_strict,
+    granger_causality_sweep, granger_causality_sweep_lags,
+    granger_causality_sweep_lags_cuda_strict,
 };
 pub use group_split::{GroupSplit, group_holdout_split, row_groups};
 pub use hawkes::{
     DEFAULT_HAWKES_DECAY, DEFAULT_HAWKES_ITERATIONS, DEFAULT_HAWKES_MIN_EDGE_BRANCHING_RATIO,
     HawkesBaseline, HawkesConfig, HawkesEdge, HawkesEventSeries, HawkesReport, HawkesStability,
-    exponential_hawkes_em,
+    exponential_hawkes_em, exponential_hawkes_em_cuda_strict,
 };
 pub use hsic::{
     DEFAULT_HSIC_PERMUTATIONS, DEFAULT_HSIC_SEED, HsicConfig, HsicEstimators, HsicPermConfig,
-    HsicReport, HsicTest, MIN_HSIC_GAMMA_SAMPLES, MIN_HSIC_SAMPLES, hsic, hsic_estimators,
-    hsic_estimators_with_config, hsic_permutation_test, hsic_with_config,
+    HsicReport, HsicTest, MIN_HSIC_GAMMA_SAMPLES, MIN_HSIC_SAMPLES, hsic, hsic_cuda_strict,
+    hsic_estimators, hsic_estimators_cuda_strict, hsic_estimators_with_config,
+    hsic_estimators_with_config_cuda_strict, hsic_permutation_test,
+    hsic_permutation_test_cuda_strict, hsic_with_config, hsic_with_config_cuda_strict,
 };
 pub use ksg::{
-    MIN_ASSAY_SAMPLES, ksg_mi_continuous, ksg_mi_continuous_discrete,
-    ksg_mi_continuous_discrete_with_anchor, ksg_mi_continuous_with_anchor,
+    MIN_ASSAY_SAMPLES, ksg_mi_continuous, ksg_mi_continuous_cuda_strict,
+    ksg_mi_continuous_discrete, ksg_mi_continuous_discrete_cuda_strict,
+    ksg_mi_continuous_discrete_with_anchor, ksg_mi_continuous_discrete_with_anchor_cuda_strict,
+    ksg_mi_continuous_with_anchor, ksg_mi_continuous_with_anchor_cuda_strict,
 };
 pub use logistic::{
     DEFAULT_ASSAY_SEEDS, DEFAULT_HOLDOUT_FRACTION, LogisticProbeReport, logistic_probe_mi,
-    logistic_probe_mi_calibrated, logistic_probe_mi_multiseed,
-    logistic_probe_mi_multiseed_calibrated, logistic_probe_mi_multiseed_calibrated_with_anchor,
-    logistic_probe_mi_multiseed_with_anchor, logistic_probe_mi_with_anchor,
+    logistic_probe_mi_calibrated, logistic_probe_mi_calibrated_cuda_strict,
+    logistic_probe_mi_cuda_strict, logistic_probe_mi_multiseed,
+    logistic_probe_mi_multiseed_calibrated, logistic_probe_mi_multiseed_calibrated_cuda_strict,
+    logistic_probe_mi_multiseed_calibrated_with_anchor,
+    logistic_probe_mi_multiseed_calibrated_with_anchor_cuda_strict,
+    logistic_probe_mi_multiseed_cuda_strict, logistic_probe_mi_multiseed_with_anchor,
+    logistic_probe_mi_multiseed_with_anchor_cuda_strict, logistic_probe_mi_with_anchor,
+    logistic_probe_mi_with_anchor_cuda_strict,
 };
 pub use loom_adapter::AsterAssayMaterializationGate;
-pub use mic::{DEFAULT_MIC_ALPHA, MIN_MIC_SAMPLES, MicReport, mic, mic_with_alpha};
+pub use mic::{
+    DEFAULT_MIC_ALPHA, MIC_CUDA_MIN_SAMPLES, MIN_MIC_SAMPLES, MicReport, mic, mic_cuda_strict,
+    mic_with_alpha, mic_with_alpha_cuda_strict, mic_with_alpha_cuda_strict_with_stats,
+};
 pub use mmd::{
     ChangePointReport, DEFAULT_MMD_ALPHA, DEFAULT_MMD_PERMUTATIONS, DEFAULT_MMD_SEED, MmdConfig,
-    MmdReport, gaussian_mmd, gaussian_mmd_with_config, mmd_change_point,
+    MmdReport, gaussian_mmd, gaussian_mmd_cuda_strict, gaussian_mmd_with_config,
+    gaussian_mmd_with_config_cuda_strict, mmd_change_point, mmd_change_point_cuda_strict,
 };
 pub use n_eff::{NeffReport, stable_rank};
-pub use nmi::{NmiReport, partitioned_histogram_nmi};
+pub use nmi::{
+    NMI_CUDA_MIN_SAMPLES, NmiReport, partitioned_histogram_nmi,
+    partitioned_histogram_nmi_cuda_strict, partitioned_histogram_nmi_cuda_strict_with_stats,
+};
 pub use partial_correlation::{
     MIN_PEARSON_SAMPLES, PartialReport, PearsonReport, partial_correlation,
-    partial_correlation_controlling, pearson,
+    partial_correlation_controlling, partial_correlation_controlling_cuda_strict,
+    partial_correlation_cuda_strict, pearson, pearson_cuda_strict,
 };
 pub use partial_network::{
     DEFAULT_PARTIAL_NETWORK_ALPHA, DEFAULT_PARTIAL_NETWORK_MIN_ABS_R, PartialNetworkEdge,
     PartialNetworkPrunedEdge, PartialNetworkReport, PartialNetworkSeries,
-    partial_correlation_network,
+    partial_correlation_network, partial_correlation_network_cuda_strict,
 };
 pub use periodicity::{
     AutocorrelationReport, DEFAULT_FAP_PERMUTATIONS, DEFAULT_MAX_PEAKS, DEFAULT_PERIODICITY_SEED,
     DEFAULT_PERIODOGRAM_OVERSAMPLE, MAX_ACF_SAMPLES, MAX_FREQUENCY_GRID, MIN_PERIODICITY_SAMPLES,
     PeriodicityReport, PeriodogramConfig, PeriodogramPeak, SIGNIFICANT_PEAK_FAP, autocorrelation,
-    bin_event_counts, lomb_scargle, lomb_scargle_with_anchor, lomb_scargle_with_config,
+    autocorrelation_cuda_strict, bin_event_counts, lomb_scargle, lomb_scargle_cuda_strict,
+    lomb_scargle_with_anchor, lomb_scargle_with_config, lomb_scargle_with_config_cuda_strict,
 };
 pub use point_process::{
     CoIntensityVerdict, CrossKPoint, CrossKReport, DEFAULT_CLUSTER_RATIO, DEFAULT_INHIBIT_RATIO,
     MIN_POINT_EVENTS, temporal_cross_k,
 };
-pub use projection::{ProjectionReport, project_cpu, project_gpu, target_projection_dim};
+pub use projection::{
+    ProjectionReport, ProjectionTransferBytes, project_cpu, project_gpu, projection_transfer_bytes,
+    target_projection_dim,
+};
 pub use rank_correlation::{
-    KendallReport, MIN_RANK_CORR_SAMPLES, SpearmanReport, kendall_tau_b, spearman_rho,
+    KendallReport, MIN_RANK_CORR_SAMPLES, RANK_CUDA_MIN_SAMPLES, RankCorrelationCudaReport,
+    SpearmanReport, kendall_tau_b, kendall_tau_b_cuda_strict, rank_correlations_cuda_strict,
+    spearman_rho, spearman_rho_cuda_strict,
 };
 pub use recurrence_anchor::{
     CALYX_ASSAY_MISSING_OUTCOME_SLOT, CONSISTENT_AGREEMENT_THRESHOLD, DEFAULT_OUTCOME_ANCHOR_LABEL,
@@ -213,14 +250,16 @@ pub use sufficiency::{
 pub use total_correlation::{
     CALYX_TC_INSUFFICIENT_SAMPLES, DEFAULT_TC_BOOTSTRAP_RESAMPLES, DEFAULT_TC_K, IIResult, IISign,
     MIN_QUORUM_TC_PER_SLOT, SlotVectors, TCResult, TotalCorrelationConfig, interaction_information,
-    interaction_information_with_config, min_quorum_tc, n_eff_from_tc, total_correlation,
-    total_correlation_with_config,
+    interaction_information_with_config, interaction_information_with_config_cuda_strict,
+    min_quorum_tc, n_eff_from_tc, total_correlation, total_correlation_with_config,
+    total_correlation_with_config_cuda_strict,
 };
 pub use transfer_entropy::{
     CALYX_TE_INSUFFICIENT_SAMPLES, DEFAULT_TE_BOOTSTRAP_RESAMPLES, DEFAULT_TE_BOOTSTRAP_SEED,
     DEFAULT_TE_K, DEFAULT_TE_LAGS, DEFAULT_TE_WINDOW, Direction, MIN_TE_QUORUM, RecurrenceStream,
     TEResult, Timestamp, TransferEntropyConfig, max_transfer_entropy_lag, transfer_entropy,
     transfer_entropy_sweep, transfer_entropy_sweep_with_config, transfer_entropy_with_config,
+    transfer_entropy_with_config_cuda_strict,
 };
 
 #[cfg(test)]

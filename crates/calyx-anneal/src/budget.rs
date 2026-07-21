@@ -377,6 +377,7 @@ fn temp_path(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(tmp_name))
 }
 
+#[cfg(target_os = "linux")]
 fn read_proc_stat() -> Option<ProcStat> {
     let text = fs::read_to_string("/proc/stat").ok()?;
     let fields = text.lines().next()?.split_whitespace().collect::<Vec<_>>();
@@ -407,6 +408,40 @@ fn read_proc_stat() -> Option<ProcStat> {
         idle: idle_all,
         total,
     })
+}
+
+#[cfg(target_os = "windows")]
+fn read_proc_stat() -> Option<ProcStat> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetSystemTimes;
+
+    let mut idle = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: all three pointers reference initialized, writable FILETIME
+    // values for the duration of the synchronous Windows API call.
+    let succeeded = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    if succeeded == 0 {
+        return None;
+    }
+    let idle = filetime_ticks(idle);
+    let kernel = filetime_ticks(kernel);
+    let user = filetime_ticks(user);
+    Some(ProcStat {
+        idle,
+        // GetSystemTimes defines kernel time as including idle time.
+        total: kernel.checked_add(user)?,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn filetime_ticks(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn read_proc_stat() -> Option<ProcStat> {
+    None
 }
 
 fn handle_ticks(config: BudgetConfig) -> usize {

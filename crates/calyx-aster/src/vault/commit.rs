@@ -102,6 +102,35 @@ where
     }
 
     pub(crate) fn commit_rows_locked(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
+        if rows
+            .iter()
+            .any(|row| row.cf == crate::cf::ColumnFamily::TimeIndex)
+        {
+            return Err(CalyxError::aster_corrupt_shard(
+                "time_index is a reserved derived column family; caller-supplied rows are forbidden because they can forge or corrupt the sole time-to-sequence mapping",
+            ));
+        }
+        self.commit_rows_locked_inner(rows)
+    }
+
+    /// Trusted erasure path for tombstoning existing derived TimeIndex rows.
+    /// It deliberately accepts only the MVCC tombstone value, never a forged
+    /// live time-to-sequence mapping.
+    pub(crate) fn commit_erasure_rows_locked(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
+        if let Some(row) = rows.iter().find(|row| {
+            row.cf == crate::cf::ColumnFamily::TimeIndex
+                && !crate::mvcc::is_tombstone_value(&row.value)
+        }) {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "trusted erasure attempted a live time_index write: key_len={} value_len={}",
+                row.key.len(),
+                row.value.len()
+            )));
+        }
+        self.commit_rows_locked_inner(rows)
+    }
+
+    fn commit_rows_locked_inner(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
         if rows.is_empty() {
             // Empty commit: do not advance the seq or stamp a time-index entry.
             return self.commit_prepared_rows(rows);

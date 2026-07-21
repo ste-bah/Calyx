@@ -1,9 +1,12 @@
 use super::page;
-use super::{SstEntry, SstKeyState, SstLookupMetadata, SstReader};
+use super::shared_reader;
+use super::{SstEntry, SstKeyState, SstLookupMetadata, SstPointReader};
 use calyx_core::Result;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use crate::storage_names::{SstName, classify_sst};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SstLevel {
@@ -22,7 +25,7 @@ impl LevelFile {
     }
 
     fn with_lookup(path: PathBuf) -> Result<Self> {
-        let lookup = SstReader::open(&path)?.lookup_metadata();
+        let lookup = shared_reader(&path)?.lookup_metadata();
         Ok(Self { path, lookup })
     }
 
@@ -33,6 +36,21 @@ impl LevelFile {
         key >= lookup.first_key.as_slice()
             && key <= lookup.last_key.as_slice()
             && lookup.bloom.may_contain(key)
+    }
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if !self.may_contain(key) {
+            return Ok(None);
+        }
+        let Some(lookup) = &self.lookup else {
+            return shared_reader(&self.path)?.get(key);
+        };
+        let Some(offset) = lookup.record_offset(key) else {
+            return Ok(None);
+        };
+        SstPointReader::open(&self.path)?
+            .read_value(offset, key)
+            .map(Some)
     }
 }
 
@@ -70,15 +88,70 @@ impl SstLevel {
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         for file in &self.files {
-            if !file.may_contain(key) {
-                continue;
-            }
-            let reader = SstReader::open(&file.path)?;
-            if let Some(value) = reader.get(key)? {
+            if let Some(value) = file.get(key)? {
                 return Ok(Some(value));
             }
         }
         Ok(None)
+    }
+
+    /// Re-derives the highest checkpointed commit that can affect a
+    /// persistent search index and proves every router-flushed key has a
+    /// commit-domain durable home. Relevant levels are opened with retained,
+    /// fully validated lookup indexes before this method is called.
+    pub(crate) fn prove_commit_domain_watermark(&self, durable_seq: u64) -> Result<u64> {
+        let mut durable_files = Vec::new();
+        let mut router_files = Vec::new();
+        let mut watermark = 0_u64;
+        for file in &self.files {
+            match classify_sst(&file.path)? {
+                Some(SstName::DurableBatch { seq, .. } | SstName::Compacted { seq })
+                    if seq <= durable_seq =>
+                {
+                    watermark = watermark.max(seq);
+                    durable_files.push(file);
+                }
+                Some(SstName::RouterLegacy { .. } | SstName::Flush { .. }) => {
+                    router_files.push(file);
+                }
+                Some(SstName::DurableBatch { .. } | SstName::Compacted { .. }) | None => {}
+            }
+        }
+
+        let mut missing_count = 0_u64;
+        let mut samples = Vec::new();
+        for router in router_files {
+            let lookup = router.lookup.as_ref().ok_or_else(|| {
+                calyx_core::CalyxError::aster_corrupt_shard(format!(
+                    "persistent-search watermark migration lacks a validated lookup index for router SST {}",
+                    router.path.display()
+                ))
+            })?;
+            for key in lookup.keys() {
+                if durable_files.iter().any(|file| {
+                    file.lookup
+                        .as_ref()
+                        .is_some_and(|index| index.record_offset(key).is_some())
+                }) {
+                    continue;
+                }
+                missing_count += 1;
+                if samples.len() < 3 {
+                    samples.push(hex_prefix(key));
+                }
+            }
+        }
+        if missing_count != 0 {
+            return Err(calyx_core::CalyxError {
+                code: "CALYX_ASTER_DERIVED_CONTENT_MIGRATION_UNPROVEN",
+                message: format!(
+                    "persistent-search watermark migration found {missing_count} router-flushed key(s) with no commit-domain durable home, e.g. [{}]",
+                    samples.join(", ")
+                ),
+                remediation: "preserve the vault and run verified CF compaction/recovery so every Base and quantized Slot key has a commit-domain SST before reopening; do not edit MANIFEST or SST files by hand",
+            });
+        }
+        Ok(watermark)
     }
 
     pub(crate) fn values_for_key(&self, key: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -87,7 +160,7 @@ impl SstLevel {
             if !file.may_contain(key) {
                 continue;
             }
-            let reader = SstReader::open(&file.path)?;
+            let reader = shared_reader(&file.path)?;
             if let Some(value) = reader.get(key)? {
                 values.push(value);
             }
@@ -101,7 +174,7 @@ impl SstLevel {
             .par_iter()
             .enumerate()
             .map(|(index, file)| -> Result<(usize, Vec<SstEntry>)> {
-                Ok((index, SstReader::open(&file.path)?.range(start, end)?))
+                Ok((index, shared_reader(&file.path)?.range(start, end)?))
             })
             .collect::<Result<Vec<_>>>()?;
         per_file.sort_by_key(|(index, _)| *index);
@@ -118,6 +191,30 @@ impl SstLevel {
             .collect())
     }
 
+    pub(crate) fn predecessor(
+        &self,
+        start: &[u8],
+        upper: &[u8],
+        inclusive: bool,
+    ) -> Result<Option<SstEntry>> {
+        let mut newest_at_greatest_key = None::<(usize, SstEntry)>;
+        for (file_index, file) in self.files.iter().enumerate() {
+            let Some(entry) = shared_reader(&file.path)?.predecessor(start, upper, inclusive)?
+            else {
+                continue;
+            };
+            let replace = newest_at_greatest_key
+                .as_ref()
+                .is_none_or(|(best_index, best)| {
+                    entry.key > best.key || (entry.key == best.key && file_index < *best_index)
+                });
+            if replace {
+                newest_at_greatest_key = Some((file_index, entry));
+            }
+        }
+        Ok(newest_at_greatest_key.map(|(_, entry)| entry))
+    }
+
     pub fn range_keys(&self, start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>> {
         self.range_keys_until(start, Some(end))
     }
@@ -130,7 +227,7 @@ impl SstLevel {
             .map(|(index, file)| -> Result<(usize, Vec<SstKeyState>)> {
                 Ok((
                     index,
-                    SstReader::open(&file.path)?.range_key_states_until(start, end)?,
+                    shared_reader(&file.path)?.range_key_states_until(start, end)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -188,7 +285,7 @@ impl SstLevel {
     pub fn iter(&self) -> Result<Vec<SstEntry>> {
         let mut rows = BTreeMap::new();
         for file in &self.files {
-            for entry in SstReader::open(&file.path)?.iter()? {
+            for entry in shared_reader(&file.path)?.iter()? {
                 rows.entry(entry.key).or_insert(entry.value);
             }
         }
@@ -215,6 +312,17 @@ impl SstLevel {
     }
 }
 
+fn hex_prefix(bytes: &[u8]) -> String {
+    let mut value = String::new();
+    for byte in bytes.iter().take(12) {
+        value.push_str(&format!("{byte:02x}"));
+    }
+    if bytes.len() > 12 {
+        value.push_str("...");
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +332,52 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn persistent_search_watermark_proves_router_keys_in_commit_domain() {
+        let dir = test_dir("watermark-proof");
+        let durable = dir.join("00000000000000000007-0000.sst");
+        let router = dir.join("flush-00000000000000000009-0001.sst");
+        write_sst(&durable, [(b"cx-1".as_slice(), b"durable".as_slice())]).unwrap();
+        write_sst(&router, [(b"cx-1".as_slice(), b"latest".as_slice())]).unwrap();
+        let level = SstLevel::from_oldest_first_with_lookup([durable, router]).unwrap();
+
+        assert_eq!(level.prove_commit_domain_watermark(9).unwrap(), 7);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn persistent_search_watermark_rejects_router_only_key() {
+        let dir = test_dir("watermark-router-only");
+        let durable = dir.join("00000000000000000007-0000.sst");
+        let router = dir.join("flush-00000000000000000009-0001.sst");
+        write_sst(&durable, [(b"cx-1".as_slice(), b"durable".as_slice())]).unwrap();
+        write_sst(&router, [(b"cx-2".as_slice(), b"orphan".as_slice())]).unwrap();
+        let level = SstLevel::from_oldest_first_with_lookup([durable, router]).unwrap();
+
+        let error = level
+            .prove_commit_domain_watermark(9)
+            .expect_err("router-only key must fail migration");
+        assert_eq!(error.code, "CALYX_ASTER_DERIVED_CONTENT_MIGRATION_UNPROVEN");
+        assert!(error.message.contains("1 router-flushed key"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn persistent_search_watermark_rejects_coverage_beyond_manifest_floor() {
+        let dir = test_dir("watermark-beyond-floor");
+        let future = dir.join("00000000000000000009-0000.sst");
+        let router = dir.join("flush-00000000000000000009-0001.sst");
+        write_sst(&future, [(b"cx-1".as_slice(), b"future".as_slice())]).unwrap();
+        write_sst(&router, [(b"cx-1".as_slice(), b"router".as_slice())]).unwrap();
+        let level = SstLevel::from_oldest_first_with_lookup([future, router]).unwrap();
+
+        let error = level
+            .prove_commit_domain_watermark(8)
+            .expect_err("uncheckpointed SST must not prove durable coverage");
+        assert_eq!(error.code, "CALYX_ASTER_DERIVED_CONTENT_MIGRATION_UNPROVEN");
+        cleanup(dir);
+    }
 
     #[test]
     fn newest_first_point_lookup_wins() {
@@ -338,6 +492,75 @@ mod tests {
         assert_eq!(level.file_count(), 128);
         assert_eq!(level.candidate_file_count_for_key(&key), 1);
         assert_eq!(level.get(&key).unwrap(), Some(vec![43u8; 8]));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn validated_lookup_rejects_bloom_false_positive_before_file_io() {
+        let dir = test_dir("validated-exact-index");
+        let path = dir.join("large.sst");
+        let first_value = vec![0x31; 2 * 1024 * 1024];
+        let last_value = vec![0x7a; 2 * 1024 * 1024];
+        write_sst(
+            &path,
+            [
+                (b"a".as_slice(), first_value.as_slice()),
+                (b"z".as_slice(), last_value.as_slice()),
+            ],
+        )
+        .unwrap();
+        let level = SstLevel::from_oldest_first_with_lookup([path.clone()]).unwrap();
+        let missing = (0..=u16::MAX)
+            .map(|value| format!("m{value:04x}").into_bytes())
+            .find(|key| level.candidate_file_count_for_key(key) == 1)
+            .expect("find a deterministic Bloom candidate absent from the exact index");
+
+        assert_eq!(level.get(b"a").unwrap(), Some(first_value));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            level.get(&missing).unwrap(),
+            None,
+            "the validated exact index must reject a Bloom false positive without reopening the SST"
+        );
+        let error = level
+            .get(b"a")
+            .expect_err("an exact match must fail if its immutable SST disappeared");
+        eprintln!(
+            "ISSUE1802_EXACT_INDEX large_value_bytes={} bloom_candidate={} missing_without_io=true exact_missing_error={}",
+            2 * 1024 * 1024,
+            String::from_utf8_lossy(&missing),
+            error.code
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn validated_lookup_exact_read_fails_loud_after_physical_truncation() {
+        let dir = test_dir("validated-truncated-point");
+        let path = dir.join("truncated.sst");
+        let value = vec![0x55; 2 * 1024 * 1024];
+        write_sst(&path, [(b"key".as_slice(), value.as_slice())]).unwrap();
+        let level = SstLevel::from_oldest_first_with_lookup([path.clone()]).unwrap();
+        // Simulates external truncation: drop the shared-cache mapping first
+        // (Windows refuses to truncate a mapped file), the same contract every
+        // reclaim site follows before deleting an SST.
+        crate::sst::invalidate_reader(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(super::super::HEADER_LEN as u64)
+            .unwrap();
+
+        let error = level
+            .get(b"key")
+            .expect_err("truncated matched SST must not produce a value");
+        assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
+        eprintln!(
+            "ISSUE1802_TRUNCATED_POINT physical_bytes_after={} error_code={} exact_value_returned=false",
+            fs::metadata(&path).unwrap().len(),
+            error.code
+        );
         cleanup(dir);
     }
 

@@ -14,7 +14,8 @@
 //! (read-only), then edge updates apply sequentially in batch order — so the
 //! build is both parallel and fully deterministic regardless of thread count.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use calyx_core::Result;
@@ -194,8 +195,15 @@ where
 {
     params.validate()?;
     validate_build_input(vectors, &params)?;
+    let cagra_sidecar = cagra_sidecar_path(path);
+    let cagra_dataset = cagra_dataset_sidecar_path(path);
     match backend {
         DiskAnnBuildBackend::CpuVamana => {
+            // A CPU rebuild changes the graph generation. Remove any prior
+            // device-serving asset first so serving can only fail closed,
+            // never deserialize a stale CAGRA index.
+            remove_cagra_sidecar_if_present(&cagra_sidecar)?;
+            remove_cagra_sidecar_if_present(&cagra_dataset)?;
             build_diskann_graph_cpu(path, vectors, params, metric, &mut progress)
         }
         DiskAnnBuildBackend::CuvsCagra => {
@@ -206,6 +214,30 @@ where
                 vectors.len(),
             ))
         }
+    }
+}
+
+/// Dataset-inclusive cuVS CAGRA asset used by CUDA serving.
+pub fn cagra_sidecar_path(graph_path: &Path) -> PathBuf {
+    graph_path.with_extension("cagra")
+}
+
+/// Compact dataset paired with the CAGRA generation for partitioned CUDA serving.
+pub fn cagra_dataset_sidecar_path(graph_path: &Path) -> PathBuf {
+    graph_path.with_extension("cagra-data")
+}
+
+fn remove_cagra_sidecar_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::error::sextant_error(
+            crate::error::CALYX_INDEX_IO,
+            format!(
+                "remove stale CAGRA serving asset {}: {error}",
+                path.display()
+            ),
+        )),
     }
 }
 

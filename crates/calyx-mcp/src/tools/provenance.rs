@@ -1,5 +1,7 @@
 //! Provenance and ops MCP tools for PH63 T07.
 
+mod answer_directory;
+mod answer_entries;
 mod core;
 mod ids;
 mod quarantine;

@@ -1,15 +1,11 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_aster::cf::{ColumnFamily, base_key, recurrence_prefix_range};
 use calyx_aster::dedup::EpochSecs;
 use calyx_aster::recurrence::{
     FREQUENCY_SCALAR, OccurrenceContext, RetentionPolicy, append_occurrence, read_series,
 };
 use calyx_aster::vault::{AsterVault, VaultOptions, encode};
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, BoostConfig, CxFlags, DecayFunction, FusionWeights, InputRef,
     LedgerRef, Modality, SlotId, SlotVector, VaultId, VaultStore,
@@ -21,6 +17,9 @@ use calyx_sextant::{
 };
 use serde_json::json;
 use sextant_support::cx_u8_fill as cx;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 const QUERY_TIME: i64 = 1_000_000;
 const CONTENT_SCORE: f32 = 0.70;

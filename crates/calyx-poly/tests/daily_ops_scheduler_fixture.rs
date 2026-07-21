@@ -27,8 +27,8 @@ use calyx_poly::ward_calibration::{
 use calyx_ward::{MIN_BAD_SCORES, SlotKind};
 use serde_json::{Value, json};
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use support::{
     known_healthy_market_integrity, known_healthy_oracle_risk, known_healthy_wash_trade,

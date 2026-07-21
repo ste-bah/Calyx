@@ -1,6 +1,8 @@
-use std::fs::{self, File};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use calyx_core::{CalyxError, Result};
@@ -8,6 +10,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::types::{CORRUPT_CODE, MISSING_CODE, REMEDIATION, STALE_CODE};
+
+static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
@@ -28,6 +32,103 @@ pub(super) fn write_bytes_file(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all().map_err(|error| {
         CalyxError::disk_pressure(format!("sync Base page index {}: {error}", path.display()))
     })
+}
+
+pub(super) fn write_json_file_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| corrupt(format!("encode Base page index JSON: {error}")))?;
+    let filename = path.file_name().ok_or_else(|| {
+        corrupt(format!(
+            "Base page index commit-point path {} has no filename",
+            path.display()
+        ))
+    })?;
+    let mut tmp_name = OsString::from(".");
+    tmp_name.push(filename);
+    tmp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        ATOMIC_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = path.with_file_name(tmp_name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|error| {
+            CalyxError::disk_pressure(format!(
+                "create Base page index commit-point temp {}: {error}",
+                tmp.display()
+            ))
+        })?;
+    let published = (|| {
+        file.write_all(&bytes).map_err(|error| {
+            CalyxError::disk_pressure(format!(
+                "write Base page index commit-point temp {}: {error}",
+                tmp.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            CalyxError::disk_pressure(format!(
+                "sync Base page index commit-point temp {}: {error}",
+                tmp.display()
+            ))
+        })?;
+        drop(file);
+        publish_replace(&tmp, path)?;
+        sync_parent(path)
+    })();
+    if published.is_err() && tmp.exists() {
+        let _ = fs::remove_file(&tmp);
+    }
+    published
+}
+
+#[cfg(unix)]
+fn publish_replace(tmp: &Path, path: &Path) -> Result<()> {
+    fs::rename(tmp, path).map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "publish Base page index commit point {} -> {}: {error}",
+            tmp.display(),
+            path.display()
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn publish_replace(tmp: &Path, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let from = tmp
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let to = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both buffers are NUL-terminated and remain alive for the call.
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        return Ok(());
+    }
+    Err(CalyxError::disk_pressure(format!(
+        "publish Base page index commit point {} -> {}: {}",
+        tmp.display(),
+        path.display(),
+        std::io::Error::last_os_error()
+    )))
 }
 
 pub(super) fn remove_path(path: &Path) -> Result<()> {

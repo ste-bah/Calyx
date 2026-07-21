@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub const DEFAULT_MAX_ROWS: usize = 1_000_000;
 pub const DEFAULT_MAX_GROUPS: usize = 4096;
+pub const OLAP_CUDA_MIN_ROWS: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OlapScanPlan {
@@ -61,4 +62,26 @@ pub struct OlapScanResult {
     pub group_by_column: Option<usize>,
     pub aggregate: OlapAggregate,
     pub groups: Vec<OlapGroupAggregate>,
+    pub execution: OlapExecutionStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OlapExecutionStats {
+    pub backend: String,
+    pub pinned_staging: bool,
+    pub chunks: u64,
+    pub dictionary_capacity: u64,
+    pub kernel_launches: u64,
+    pub host_to_device_bytes: u64,
+    pub device_to_host_bytes: u64,
+    pub peak_pinned_staging_bytes: u64,
+    pub peak_device_bytes: u64,
+    pub sum_abs_tolerance: f64,
+    pub avg_abs_tolerance: f64,
+}
+
+pub fn olap_sum_tolerance(count: usize, min: f32, max: f32) -> f64 {
+    let n = count as f64;
+    let max_abs = f64::from(min).abs().max(f64::from(max).abs());
+    (8.0 * f64::EPSILON * n * n * max_abs).max(1.0e-12)
 }

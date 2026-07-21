@@ -22,6 +22,18 @@ pub(super) fn centroid_bits(bits: u8, code: u16) -> f32 {
     codebook_bits(bits).centroids[usize::from(code)]
 }
 
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_codebook_tables() -> (Vec<f32>, Vec<f32>) {
+    let mut thresholds = Vec::with_capacity(11);
+    let mut centroids = Vec::with_capacity(14);
+    for bits in [1, 2, 3] {
+        let codebook = codebook_bits(bits);
+        thresholds.extend_from_slice(&codebook.thresholds);
+        centroids.extend_from_slice(&codebook.centroids);
+    }
+    (thresholds, centroids)
+}
+
 pub(super) fn centroid_product_sum_mixed(
     left_codes: &[u8],
     left_widths: &[u8],

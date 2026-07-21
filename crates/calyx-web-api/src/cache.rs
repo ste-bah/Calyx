@@ -7,7 +7,7 @@ use super::*;
 /// One cached response: the EXACT serialized body bytes (so a hit replays
 /// byte-for-byte) plus the monotonic instant it was stored (for TTL + `Age`).
 pub(super) struct CacheEntry {
-    body: Arc<[u8]>,
+    body: Bytes,
     stored: Instant,
 }
 
@@ -60,7 +60,7 @@ impl ResponseCache {
     /// Look up `key`. Returns the cached body bytes + their current age when a
     /// FRESH (non-expired) entry exists; drops the entry and returns `None` when
     /// it has expired or is absent (so an expired entry can never be served).
-    pub(super) fn get(&self, key: &str) -> Option<(Arc<[u8]>, Duration)> {
+    pub(super) fn get(&self, key: &str) -> Option<(Bytes, Duration)> {
         if !self.enabled() {
             return None;
         }
@@ -68,7 +68,7 @@ impl ResponseCache {
         if let Some(entry) = entries.get(key) {
             let age = entry.stored.elapsed();
             if age < self.ttl {
-                return Some((Arc::clone(&entry.body), age));
+                return Some((entry.body.clone(), age));
             }
         }
         entries.remove(key);
@@ -77,7 +77,7 @@ impl ResponseCache {
 
     /// Store `body` under `key`. Evicts expired entries, then the oldest-stored
     /// key, until `len <= capacity` — a hard memory bound.
-    pub(super) fn put(&self, key: String, body: Arc<[u8]>) {
+    pub(super) fn put(&self, key: String, body: Bytes) {
         if !self.enabled() {
             return;
         }
@@ -118,7 +118,7 @@ pub(super) fn parse_env_u64(name: &str, default: u64) -> Result<u64, String> {
 /// RFC 9111 §5.1). A HIT replays the EXACT cached bytes, so it is byte-identical
 /// to the MISS that populated it.
 pub(super) fn cached_json_response(
-    body: Arc<[u8]>,
+    body: Bytes,
     cache_status: &'static str,
     age: Duration,
 ) -> Response {
@@ -127,7 +127,7 @@ pub(super) fn cached_json_response(
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-cache", cache_status)
         .header(header::AGE, age.as_secs())
-        .body(Body::from(body.to_vec()))
+        .body(Body::from(body))
         .expect("static headers + byte body is always a valid response")
 }
 
@@ -137,8 +137,11 @@ pub(super) fn cached_json_response(
 pub(super) fn store_and_respond(cache: &ResponseCache, key: String, body: &Value) -> Response {
     match serde_json::to_vec(body) {
         Ok(bytes) => {
-            let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
-            cache.put(key, Arc::clone(&bytes));
+            // `Bytes::from(Vec<u8>)` takes ownership of the serializer's
+            // allocation. Clones stored in the cache and moved into Axum's
+            // body share that immutable allocation without a body-sized copy.
+            let bytes = Bytes::from(bytes);
+            cache.put(key, bytes.clone());
             cached_json_response(bytes, "MISS", Duration::ZERO)
         }
         Err(error) => {

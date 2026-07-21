@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use calyx_core::{Anchor, AnchorValue, Constellation, CxId};
 use calyx_sextant::{AnchorPredicate, MetadataPredicate, QueryFilters, ScalarOp, ScalarPredicate};
@@ -35,6 +36,15 @@ struct FilterMetadata {
     created_at: u64,
     input_redacted: bool,
     input_pointer: Option<String>,
+    #[serde(default)]
+    attributes: BTreeMap<String, String>,
+}
+
+type FilterCache = Mutex<BTreeMap<String, (String, u64, Arc<FilterIndex>)>>;
+
+fn cache() -> &'static FilterCache {
+    static CACHE: OnceLock<FilterCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 pub(super) fn write(
@@ -84,12 +94,56 @@ pub(super) fn candidates(
     ))
 }
 
+pub(super) fn exact_metadata_candidates(
+    vault_dir: &Path,
+    entry: Option<&FilterIndexEntry>,
+    manifest_base_seq: u64,
+    query: &str,
+) -> CliResult<BTreeSet<CxId>> {
+    let entry = entry.ok_or_else(|| {
+        stale("persistent search filter sidecar is absent from manifest; rebuild the vault search indexes before exact metadata search")
+    })?;
+    let index = read(vault_dir, entry, manifest_base_seq)?;
+    let matched = index
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                row.cx_id,
+                crate::metadata_exact::metadata_match(query, &row.metadata.attributes)
+                    .specificity(),
+            )
+        })
+        .filter(|(_, specificity)| *specificity > 0)
+        .collect::<Vec<_>>();
+    let highest = matched
+        .iter()
+        .map(|(_, specificity)| *specificity)
+        .max()
+        .unwrap_or(0);
+    Ok(matched
+        .into_iter()
+        .filter(|(_, specificity)| *specificity == highest)
+        .map(|(cx_id, _)| cx_id)
+        .collect())
+}
+
 fn read(
     vault_dir: &Path,
     entry: &FilterIndexEntry,
     manifest_base_seq: u64,
-) -> CliResult<FilterIndex> {
+) -> CliResult<Arc<FilterIndex>> {
     let path = vault_dir.join(&entry.index_rel);
+    let cache_key = vault_dir.to_string_lossy().into_owned();
+    if let Some((_, _, index)) = cache()
+        .lock()
+        .expect("filter index cache poisoned")
+        .get(&cache_key)
+        .filter(|(sha256, base_seq, _)| *sha256 == entry.sha256 && *base_seq == manifest_base_seq)
+        .cloned()
+    {
+        return Ok(index);
+    }
     if !path.is_file() {
         return Err(stale(format!(
             "persistent search filter sidecar missing at {}; rebuild the vault search indexes",
@@ -111,6 +165,11 @@ fn read(
         ))
     })?;
     validate(&index, entry, manifest_base_seq)?;
+    let index = Arc::new(index);
+    cache().lock().expect("filter index cache poisoned").insert(
+        cache_key,
+        (entry.sha256.clone(), manifest_base_seq, Arc::clone(&index)),
+    );
     Ok(index)
 }
 
@@ -189,6 +248,15 @@ impl From<&Constellation> for FilterRow {
                 created_at: cx.created_at,
                 input_redacted: cx.input_ref.redacted,
                 input_pointer: cx.input_ref.pointer.clone(),
+                attributes: ["case_name", "docket_number"]
+                    .into_iter()
+                    .filter_map(|name| {
+                        cx.metadata
+                            .get(name)
+                            .filter(|value| !value.is_empty())
+                            .map(|value| (name.to_string(), value.clone()))
+                    })
+                    .collect(),
             },
         }
     }

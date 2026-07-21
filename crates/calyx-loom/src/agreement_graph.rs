@@ -1,6 +1,6 @@
 //! In-memory xterm CF and agreement graph readbacks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::{CfRouter, ColumnFamily};
 use calyx_core::{CalyxError, CxId, Result, SlotId};
@@ -10,6 +10,7 @@ use crate::cross_term::{
     CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag, agreement_scalar,
     agreement_weight, canonical_pair, concat_vec, delta_vec, interaction_vec,
 };
+use crate::cuda::{CudaTermRequest, LoomCudaStats, execute_terms, loom_cuda_strict_requested};
 use crate::error::{CALYX_LOOM_SLOT_MISSING, loom_error};
 use crate::lru_cache::LruCache;
 use crate::materialization::{MaterializationAction, MaterializationPlan};
@@ -36,6 +37,7 @@ pub struct LoomStore {
     xterm_cf: BTreeMap<CrossTermKey, XtermRow>,
     measured_tags: BTreeMap<(CxId, SlotId), SignalProvenanceTag>,
     cache: LruCache<CrossTermKey, CrossTermValue>,
+    last_cuda_stats: Option<LoomCudaStats>,
 }
 
 impl LoomStore {
@@ -44,6 +46,7 @@ impl LoomStore {
             xterm_cf: BTreeMap::new(),
             measured_tags: BTreeMap::new(),
             cache: LruCache::new(cache_capacity),
+            last_cuda_stats: None,
         }
     }
 
@@ -64,7 +67,60 @@ impl LoomStore {
         self.cache.len()
     }
 
+    pub fn last_cuda_stats(&self) -> Option<&LoomCudaStats> {
+        self.last_cuda_stats.as_ref()
+    }
+
     pub fn weave(&mut self, cx: CxId, slots: &BTreeMap<SlotId, Vec<f32>>) -> Result<usize> {
+        if loom_cuda_strict_requested() {
+            return self.weave_cuda_strict(cx, slots);
+        }
+        self.last_cuda_stats = None;
+        self.weave_cpu(cx, slots)
+    }
+
+    pub fn weave_cuda_strict(
+        &mut self,
+        cx: CxId,
+        slots: &BTreeMap<SlotId, Vec<f32>>,
+    ) -> Result<usize> {
+        self.last_cuda_stats = None;
+        for slot in slots.keys() {
+            self.tag_measured(cx, *slot);
+        }
+        let ids: Vec<_> = slots.keys().copied().collect();
+        let mut requests = Vec::new();
+        for left in 0..ids.len() {
+            for right in left + 1..ids.len() {
+                requests.push(CudaTermRequest {
+                    a: ids[left],
+                    b: ids[right],
+                    kind: CrossTermKind::Agreement,
+                });
+            }
+        }
+        let batch = execute_terms(slots, &requests)?;
+        for (request, value) in requests.iter().zip(batch.values) {
+            let key = CrossTermKey {
+                cx_id: cx,
+                a: request.a,
+                b: request.b,
+                kind: request.kind,
+            };
+            self.xterm_cf.insert(
+                key,
+                XtermRow {
+                    key,
+                    value,
+                    tag: SignalProvenanceTag::Derived,
+                },
+            );
+        }
+        self.last_cuda_stats = Some(batch.stats);
+        Ok(requests.len())
+    }
+
+    fn weave_cpu(&mut self, cx: CxId, slots: &BTreeMap<SlotId, Vec<f32>>) -> Result<usize> {
         let mut inserted = 0;
         for slot in slots.keys() {
             self.tag_measured(cx, *slot);
@@ -96,6 +152,84 @@ impl LoomStore {
     }
 
     pub fn materialize_plan(
+        &mut self,
+        cx: CxId,
+        slots: &BTreeMap<SlotId, Vec<f32>>,
+        plan: &MaterializationPlan,
+    ) -> Result<usize> {
+        if loom_cuda_strict_requested() {
+            return self.materialize_plan_cuda_strict(cx, slots, plan);
+        }
+        self.last_cuda_stats = None;
+        self.materialize_plan_cpu(cx, slots, plan)
+    }
+
+    pub fn materialize_plan_cuda_strict(
+        &mut self,
+        cx: CxId,
+        slots: &BTreeMap<SlotId, Vec<f32>>,
+        plan: &MaterializationPlan,
+    ) -> Result<usize> {
+        self.last_cuda_stats = None;
+        for slot in slots.keys() {
+            self.tag_measured(cx, *slot);
+        }
+        let mut seen = BTreeSet::new();
+        let mut keys = Vec::new();
+        for entry in plan
+            .entries
+            .iter()
+            .filter(|entry| entry.action == MaterializationAction::EagerStore)
+        {
+            let (a, b) = canonical_pair(entry.a, entry.b);
+            let key = CrossTermKey {
+                cx_id: cx,
+                a,
+                b,
+                kind: entry.kind,
+            };
+            if !self.xterm_cf.contains_key(&key) && seen.insert(key) {
+                keys.push(key);
+            }
+        }
+        let requests: Vec<_> = keys
+            .iter()
+            .filter(|key| key.kind != CrossTermKind::Concat)
+            .map(|key| CudaTermRequest {
+                a: key.a,
+                b: key.b,
+                kind: key.kind,
+            })
+            .collect();
+        let (device_values, stats) = if requests.is_empty() {
+            (Vec::new(), None)
+        } else {
+            let batch = execute_terms(slots, &requests)?;
+            (batch.values, Some(batch.stats))
+        };
+        let mut device_values = device_values.into_iter();
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = if key.kind == CrossTermKind::Concat {
+                compute_cross_term(key.a, key.b, key.kind, slots)?
+            } else {
+                device_values.next().expect("one value per CUDA request")
+            };
+            rows.push(XtermRow {
+                key,
+                value,
+                tag: SignalProvenanceTag::Derived,
+            });
+        }
+        let inserted = rows.len();
+        for row in rows {
+            self.xterm_cf.insert(row.key, row);
+        }
+        self.last_cuda_stats = stats;
+        Ok(inserted)
+    }
+
+    fn materialize_plan_cpu(
         &mut self,
         cx: CxId,
         slots: &BTreeMap<SlotId, Vec<f32>>,
@@ -142,6 +276,30 @@ impl LoomStore {
         kind: CrossTermKind,
         slots: &BTreeMap<SlotId, Vec<f32>>,
     ) -> Result<CrossTermValue> {
+        self.cross_term_routed(cx, a, b, kind, slots, loom_cuda_strict_requested())
+    }
+
+    pub fn cross_term_cuda_strict(
+        &mut self,
+        cx: CxId,
+        a: SlotId,
+        b: SlotId,
+        kind: CrossTermKind,
+        slots: &BTreeMap<SlotId, Vec<f32>>,
+    ) -> Result<CrossTermValue> {
+        self.cross_term_routed(cx, a, b, kind, slots, true)
+    }
+
+    fn cross_term_routed(
+        &mut self,
+        cx: CxId,
+        a: SlotId,
+        b: SlotId,
+        kind: CrossTermKind,
+        slots: &BTreeMap<SlotId, Vec<f32>>,
+        strict_cuda: bool,
+    ) -> Result<CrossTermValue> {
+        self.last_cuda_stats = None;
         let (a, b) = canonical_pair(a, b);
         let key = CrossTermKey {
             cx_id: cx,
@@ -155,7 +313,13 @@ impl LoomStore {
         if let Some(value) = self.cache.get(&key) {
             return Ok(value);
         }
-        let value = compute_cross_term(a, b, kind, slots)?;
+        let value = if strict_cuda && kind != CrossTermKind::Concat {
+            let mut batch = execute_terms(slots, &[CudaTermRequest { a, b, kind }])?;
+            self.last_cuda_stats = Some(batch.stats);
+            batch.values.pop().expect("one strict CUDA xterm value")
+        } else {
+            compute_cross_term(a, b, kind, slots)?
+        };
         self.cache.put(key, value.clone());
         Ok(value)
     }
@@ -270,102 +434,6 @@ fn compute_cross_term(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
-    #[test]
-    fn xterms_roundtrip_through_aster_cf() {
-        let dir = test_dir("xterm");
-        let mut router = CfRouter::open(&dir, 1024).unwrap();
-        let mut store = LoomStore::new(8);
-        let slots = BTreeMap::from([
-            (SlotId::new(1), vec![1.0, 0.0]),
-            (SlotId::new(2), vec![0.0, 1.0]),
-        ]);
-        store.weave(CxId::from_bytes([1; 16]), &slots).unwrap();
-
-        assert_eq!(store.persist_xterms_to_aster(&mut router).unwrap(), 1);
-        drop(router);
-        let reopened = CfRouter::open(&dir, 1024).unwrap();
-        let loaded = LoomStore::load_xterms_from_aster(&reopened, 8).unwrap();
-
-        assert_eq!(loaded.xterm_count(), 1);
-        assert_eq!(loaded.agreement_graph().unwrap()[0].n, 1);
-        cleanup(dir);
-    }
-
-    #[test]
-    fn agreement_graph_rejects_non_finite_xterm_rows() {
-        let mut store = LoomStore::new(8);
-        store.xterm_cf.insert(
-            CrossTermKey {
-                cx_id: CxId::from_bytes([9; 16]),
-                a: SlotId::new(1),
-                b: SlotId::new(2),
-                kind: CrossTermKind::Agreement,
-            },
-            XtermRow {
-                key: CrossTermKey {
-                    cx_id: CxId::from_bytes([9; 16]),
-                    a: SlotId::new(1),
-                    b: SlotId::new(2),
-                    kind: CrossTermKind::Agreement,
-                },
-                value: CrossTermValue::Scalar(f32::NAN),
-                tag: SignalProvenanceTag::Derived,
-            },
-        );
-        let err = store
-            .agreement_graph()
-            .expect_err("NaN xterm must fail closed");
-        assert_eq!(err.code, crate::error::CALYX_LOOM_NON_FINITE_VECTOR);
-    }
-
-    #[test]
-    fn xterm_kv_rows_match_router_persist_encoding() {
-        let dir = test_dir("xterm-kv");
-        let mut router = CfRouter::open(&dir, 1024).unwrap();
-        let mut store = LoomStore::new(8);
-        let slots = BTreeMap::from([
-            (SlotId::new(1), vec![1.0, 0.0]),
-            (SlotId::new(2), vec![0.0, 1.0]),
-            (SlotId::new(3), vec![0.5, 0.5]),
-        ]);
-        store.weave(CxId::from_bytes([7; 16]), &slots).unwrap();
-
-        // The same three rows, written through the explicit kv-row path used by
-        // the corpus weave-loom command (vault.write_cf_batch), must produce a CF
-        // that load_xterms_from_aster reads back identically to the in-memory store.
-        let kv = store.xterm_kv_rows().unwrap();
-        assert_eq!(kv.len(), store.xterm_count());
-        for (key, value) in &kv {
-            router.put(ColumnFamily::XTerm, key, value).unwrap();
-        }
-        router.flush_cf(ColumnFamily::XTerm).unwrap();
-        drop(router);
-
-        let reopened = CfRouter::open(&dir, 1024).unwrap();
-        let loaded = LoomStore::load_xterms_from_aster(&reopened, 8).unwrap();
-        assert_eq!(loaded.xterm_count(), store.xterm_count());
-        assert_eq!(loaded.xterm_rows(), store.xterm_rows());
-        cleanup(dir);
-    }
-
-    fn test_dir(name: &str) -> PathBuf {
-        let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("calyx-loom-{name}-{}-{id}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn cleanup(dir: PathBuf) {
-        fs::remove_dir_all(dir).unwrap();
-    }
-}
+mod cuda_tests;
+#[cfg(test)]
+mod tests;

@@ -7,6 +7,7 @@ use fastembed::{EmbeddingModel, TextEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::runtime::common::DEFAULT_MAX_TOKENS;
 use crate::runtime::common::{normalize_unit, text_from_input};
 use crate::spec::{LensRuntime, LensSpec};
 
@@ -19,6 +20,8 @@ mod cpu_fallback_audit;
 mod cuda_graphs;
 mod cuda_guard;
 mod custom;
+#[cfg(feature = "cuda")]
+mod device_postprocess;
 mod dynamic_ort;
 mod fastembed_runtime;
 mod green_context;
@@ -30,7 +33,59 @@ mod windows_cuda_dlls;
 pub(in crate::runtime::onnx) use batch_scope::scoped_max_batch;
 pub(crate) use batch_scope::with_runtime_batch_limit;
 pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbertLens};
-pub use special::{FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens};
+pub(crate) use custom::{
+    contract_corpus_hash as custom_contract_corpus_hash,
+    pooling_from_config as custom_pooling_from_config,
+};
+pub use special::{
+    Bgem3RuntimeStats, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
+};
+
+/// Configured and required ONNX `(batch, sequence)` shape-domain budget for a
+/// resident runtime. The required count is derived from the same stable bucket
+/// functions used to build tensors, preventing admission checks from drifting
+/// away from the production batching path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnnxShapeBucketBudget {
+    pub configured_shape_limit: usize,
+    pub required_shape_count: usize,
+    pub sequence_bucket_count: usize,
+    pub batch_bucket_count: usize,
+    pub max_sequence_tokens: usize,
+    pub max_runtime_batch: usize,
+}
+
+pub fn onnx_shape_bucket_budget(max_runtime_batch: usize) -> Result<OnnxShapeBucketBudget> {
+    let sequence_bucket_count = custom::batch::stable_bucket_count(DEFAULT_MAX_TOKENS)?;
+    let batch_bucket_count = custom::batch::stable_bucket_count(max_runtime_batch)?;
+    let required_shape_count = sequence_bucket_count
+        .checked_mul(batch_bucket_count)
+        .ok_or_else(|| CalyxError {
+            code: "CALYX_ONNX_SHAPE_BUDGET_OVERFLOW",
+            message: format!(
+                "ONNX stable shape budget overflowed for {sequence_bucket_count} sequence buckets and {batch_bucket_count} batch buckets"
+            ),
+            remediation: "lower the configured runtime batch maximum to a representable positive value",
+        })?;
+    let configured_shape_limit = arena::configured_max_distinct_shapes()?;
+    if configured_shape_limit < required_shape_count {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_SHAPE_LIMIT_BELOW_BUCKET_DOMAIN",
+            message: format!(
+                "CALYX_ONNX_MAX_DISTINCT_SHAPES={configured_shape_limit} cannot cover the stable ONNX bucket domain: required={required_shape_count} sequence_buckets={sequence_bucket_count} batch_buckets={batch_bucket_count} max_sequence_tokens={DEFAULT_MAX_TOKENS} max_runtime_batch={max_runtime_batch}"
+            ),
+            remediation: "set CALYX_ONNX_MAX_DISTINCT_SHAPES to at least the reported required count (default 64), then restart; do not weaken sequence or batch bucketing",
+        });
+    }
+    Ok(OnnxShapeBucketBudget {
+        configured_shape_limit,
+        required_shape_count,
+        sequence_bucket_count,
+        batch_bucket_count,
+        max_sequence_tokens: DEFAULT_MAX_TOKENS,
+        max_runtime_batch,
+    })
+}
 
 #[cfg(test)]
 mod tests;
@@ -419,6 +474,11 @@ impl OnnxLens {
         model: &Mutex<TextEmbedding>,
         inputs: &[Input],
     ) -> Result<Vec<SlotVector>> {
+        if self.provider_policy == OnnxProviderPolicy::CudaFailLoud {
+            return Err(fastembed_runtime::device_postprocess_unavailable(
+                "onnx-fastembed",
+            ));
+        }
         let mut texts = Vec::with_capacity(inputs.len());
         for input in inputs {
             texts.push(text_from_input(self, input)?.to_string());

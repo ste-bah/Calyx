@@ -7,8 +7,18 @@
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cuda_strict::strict_cuda_requested;
+use crate::dependence_dispatch::{DependenceCudaStats, auto_cuda_at};
+
+#[path = "copula/cuda.rs"]
+mod cuda;
+
+use self::cuda::empirical_copula_cuda_strict_with_stats_impl;
+
 pub const MIN_COPULA_SAMPLES: usize = 20;
 pub const DEFAULT_TAIL_Q: f64 = 0.10;
+/// CUDA cutoff for rank and empirical-prefix work. Strict calls bypass it.
+pub const COPULA_CUDA_MIN_SAMPLES: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CopulaTailReport {
@@ -33,6 +43,49 @@ pub fn empirical_copula_tail_dependence_with_q(
     y: &[f64],
     tail_q: f64,
 ) -> Result<CopulaTailReport> {
+    if strict_cuda_requested() || auto_cuda_at(x.len(), COPULA_CUDA_MIN_SAMPLES) {
+        return empirical_copula_tail_dependence_with_q_cuda_strict(x, y, tail_q);
+    }
+    empirical_copula_tail_dependence_with_q_cpu(x, y, tail_q)
+}
+
+pub fn empirical_copula_tail_dependence_cuda_strict(
+    x: &[f64],
+    y: &[f64],
+) -> Result<CopulaTailReport> {
+    empirical_copula_tail_dependence_with_q_cuda_strict(x, y, DEFAULT_TAIL_Q)
+}
+
+pub fn empirical_copula_tail_dependence_with_q_cuda_strict(
+    x: &[f64],
+    y: &[f64],
+    tail_q: f64,
+) -> Result<CopulaTailReport> {
+    empirical_copula_tail_dependence_with_q_cuda_strict_with_stats(x, y, tail_q)
+        .map(|(report, _)| report)
+}
+
+pub fn empirical_copula_tail_dependence_with_q_cuda_strict_with_stats(
+    x: &[f64],
+    y: &[f64],
+    tail_q: f64,
+) -> Result<(CopulaTailReport, DependenceCudaStats)> {
+    validate_copula_inputs(x, y, tail_q)?;
+    empirical_copula_cuda_strict_with_stats_impl(x, y, tail_q)
+}
+
+fn empirical_copula_tail_dependence_with_q_cpu(
+    x: &[f64],
+    y: &[f64],
+    tail_q: f64,
+) -> Result<CopulaTailReport> {
+    validate_copula_inputs(x, y, tail_q)?;
+    let u = pseudo_observations("x", x)?;
+    let v = pseudo_observations("y", y)?;
+    copula_report_from_pseudo(&u, &v, tail_q)
+}
+
+fn validate_copula_inputs(x: &[f64], y: &[f64], tail_q: f64) -> Result<()> {
     if x.len() != y.len() {
         return Err(CalyxError::assay_insufficient_samples(format!(
             "empirical copula requires paired samples: x={} y={}",
@@ -51,20 +104,29 @@ pub fn empirical_copula_tail_dependence_with_q(
             "empirical copula tail_q must be finite in (0, 0.5); got {tail_q}"
         )));
     }
-    let u = pseudo_observations("x", x)?;
-    let v = pseudo_observations("y", y)?;
+    for (index, (&left, &right)) in x.iter().zip(y).enumerate() {
+        if !(left.is_finite() && right.is_finite()) {
+            return Err(CalyxError::assay_insufficient_samples(format!(
+                "empirical copula sample {index} is not finite (x={left}, y={right})"
+            )));
+        }
+    }
+    Ok(())
+}
 
-    let c_mid = empirical_copula_at(&u, &v, 0.5, 0.5);
+fn copula_report_from_pseudo(u: &[f64], v: &[f64], tail_q: f64) -> Result<CopulaTailReport> {
+    let n = u.len();
+    let c_mid = empirical_copula_at(u, v, 0.5, 0.5);
     let blomqvist_beta = (4.0 * c_mid - 1.0).clamp(-1.0, 1.0);
 
     let lower_tail_count = u
         .iter()
-        .zip(&v)
+        .zip(v)
         .filter(|&(&a, &b)| a <= tail_q && b <= tail_q)
         .count();
     let upper_tail_count = u
         .iter()
-        .zip(&v)
+        .zip(v)
         .filter(|&(&a, &b)| a >= 1.0 - tail_q && b >= 1.0 - tail_q)
         .count();
     let lower_tail_lambda = ((lower_tail_count as f64 / n as f64) / tail_q).clamp(0.0, 1.0);
@@ -72,15 +134,15 @@ pub fn empirical_copula_tail_dependence_with_q(
 
     let hoeffding_d_cvm = 30.0
         * u.iter()
-            .zip(&v)
+            .zip(v)
             .map(|(&a, &b)| {
-                let c = empirical_copula_at(&u, &v, a, b);
+                let c = empirical_copula_at(u, v, a, b);
                 (c - a * b).powi(2)
             })
             .sum::<f64>()
         / n as f64;
 
-    let gini_gamma = empirical_gini_gamma(&u, &v).clamp(-1.0, 1.0);
+    let gini_gamma = empirical_gini_gamma(u, v).clamp(-1.0, 1.0);
 
     Ok(CopulaTailReport {
         estimator: "empirical_rank_copula_tail_dependence".to_string(),

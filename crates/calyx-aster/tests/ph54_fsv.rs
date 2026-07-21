@@ -2,7 +2,7 @@
 //!
 //! Trigger on a CUDA host with:
 //! `CALYX_ISSUE462_FSV_ROOT=/var/lib/calyx/data/fsv-issue462-ph54-<stamp> \
-//! cargo test -p calyx-aster --test ph54_fsv -- --ignored --nocapture`
+//! cargo test -p calyx-aster --test __calyx_integration_suite_1 ph54_fsv -- --ignored --nocapture`
 
 use std::fs;
 use std::path::PathBuf;

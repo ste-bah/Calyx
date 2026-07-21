@@ -51,16 +51,30 @@ impl DenseVectorFile {
     }
 
     pub fn row_f32(&self, idx: u64) -> Vec<f32> {
+        let mut row = vec![0.0; self.dim()];
+        self.copy_row_f32(idx, &mut row);
+        row
+    }
+
+    pub fn copy_row_f32(&self, idx: u64, destination: &mut [f32]) {
+        assert_eq!(destination.len(), self.dim(), "dense row destination dim");
         match self {
-            Self::Fbin(file) => file.row(idx).to_vec(),
-            Self::I8Bin(file) => file.row_f32_normalized(idx),
+            Self::Fbin(file) => destination.copy_from_slice(file.row(idx)),
+            Self::I8Bin(file) => file.copy_row_f32_normalized(idx, destination),
         }
     }
 
     pub fn row_f32_raw(&self, idx: u64) -> Vec<f32> {
+        let mut row = vec![0.0; self.dim()];
+        self.copy_row_f32_raw(idx, &mut row);
+        row
+    }
+
+    pub fn copy_row_f32_raw(&self, idx: u64, destination: &mut [f32]) {
+        assert_eq!(destination.len(), self.dim(), "dense row destination dim");
         match self {
-            Self::Fbin(file) => file.row(idx).to_vec(),
-            Self::I8Bin(file) => file.row_f32_raw(idx),
+            Self::Fbin(file) => destination.copy_from_slice(file.row(idx)),
+            Self::I8Bin(file) => file.copy_row_f32_raw(idx, destination),
         }
     }
 }
@@ -222,32 +236,53 @@ impl I8BinVectors {
     }
 
     pub fn row_i8(&self, idx: u64) -> &[i8] {
-        let start = I8BIN_HEADER_LEN + (idx as usize) * self.dim;
-        let bytes = &self.mmap[start..start + self.dim];
+        self.rows_i8(idx, 1)
+    }
+
+    pub fn rows_i8(&self, start_row: u64, rows: usize) -> &[i8] {
+        let end_row = start_row
+            .checked_add(rows as u64)
+            .expect("i8bin row range overflow");
+        assert!(end_row <= self.count, "i8bin row range exceeds count");
+        let start = I8BIN_HEADER_LEN + (start_row as usize) * self.dim;
+        let len = rows * self.dim;
+        let bytes = &self.mmap[start..start + len];
         // SAFETY: i8 has alignment 1 and accepts every byte pattern.
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), self.dim) }
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), len) }
     }
 
     pub fn row_f32_normalized(&self, idx: u64) -> Vec<f32> {
-        let mut out = self
-            .row_i8(idx)
-            .iter()
-            .map(|value| f32::from(*value))
-            .collect::<Vec<_>>();
-        let norm = out.iter().map(|value| value * value).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for value in &mut out {
-                *value /= norm;
-            }
-        }
+        let mut out = vec![0.0; self.dim];
+        self.copy_row_f32_normalized(idx, &mut out);
         out
     }
 
-    pub fn row_f32_raw(&self, idx: u64) -> Vec<f32> {
-        self.row_i8(idx)
+    pub fn copy_row_f32_normalized(&self, idx: u64, destination: &mut [f32]) {
+        self.copy_row_f32_raw(idx, destination);
+        let norm = destination
             .iter()
-            .map(|value| f32::from(*value))
-            .collect()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        if norm > 0.0 {
+            for value in destination {
+                *value /= norm;
+            }
+        }
+    }
+
+    pub fn row_f32_raw(&self, idx: u64) -> Vec<f32> {
+        let mut out = vec![0.0; self.dim];
+        self.copy_row_f32_raw(idx, &mut out);
+        out
+    }
+
+    pub fn copy_row_f32_raw(&self, idx: u64, destination: &mut [f32]) {
+        assert_eq!(destination.len(), self.dim, "i8bin row destination dim");
+        destination
+            .iter_mut()
+            .zip(self.row_i8(idx))
+            .for_each(|(out, value)| *out = f32::from(*value));
     }
 }
 
@@ -341,6 +376,12 @@ mod tests {
         assert_eq!(file.dim(), 3);
         assert_eq!(file.row_f32_raw(0), [-3.0, 0.0, 4.0]);
         assert_close(&file.row_f32_normalized(0), &[-0.6, 0.0, 0.8]);
+        let mut raw = [f32::NAN; 3];
+        file.copy_row_f32_raw(0, &mut raw);
+        assert_eq!(raw, [-3.0, 0.0, 4.0]);
+        let mut normalized = [f32::NAN; 3];
+        file.copy_row_f32_normalized(0, &mut normalized);
+        assert_close(&normalized, &[-0.6, 0.0, 0.8]);
         assert_close(
             &DenseVectorFile::open(&path).unwrap().row_f32(1),
             &[1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0],

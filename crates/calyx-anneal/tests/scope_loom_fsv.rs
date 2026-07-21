@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     AsterAnnealLedgerStore, AsterBanditStorage, CALYX_LOOM_PLAN_WRITE_FAIL, ConcatKey,
     ConfigBanditStore, LoomScopeTuner, MatPlanConfig, QueryLog, QueryObservation,
@@ -13,11 +16,8 @@ use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{FixedClock, LensId};
 use calyx_forge::AutotuneCache;
 use calyx_ledger::{ActorId, EntryKind, LedgerAppender, decode as decode_ledger};
-use serde_json::{Value, json};
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
 use fsv_support::write_json;
+use serde_json::{Value, json};
 
 const FSV_TS: u64 = 1_785_500_415;
 

@@ -17,7 +17,9 @@ use calyx_lodestar::{
 use calyx_paths::AssocGraph;
 use proptest::prelude::*;
 
-mod memory_assoc_support;
+// calyx-shared-module: path=memory_assoc_support/mod.rs alias=__calyx_shared_memory_assoc_support_mod_rs local=memory_assoc_support visibility=private
+
+use crate::__calyx_shared_memory_assoc_support_mod_rs as memory_assoc_support;
 use memory_assoc_support::{MemoryAssocStore, cx, ids};
 
 /// Bundles the engine plumbing into a [`SummarizeCtx`] for one call. The returned

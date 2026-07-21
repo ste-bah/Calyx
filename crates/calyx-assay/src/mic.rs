@@ -28,10 +28,21 @@
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cuda_strict::strict_cuda_requested;
+use crate::dependence_dispatch::{DependenceCudaStats, auto_cuda_at};
+
+#[path = "mic/cuda.rs"]
+mod cuda;
+
+use self::cuda::mic_with_alpha_cuda_strict_with_stats_impl;
+
 /// Default grid-budget exponent `α` in `B(n) = max(n^α, 4)` (Reshef 2011).
 pub const DEFAULT_MIC_ALPHA: f64 = 0.6;
 /// Minimum samples for a defined MIC (need a 2×2 grid, i.e. `B(n) ≥ 4`).
 pub const MIN_MIC_SAMPLES: usize = 4;
+/// No optimized CPU break-even was observed for block-parallel ApproxMaxMI;
+/// automatic routing therefore remains on CPU. Strict calls bypass this sentinel.
+pub const MIC_CUDA_MIN_SAMPLES: usize = usize::MAX;
 
 /// MIC point estimate and the winning grid resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -53,6 +64,48 @@ pub fn mic(x: &[f32], y: &[f32]) -> Result<MicReport> {
 
 /// MIC with an explicit budget exponent `α ∈ (0, 1]` (Anneal-tunable).
 pub fn mic_with_alpha(x: &[f32], y: &[f32], alpha: f64) -> Result<MicReport> {
+    if strict_cuda_requested() || auto_cuda_at(x.len(), MIC_CUDA_MIN_SAMPLES) {
+        return mic_with_alpha_cuda_strict(x, y, alpha);
+    }
+    mic_with_alpha_cpu(x, y, alpha)
+}
+
+pub fn mic_cuda_strict(x: &[f32], y: &[f32]) -> Result<MicReport> {
+    mic_with_alpha_cuda_strict(x, y, DEFAULT_MIC_ALPHA)
+}
+
+pub fn mic_with_alpha_cuda_strict(x: &[f32], y: &[f32], alpha: f64) -> Result<MicReport> {
+    mic_with_alpha_cuda_strict_with_stats(x, y, alpha).map(|(report, _)| report)
+}
+
+pub fn mic_with_alpha_cuda_strict_with_stats(
+    x: &[f32],
+    y: &[f32],
+    alpha: f64,
+) -> Result<(MicReport, DependenceCudaStats)> {
+    let (xd, yd, b_budget) = validate_mic_inputs(x, y, alpha)?;
+    mic_with_alpha_cuda_strict_with_stats_impl(&xd, &yd, b_budget)
+}
+
+fn mic_with_alpha_cpu(x: &[f32], y: &[f32], alpha: f64) -> Result<MicReport> {
+    let (xd, yd, b_budget) = validate_mic_inputs(x, y, alpha)?;
+    let (mic1, nx1, ny1) = scan(&xd, &yd, b_budget);
+    let (mic2, ny2, nx2) = scan(&yd, &xd, b_budget);
+    let (mic_val, best_nx, best_ny) = if mic1 >= mic2 {
+        (mic1, nx1, ny1)
+    } else {
+        (mic2, nx2, ny2)
+    };
+    Ok(MicReport {
+        mic: mic_val.clamp(0.0, 1.0) as f32,
+        best_nx,
+        best_ny,
+        b_budget,
+        n_samples: x.len(),
+    })
+}
+
+fn validate_mic_inputs(x: &[f32], y: &[f32], alpha: f64) -> Result<(Vec<f64>, Vec<f64>, usize)> {
     if !(alpha.is_finite() && alpha > 0.0 && alpha <= 1.0) {
         return Err(CalyxError::assay_insufficient_samples(format!(
             "MIC budget exponent α must be in (0, 1]; got {alpha}"
@@ -80,26 +133,7 @@ pub fn mic_with_alpha(x: &[f32], y: &[f32], alpha: f64) -> Result<MicReport> {
     }
 
     let b_budget = (n as f64).powf(alpha).floor().max(4.0) as usize;
-
-    // Orientation 1: equipartition Y (secondary), DP-optimize X (primary).
-    let (mic1, nx1, ny1) = scan(&xd, &yd, b_budget);
-    // Orientation 2: equipartition X (secondary), DP-optimize Y (primary).
-    let (mic2, ny2, nx2) = scan(&yd, &xd, b_budget);
-
-    let (mic_val, best_nx, best_ny) = if mic1 >= mic2 {
-        (mic1, nx1, ny1)
-    } else {
-        (mic2, nx2, ny2)
-    };
-    let mic_val = mic_val.clamp(0.0, 1.0);
-
-    Ok(MicReport {
-        mic: mic_val as f32,
-        best_nx,
-        best_ny,
-        b_budget,
-        n_samples: n,
-    })
+    Ok((xd, yd, b_budget))
 }
 
 // ----- ApproxMaxMI core ------------------------------------------------------

@@ -1,40 +1,59 @@
+use std::collections::BTreeSet;
+use std::str::FromStr;
+
 use calyx_core::CxId;
 use serde_json::Value;
 
 use crate::entry::{LedgerEntry, SubjectId};
 
 pub(super) fn entry_mentions_cx(entry: &LedgerEntry, cx_id: CxId) -> bool {
-    if entry.subject == SubjectId::Cx(cx_id) {
-        return true;
-    }
-    serde_json::from_slice::<Value>(&entry.payload)
-        .ok()
-        .is_some_and(|payload| value_mentions_cx(&payload, &cx_id.to_string()))
+    entry_cx_mentions(entry).contains(&cx_id)
 }
 
-fn value_mentions_cx(value: &Value, needle: &str) -> bool {
+/// Returns every CX referenced by the entry's primary subject or recognized
+/// provenance payload fields. The traversal intentionally mirrors
+/// `get_provenance`: unrelated strings are not interpreted as CX identifiers.
+pub fn entry_cx_mentions(entry: &LedgerEntry) -> BTreeSet<CxId> {
+    let mut out = BTreeSet::new();
+    if let SubjectId::Cx(cx_id) = entry.subject {
+        out.insert(cx_id);
+    }
+    if let Ok(payload) = serde_json::from_slice::<Value>(&entry.payload) {
+        collect_value_mentions(&payload, &mut out);
+    }
+    out
+}
+
+fn collect_value_mentions(value: &Value, out: &mut BTreeSet<CxId>) {
     match value {
-        Value::Object(map) => map.iter().any(|(key, value)| {
+        Value::Object(map) => map.iter().for_each(|(key, value)| {
             if is_cx_payload_field(key) {
-                value_contains_cx(value, needle)
-            } else {
-                matches!(value, Value::Object(_) | Value::Array(_))
-                    && value_mentions_cx(value, needle)
+                collect_cx_values(value, out);
+            } else if matches!(value, Value::Object(_) | Value::Array(_)) {
+                collect_value_mentions(value, out);
             }
         }),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| matches!(value, Value::Object(_)) && value_mentions_cx(value, needle)),
-        _ => false,
+        Value::Array(values) => values.iter().for_each(|value| {
+            if matches!(value, Value::Object(_)) {
+                collect_value_mentions(value, out);
+            }
+        }),
+        _ => {}
     }
 }
 
-fn value_contains_cx(value: &Value, needle: &str) -> bool {
+fn collect_cx_values(value: &Value, out: &mut BTreeSet<CxId>) {
     match value {
-        Value::String(value) => value == needle,
-        Value::Array(values) => values.iter().any(|value| value_contains_cx(value, needle)),
-        Value::Object(_) => value_mentions_cx(value, needle),
-        _ => false,
+        Value::String(value) => {
+            if let Ok(cx_id) = CxId::from_str(value) {
+                out.insert(cx_id);
+            }
+        }
+        Value::Array(values) => values
+            .iter()
+            .for_each(|value| collect_cx_values(value, out)),
+        Value::Object(_) => collect_value_mentions(value, out),
+        _ => {}
     }
 }
 

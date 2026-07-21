@@ -7,10 +7,9 @@
 //! deterministic HDBSCAN* (mcs=2, min_samples=1) must select exactly the two
 //! planted skills with no noise.
 
-use std::collections::BTreeMap;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
 
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, VaultId,
 };
@@ -20,6 +19,7 @@ use calyx_sextant::{
     HnswIndex, Query, SearchEngine, SextantIndex, SkillParams, SlotIndexMap, search_skill, skills,
 };
 use sextant_support::{cx_u128_be as cx, dense};
+use std::collections::BTreeMap;
 
 fn slot() -> SlotId {
     SlotId::new(1)
@@ -127,6 +127,46 @@ fn skills_tree_is_byte_deterministic() {
     let first = serde_json::to_vec(&skills(&engine, &test_params()).unwrap()).unwrap();
     let second = serde_json::to_vec(&skills(&engine, &test_params()).unwrap()).unwrap();
     assert_eq!(first, second);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires an explicit CUDA acceptance host"]
+fn large_skills_route_through_cuda_and_remain_deterministic() {
+    use calyx_sextant::SkillExecutionBackend;
+
+    let points = calyx_forge::SKILL_CUDA_MIN_POINTS;
+    let dim = 64_usize;
+    let mut index = HnswIndex::new(slot(), dim as u32, 7);
+    let mut engine_rows = Vec::with_capacity(points);
+    for point in 0..points {
+        let id = cx(point as u128 + 1);
+        let data = (0..dim)
+            .map(|feature| ((point * 17 + feature * 13) % 101) as f32 / 101.0 + 0.01)
+            .collect();
+        index.insert(id, dense(data), point as u64 + 1).unwrap();
+        engine_rows.push(row(id, point as u64 + 1));
+    }
+    let indexes = SlotIndexMap::new();
+    indexes.register(index).unwrap();
+    let mut engine = SearchEngine::new(indexes);
+    for constellation in engine_rows {
+        engine.put_constellation(constellation);
+    }
+    let params = SkillParams {
+        min_cluster_size: 3,
+        min_samples: 3,
+        ..SkillParams::default()
+    };
+    let first = skills(&engine, &params).unwrap();
+    let second = skills(&engine, &params).unwrap();
+    assert_eq!(first.execution.backend, SkillExecutionBackend::Cuda);
+    assert_eq!(first.execution.points, points as u64);
+    assert_eq!(first.execution.kernel_launches, 3);
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&second).unwrap()
+    );
 }
 
 #[test]

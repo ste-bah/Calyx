@@ -372,11 +372,17 @@ pub(crate) fn read_optional_string(path: PathBuf) -> std::io::Result<Option<Stri
     }
 }
 
-pub(crate) fn wait_for_path(path: &Path, timeout: Duration) {
+pub(crate) fn wait_for_child_path(path: &Path, timeout: Duration, child: &mut std::process::Child) {
     let started = Instant::now();
     while started.elapsed() < timeout {
         if path.exists() {
             return;
+        }
+        if let Some(status) = child.try_wait().expect("poll child writer") {
+            panic!(
+                "child writer exited with {status} before publishing {}",
+                path.display()
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }

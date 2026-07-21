@@ -1,13 +1,12 @@
-use std::fs;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{CALYX_TEMPORAL_INVALID_WINDOW, CxId, LedgerRef};
 use calyx_sextant::{
     FreshnessTag, Hit, ProvenanceSource, TemporalFixedClock, TimeWindow, filter_hits_by_window,
 };
 use serde_json::json;
 use sextant_support::{fsv_root, reset_dir, write_json, write_root_file_blake3_sums};
+use std::fs;
 
 #[test]
 fn temporal_window_fsv_writes_filter_readbacks() {

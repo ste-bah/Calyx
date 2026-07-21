@@ -92,6 +92,7 @@ tmp/
 .tmp/
 *.tmp
 .cache/
+.codex-tmp/
 
 # ── CUDA / GPU build artifacts ───────────────────────────────────────
 *.cubin

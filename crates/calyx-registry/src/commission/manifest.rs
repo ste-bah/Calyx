@@ -92,6 +92,8 @@ pub struct LensForgeManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_policy: Option<LensForgeBatchPolicy>,
 }
 
@@ -190,6 +192,9 @@ pub fn lens_spec_from_manifest_with_license_override(
     if manifest.max_batch == Some(0) {
         return Err(config_invalid("lensforge manifest max_batch must be > 0"));
     }
+    if manifest.max_tokens == Some(0) {
+        return Err(config_invalid("lensforge manifest max_tokens must be > 0"));
+    }
     ensure_license_allowed(
         manifest.license.as_deref(),
         manifest.non_commercial,
@@ -199,6 +204,11 @@ pub fn lens_spec_from_manifest_with_license_override(
     let output = manifest.output_shape()?;
     let algorithmic_contract =
         algorithmic_frozen_contract(&manifest.name, &manifest.runtime, manifest.modality, output)?;
+    let max_tokens_hash = manifest
+        .max_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let endpoint_hash = manifest.endpoint.as_deref().unwrap_or_default();
     let (output, weights_sha256, corpus_hash, norm_policy) =
         if let Some(contract) = algorithmic_contract {
             (
@@ -219,6 +229,8 @@ pub fn lens_spec_from_manifest_with_license_override(
                     modality_token(manifest.modality).as_bytes(),
                     manifest.pooling.as_bytes(),
                     manifest.norm.as_bytes(),
+                    max_tokens_hash.as_bytes(),
+                    endpoint_hash.as_bytes(),
                 ]),
                 norm_policy(&manifest.norm)?,
             )

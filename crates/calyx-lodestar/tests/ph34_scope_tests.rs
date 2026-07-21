@@ -9,7 +9,9 @@ use calyx_lodestar::{
 use calyx_paths::AssocGraph;
 use serde_json::json;
 
-mod memory_assoc_support;
+// calyx-shared-module: path=memory_assoc_support/mod.rs alias=__calyx_shared_memory_assoc_support_mod_rs local=memory_assoc_support visibility=private
+
+use crate::__calyx_shared_memory_assoc_support_mod_rs as memory_assoc_support;
 use memory_assoc_support::{MemoryAssocStore, cx, ids};
 
 const EXPECTED_ALL_HASH: &str = "9bcc9eef3da72eaed03ea54c2b0086368d119cf274516e1fb6706aaf487fe7d5";

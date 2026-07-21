@@ -5,12 +5,8 @@
 
 #[path = "daily_ops_scheduler_fixture.rs"]
 mod fixture;
-#[allow(
-    clippy::duplicate_mod,
-    reason = "integration test fixture and FSV driver both include the same helper file"
-)]
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use calyx_core::FixedClock;
 use calyx_poly::daily_ops_scheduler::{DailyOpsSchedulerConfig, DailyOpsSchedulerDecision};

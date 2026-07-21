@@ -1,9 +1,5 @@
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     AsterBanditStorage, BanditPolicy, BanditStorage, CALYX_ANNEAL_BANDIT_EMPTY,
     CALYX_ANNEAL_BANDIT_INVALID_CONFIG, ConfigBandit, bandit_key, encode_config_bandit,
@@ -13,6 +9,9 @@ use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use fsv_support::{hex_bytes, parse_vault_id, write_json};
 use serde_json::json;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
 
 const SHAPE_KEY: &str = "issue412:forge:gemm:768x768:fp16:cuda:recall0.99";
 

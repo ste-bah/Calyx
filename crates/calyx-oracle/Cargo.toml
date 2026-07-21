@@ -1,10 +1,15 @@
 [package]
+autotests = false
 name = "calyx-oracle"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[features]
+default = []
+cuda = ["calyx-forge/cuda"]
 
 [dependencies]
 calyx-assay = { path = "../calyx-assay" }
@@ -25,3 +30,11 @@ calyx-fsv = { path = "../calyx-fsv" }
 calyx-loom = { path = "../calyx-loom" }
 calyx-testkit = { path = "../calyx-testkit" }
 proptest.workspace = true
+
+# BEGIN generated integration harnesses (issue #1546)
+
+[[test]]
+name = "__calyx_integration_suite_0"
+path = "tests/__calyx_integration_suite_0.rs"
+
+# END generated integration harnesses (issue #1546)

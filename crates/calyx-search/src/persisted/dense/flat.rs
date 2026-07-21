@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -13,9 +14,14 @@ use crate::error::CliResult;
 use crate::persisted::pinned::{self, PinKey};
 use crate::persisted::{SearchIndexEntry, rel, sha256_hex, stale, write_atomic_hashed};
 
+#[path = "flat/gpu.rs"]
+mod gpu;
+
 const FORMAT: &str = "calyx-search-flat-dense-v1";
 const MAGIC: &[u8; 16] = b"CALYXFLATDENSE01";
 const DEFAULT_MAX_ROWS: usize = 32_768;
+const DEFAULT_CUDA_MIN_ROWS: usize = 16_384;
+const CUDA_MIN_ROWS_ENV: &str = "CALYX_SEARCH_FLAT_CUDA_MIN_ROWS";
 const PIN_KIND: &str = "flat_dense";
 
 pub(super) fn should_use_index(row_count: usize) -> bool {
@@ -59,6 +65,7 @@ pub(super) fn search(
     query: &SlotVector,
     k: usize,
     candidates: Option<&BTreeSet<CxId>>,
+    gpu_serving: bool,
 ) -> CliResult<Vec<IndexSearchHit>> {
     if k == 0 {
         return Ok(Vec::new());
@@ -75,6 +82,19 @@ pub(super) fn search(
             index.header.dim
         )));
     }
+    if gpu_serving && index.header.len >= cuda_min_rows() {
+        crate::engine_slot_fanout::record_slot_serving_detail(format!(
+            "slot_backend=cuvs-resident-flat slot_compute_placement=cuda:0 source_rows={} candidate_rows={}",
+            index.header.len,
+            candidates.map_or(index.header.len, BTreeSet::len)
+        ));
+        return gpu::search(vault_dir, entry, slot, &index, data, k, candidates);
+    }
+    crate::engine_slot_fanout::record_slot_serving_detail(format!(
+        "slot_backend=flat-dense-cpu-exact-v1 slot_compute_placement=cpu:bounded-exact source_rows={} candidate_rows={}",
+        index.header.len,
+        candidates.map_or(index.header.len, BTreeSet::len)
+    ));
     let mut scored = index
         .rows
         .iter()
@@ -89,6 +109,14 @@ pub(super) fn search(
     });
     scored.truncate(k);
     Ok(ranked(scored))
+}
+
+fn cuda_min_rows() -> usize {
+    env::var(CUDA_MIN_ROWS_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CUDA_MIN_ROWS)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

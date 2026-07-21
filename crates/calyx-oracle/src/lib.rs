@@ -27,8 +27,8 @@ pub use complete::{
 };
 pub use energy::{
     AnnealConfig, CALYX_ORACLE_ENERGY_EMPTY_REGION, CALYX_ORACLE_ENERGY_INVALID_INPUT,
-    DEFAULT_BETA, DEFAULT_EPS, DescentResult, MAX_STEPS, descend, descent_step, energy,
-    energy_softmax_weights, get_beta,
+    DEFAULT_BETA, DEFAULT_EPS, DescentResult, ENERGY_CUDA_MIN_ELEMENTS, MAX_STEPS, descend,
+    descent_step, energy, energy_softmax_weights, get_beta,
 };
 pub use error::{
     CALYX_ORACLE_DOMAIN_NOT_FOUND, CALYX_ORACLE_EVIDENCE_CORRUPT, CALYX_ORACLE_FLAKY_ANCHOR,

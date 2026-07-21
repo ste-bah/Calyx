@@ -22,8 +22,8 @@ use calyx_registry::{
 };
 use serde_json::json;
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 use support::{collect_files, named_fsv_root, reset_dir, write_blake3sums, write_json};
 
 #[test]
@@ -243,6 +243,7 @@ fn card(lens_id: LensId, signal: Option<f32>) -> CapabilityCard {
         },
         health: LensHealth::Loaded,
         low_spread: false,
+        execution: Default::default(),
     }
 }
 

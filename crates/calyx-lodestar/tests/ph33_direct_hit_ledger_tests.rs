@@ -2,14 +2,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use calyx_core::{CxId, FixedClock};
+use calyx_aster::ledger_view::AsterLedgerCfStore;
+use calyx_aster::vault::{AsterVault, VaultOptions};
+use calyx_core::{CxId, FixedClock, SlotId, VaultId};
 use calyx_ledger::{
     DirectoryLedgerStore, EntryKind, LedgerAppender, LedgerCfStore, MemoryLedgerStore,
     QuarantineSet, decode, get_answer_trace,
 };
 use calyx_lodestar::{
-    Kernel, KernelGraphParams, KernelParams, build_kernel_index, build_kernel_pipeline_with_ledger,
-    kernel_answer_with_ledger,
+    AsterKernelAnswerRequest, Kernel, KernelAnswerRecordContext, KernelGraphParams, KernelParams,
+    build_kernel_index, build_kernel_pipeline, build_kernel_pipeline_with_ledger,
+    kernel_answer_with_aster_ledger, kernel_answer_with_ledger,
 };
 use calyx_paths::AssocGraph;
 use serde_json::json;
@@ -112,6 +115,57 @@ fn direct_hit_answer_appends_complete_answer_ledger_row() {
     assert!(trace.is_trusted());
     assert_eq!(trace.path.len(), 0);
     assert_eq!(trace.answer_entry.as_ref().unwrap().seq, 1);
+}
+
+#[test]
+fn aster_answer_path_is_physically_readable_from_the_real_vault_ledger() {
+    let root = fsv_root().join("aster-answer-ledger-unit");
+    reset_dir(&root);
+    let vault_id: VaultId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
+    let vault = AsterVault::new_durable(&root, vault_id, [7; 32], VaultOptions::default())
+        .expect("create durable Aster vault");
+    let graph = ring_graph();
+    let kernel = build_kernel_pipeline(&graph, &[cx(10)], &params()).expect("build kernel");
+    let anchor = kernel.members[0];
+    let index = build_kernel_index(&kernel, &embeddings(&kernel, anchor)).expect("build index");
+    let context = KernelAnswerRecordContext {
+        answer_id: vec![9; 32],
+        query_input_sha256: [10; 32],
+        query_input_pointer: "calyx-vault://inputs/queries/real.txt".to_string(),
+        kernel_manifest_sha256: [11; 32],
+        embedding_slot: SlotId::new(2),
+        nearest_similarity: 1.0,
+        admission_threshold: 0.5,
+        resident_addr: "127.0.0.1:18190".to_string(),
+        anchor: None,
+        max_hops: 4,
+    };
+
+    let answer = kernel_answer_with_aster_ledger(AsterKernelAnswerRequest {
+        kernel_index: &index,
+        graph: &graph,
+        query_cx: anchor,
+        query_vec: &[1.0, 0.0],
+        anchored_kernel_nodes: &[anchor],
+        max_hops: 4,
+        context: &context,
+        vault: &vault,
+        vault_dir: &root,
+    })
+    .expect("append answer through the durable Aster ledger");
+    let physical = AsterLedgerCfStore::open(&root).expect("open physical ledger view");
+    let rows = physical.scan().expect("scan physical ledger rows");
+    let entry = decode(&rows[0].bytes).expect("decode physical Answer row");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&entry.payload).expect("decode physical payload");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(entry.kind, EntryKind::Answer);
+    assert_eq!(payload["type"], "kernel_answer_v1");
+    assert_eq!(payload["answer_id"], hex(&context.answer_id));
+    assert_eq!(answer.provenance.len(), 1);
+    assert_eq!(answer.provenance[0].seq, rows[0].seq);
+    assert_eq!(answer.provenance[0].hash, entry.entry_hash);
 }
 
 #[test]

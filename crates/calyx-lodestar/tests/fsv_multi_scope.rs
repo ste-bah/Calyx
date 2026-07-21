@@ -2,9 +2,8 @@
 
 #[path = "support/multi_scope_fsv.rs"]
 mod multi_scope_fsv;
-#[allow(dead_code, unused_imports)]
-#[path = "support/real_corpora.rs"]
-mod real_corpora;
+// calyx-shared-module: path=support/real_corpora.rs alias=__calyx_shared_support_real_corpora_rs local=real_corpora visibility=private
+use crate::__calyx_shared_support_real_corpora_rs as real_corpora;
 
 use real_corpora::{calyx_home, scifact_text};
 

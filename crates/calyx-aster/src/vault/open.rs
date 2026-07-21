@@ -14,7 +14,7 @@ where
     ) -> Result<Self> {
         DurableVault::validate_options(&options)?;
         let vault_root = vault_dir.as_ref().to_path_buf();
-        let recovery = DurableVault::recover_batches(vault_dir.as_ref(), &options)?;
+        let mut recovery = DurableVault::recover_batches(vault_dir.as_ref(), &options)?;
         let ledger_hook = if options.restore_ledger_hook && options.value_crypto.is_some() {
             Some(ledger_hook::recover_hook(
                 &recovery,
@@ -34,7 +34,19 @@ where
             last_recovered_seq: recovery.last_recovered_seq,
             torn_tail: recovery.torn_tail.clone(),
         };
-        let router = match &options.selected_cfs {
+        let mut selected_cfs = options.selected_cfs.clone();
+        if recovery.migrate_derived_content_model {
+            let required = durable::recovery_readback::persistent_search_cfs(
+                vault_dir.as_ref(),
+                options.tiering_policy.as_ref(),
+            )?;
+            if let Some(selected) = selected_cfs.as_mut() {
+                selected.extend(required);
+                selected.sort();
+                selected.dedup();
+            }
+        }
+        let router = match &selected_cfs {
             Some(cfs) => CfRouter::open_selected_cfs_with_tiering_and_crypto(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
@@ -49,6 +61,10 @@ where
                 options.value_crypto.clone(),
             )?,
         };
+        if recovery.migrate_derived_content_model {
+            recovery.derived_content_floor_seq =
+                router.prove_persistent_search_content_watermark(recovery.wal_replay_floor_seq)?;
+        }
         let rows = if recovery.router_latest_readback {
             VersionedCfStore::new_with_router_latest_readback(recovery.last_recovered_seq, router)
         } else {
@@ -107,6 +123,7 @@ where
                 vault_dir.as_ref(),
                 &durable_options,
                 recovery.wal_replay_floor_seq,
+                recovery.derived_content_floor_seq,
             )?;
             durable.stage_recovered_wal_batches(wal_tail_batches)?;
             Some(durable)

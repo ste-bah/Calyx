@@ -1,8 +1,5 @@
-use std::fs;
-use std::time::Instant;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_aster::gc::{AnnGcReclaimer, AnnIndexGraph, SharedAnnIndex};
 use calyx_core::{CxId, SlotId};
 use calyx_sextant::{
@@ -11,6 +8,8 @@ use calyx_sextant::{
 };
 use serde_json::json;
 use sextant_support::{cx_usize_be as cx, dense, digest_hex};
+use std::fs;
+use std::time::Instant;
 
 #[test]
 fn hnsw_ef_search_recalls_bruteforce_neighbors() {

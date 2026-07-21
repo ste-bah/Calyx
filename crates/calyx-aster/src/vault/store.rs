@@ -3,14 +3,149 @@ use crate::mvcc::{CfRead, Snapshot};
 use calyx_core::{Anchor, CalyxError, Clock, Constellation, CxId, Result, Seq, SlotId, VaultStore};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{AsterVault, anchor_merge, encode, ledger_hook};
+use super::{AsterVault, anchor_merge, encode, ledger_hook, prepared};
 
 const COMPRESSED_SLOT_TAG: u8 = 16;
+
+/// Authoritative disposition of one Aster put, decided while holding the
+/// durable commit lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutDisposition {
+    Inserted,
+    ExistingIdentical,
+    ExistingAnchorsMerged { added: usize },
+    InBatchDuplicate { anchors_added: usize },
+}
+
+/// Ordered result for one submitted constellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PutOutcome {
+    pub cx_id: CxId,
+    pub disposition: PutDisposition,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DuplicatePutPolicy {
+    StrictConstellation,
+    ContentObservation,
+}
+
+impl PutOutcome {
+    pub const fn inserted(self) -> bool {
+        matches!(self.disposition, PutDisposition::Inserted)
+    }
+
+    pub const fn deduped(self) -> bool {
+        !self.inserted()
+    }
+}
 
 impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Writes one constellation and returns the locked, authoritative
+    /// insert/dedup/anchor-merge decision without rereading Base afterward.
+    pub fn put_with_outcome(&self, constellation: Constellation) -> Result<PutOutcome> {
+        self.put_with_outcome_policy(constellation, DuplicatePutPolicy::StrictConstellation)
+    }
+
+    /// Inserts a content-addressed observation or reports its locked duplicate
+    /// outcome. On duplicates, the first-write metadata/scalars/input pointer
+    /// remain authoritative while compatible anchors are merged. Content hash,
+    /// panel, modality, redaction, and slot differences still fail closed.
+    pub fn put_observation_with_outcome(&self, constellation: Constellation) -> Result<PutOutcome> {
+        self.put_with_outcome_policy(constellation, DuplicatePutPolicy::ContentObservation)
+    }
+
+    fn put_with_outcome_policy(
+        &self,
+        constellation: Constellation,
+        duplicate_policy: DuplicatePutPolicy,
+    ) -> Result<PutOutcome> {
+        if constellation.vault_id != self.vault_id {
+            return Err(CalyxError::vault_access_denied(
+                "constellation belongs to another vault",
+            ));
+        }
+        constellation.validate_schema()?;
+        let prepared = prepared::PreparedConstellationEncoding::new(&constellation)?;
+
+        self.with_durable_commit_lock(move || {
+            let mut constellation = constellation;
+            let id = constellation.cx_id;
+            let base_key = base_key(id);
+            let latest = self.snapshot();
+            let snapshot = self.snapshot_handle(latest);
+            if let Some(existing) = self.rows.read_at(
+                snapshot.snapshot(),
+                ColumnFamily::Base,
+                &base_key,
+                &self.clock,
+            )? {
+                let base_bytes = prepared.encode_base(&constellation)?;
+                if existing == base_bytes {
+                    return Ok(PutOutcome {
+                        cx_id: id,
+                        disposition: PutDisposition::ExistingIdentical,
+                    });
+                }
+                let mut merged = self.get_at_snapshot(id, snapshot.snapshot())?;
+                let added = match duplicate_policy {
+                    DuplicatePutPolicy::StrictConstellation => {
+                        anchor_merge::merge_duplicate_anchors(&mut merged, &constellation)?
+                    }
+                    DuplicatePutPolicy::ContentObservation => {
+                        anchor_merge::merge_observation_anchors(&mut merged, &constellation)?
+                    }
+                };
+                if !added.is_empty() {
+                    let rows = anchor_merge::stage_anchor_merge_rows(id, &merged, &added)?;
+                    self.commit_rows_locked(&rows)?;
+                }
+                return Ok(PutOutcome {
+                    cx_id: id,
+                    disposition: if added.is_empty() {
+                        PutDisposition::ExistingIdentical
+                    } else {
+                        PutDisposition::ExistingAnchorsMerged { added: added.len() }
+                    },
+                });
+            }
+
+            let mut rows = Vec::new();
+            let mut hook_guard = match &self.ledger_hook {
+                Some(hook) => Some(ledger_hook::lock_hook(hook)?),
+                None => None,
+            };
+            let staged_ledger = if let Some(hook) = hook_guard.as_deref() {
+                let staged = ledger_hook::stage_ingest(hook, &mut rows, &constellation)?;
+                constellation.provenance = staged
+                    .first()
+                    .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
+                    .ledger_ref();
+                Some(staged)
+            } else {
+                constellation.provenance = self.stage_raw_ingest_ledger_locked(
+                    &mut rows,
+                    constellation.cx_id,
+                    ledger_hook::ingest_payload(&constellation),
+                )?;
+                None
+            };
+            prepared::stage_validated_constellation_rows(&mut rows, &constellation, prepared)?;
+            self.commit_rows_locked(&rows)?;
+            if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref())
+            {
+                ledger_hook::commit_staged(hook, staged)?;
+            }
+            Ok(PutOutcome {
+                cx_id: id,
+                disposition: PutDisposition::Inserted,
+            })
+        })
+    }
+
     /// Reads one stored constellation through an already-pinned snapshot lease.
     pub fn get_at_snapshot(&self, id: CxId, snapshot: Snapshot) -> Result<Constellation> {
         let constellation = self.read_base_at_snapshot(id, snapshot)?;
@@ -119,6 +254,14 @@ where
         Ok(constellation)
     }
 
+    /// Reads only the authoritative Base CF row at a sequence, without
+    /// hydrating any lens slot. This is the public latest-read path for
+    /// provenance/source inspection handles opened with only `Base` selected.
+    pub fn get_base(&self, id: CxId, snapshot: Seq) -> Result<Constellation> {
+        let snapshot = self.snapshot_handle(snapshot);
+        self.get_base_at_snapshot(id, snapshot.snapshot())
+    }
+
     fn read_base_at_snapshot(&self, id: CxId, snapshot: Snapshot) -> Result<Constellation> {
         let base = self
             .rows
@@ -133,85 +276,8 @@ where
     C: Clock,
 {
     fn put(&self, constellation: Constellation) -> Result<CxId> {
-        if constellation.vault_id != self.vault_id {
-            return Err(CalyxError::vault_access_denied(
-                "constellation belongs to another vault",
-            ));
-        }
-        constellation.validate_schema()?;
-
-        self.with_durable_commit_lock(|| {
-            let mut constellation = constellation;
-            let id = constellation.cx_id;
-            let base_key = base_key(id);
-            let latest = self.snapshot();
-            let snapshot = self.snapshot_handle(latest);
-            if let Some(existing) = self.rows.read_at(
-                snapshot.snapshot(),
-                ColumnFamily::Base,
-                &base_key,
-                &self.clock,
-            )? {
-                let base_bytes = encode::encode_constellation_base(&constellation)?;
-                if existing == base_bytes {
-                    return Ok(id);
-                }
-                let mut merged = self.get_at_snapshot(id, snapshot.snapshot())?;
-                let added = anchor_merge::merge_duplicate_anchors(&mut merged, &constellation)?;
-                if !added.is_empty() {
-                    let rows = anchor_merge::stage_anchor_merge_rows(id, &merged, &added)?;
-                    self.commit_rows_locked(&rows)?;
-                }
-                return Ok(id);
-            }
-
-            let mut rows = Vec::new();
-            let mut hook_guard = match &self.ledger_hook {
-                Some(hook) => Some(ledger_hook::lock_hook(hook)?),
-                None => None,
-            };
-            let staged_ledger = if let Some(hook) = hook_guard.as_deref() {
-                let staged = ledger_hook::stage_ingest(hook, &mut rows, &constellation)?;
-                constellation.provenance = staged
-                    .first()
-                    .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
-                    .ledger_ref();
-                Some(staged)
-            } else {
-                constellation.provenance = self.stage_raw_ingest_ledger_locked(
-                    &mut rows,
-                    constellation.cx_id,
-                    ledger_hook::ingest_payload(&constellation),
-                )?;
-                None
-            };
-            let base_bytes = encode::encode_constellation_base(&constellation)?;
-            rows.push(encode::WriteRow {
-                cf: ColumnFamily::Base,
-                key: base_key,
-                value: base_bytes,
-            });
-            for (slot, vector) in &constellation.slots {
-                rows.push(encode::WriteRow {
-                    cf: ColumnFamily::slot(*slot),
-                    key: slot_key(id),
-                    value: encode::encode_slot_vector(vector)?,
-                });
-            }
-            for anchor in &constellation.anchors {
-                rows.push(encode::WriteRow {
-                    cf: ColumnFamily::Anchors,
-                    key: anchor_key(id, &anchor.kind),
-                    value: encode::encode_anchor(anchor)?,
-                });
-            }
-            self.commit_rows_locked(&rows)?;
-            if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref())
-            {
-                ledger_hook::commit_staged(hook, staged)?;
-            }
-            Ok(id)
-        })
+        self.put_with_outcome(constellation)
+            .map(|outcome| outcome.cx_id)
     }
 
     fn get(&self, id: CxId, snapshot: Seq) -> Result<Constellation> {

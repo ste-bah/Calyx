@@ -14,6 +14,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod queries;
+
 const DEFAULT_MEMTABLE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Commit watermark for router writes that have no commit domain (raw
@@ -36,6 +38,19 @@ pub struct CfRouter {
 }
 
 impl CfRouter {
+    pub(crate) fn prove_persistent_search_content_watermark(
+        &self,
+        durable_seq: u64,
+    ) -> Result<u64> {
+        let mut watermark = 0_u64;
+        for (cf, level) in &self.levels {
+            if cf.feeds_persistent_search_index() {
+                watermark = watermark.max(level.prove_commit_domain_watermark(durable_seq)?);
+            }
+        }
+        Ok(watermark)
+    }
+
     pub fn open(vault_dir: impl AsRef<Path>, memtable_byte_cap: usize) -> Result<Self> {
         Self::open_with_tiering(vault_dir, memtable_byte_cap, None)
     }
@@ -271,136 +286,6 @@ impl CfRouter {
             .or_default()
             .push_with_lookup(summary.path.clone())?;
         Ok(summary)
-    }
-
-    pub fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if let Some(value) = self.memtables.get(&cf).and_then(|table| table.get(key)) {
-            return Ok(Some(value));
-        }
-        self.levels.get(&cf).map_or(Ok(None), |level| {
-            level
-                .get(key)?
-                .map(|value| self.open_value(cf, key, value))
-                .transpose()
-        })
-    }
-
-    pub fn range(&self, cf: ColumnFamily, start: &[u8], end: &[u8]) -> Result<Vec<SstEntry>> {
-        let mut rows = BTreeMap::new();
-        if let Some(level) = self.levels.get(&cf) {
-            for entry in level.range(start, end)? {
-                rows.insert(entry.key, entry.value);
-            }
-        }
-        if let Some(table) = self.memtables.get(&cf) {
-            for (key, value) in table.range(start, end) {
-                rows.insert(key, value);
-            }
-        }
-        self.open_entries(
-            cf,
-            rows.into_iter().map(|(key, value)| SstEntry { key, value }),
-        )
-    }
-
-    pub fn range_page_until(
-        &self,
-        cf: ColumnFamily,
-        start: &[u8],
-        end: Option<&[u8]>,
-        after_key: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<Vec<SstEntry>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let overlay = self
-            .memtables
-            .get(&cf)
-            .map(|table| {
-                table
-                    .range_until(start, end)
-                    .into_iter()
-                    .map(|(key, value)| SstEntry { key, value })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let rows = self
-            .levels
-            .get(&cf)
-            .cloned()
-            .unwrap_or_default()
-            .range_page_with_overlay(start, end, after_key, limit, overlay)?;
-        self.open_entries(cf, rows)
-    }
-
-    pub fn range_keys(&self, cf: ColumnFamily, start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>> {
-        self.range_keys_until(cf, start, Some(end))
-    }
-
-    pub fn range_keys_until(
-        &self,
-        cf: ColumnFamily,
-        start: &[u8],
-        end: Option<&[u8]>,
-    ) -> Result<Vec<Vec<u8>>> {
-        let mut rows = BTreeMap::<Vec<u8>, bool>::new();
-        if let Some(level) = self.levels.get(&cf) {
-            for key in level.range_keys_until(start, end)? {
-                rows.insert(key, false);
-            }
-        }
-        if let Some(table) = self.memtables.get(&cf) {
-            for (key, value) in table.range_until(start, end) {
-                rows.insert(key, crate::mvcc::is_tombstone_value(&value));
-            }
-        }
-        Ok(rows
-            .into_iter()
-            .filter_map(|(key, is_tombstone)| (!is_tombstone).then_some(key))
-            .collect())
-    }
-
-    pub fn iter_cf(&self, cf: ColumnFamily) -> Result<Vec<SstEntry>> {
-        let mut rows = BTreeMap::new();
-        if let Some(level) = self.levels.get(&cf) {
-            for entry in level.iter()? {
-                rows.insert(entry.key, entry.value);
-            }
-        }
-        if let Some(table) = self.memtables.get(&cf) {
-            for (key, value) in table.iter() {
-                rows.insert(key, value);
-            }
-        }
-        self.open_entries(
-            cf,
-            rows.into_iter().map(|(key, value)| SstEntry { key, value }),
-        )
-    }
-
-    pub fn level_file_count(&self, cf: ColumnFamily) -> usize {
-        self.levels.get(&cf).map_or(0, SstLevel::file_count)
-    }
-
-    /// Raw flush with no commit domain; see [`Self::flush_pending_at`].
-    pub fn flush_pending(&mut self) -> Result<Vec<SstSummary>> {
-        self.flush_pending_at(NO_COMMIT_DOMAIN)
-    }
-
-    /// Flushes every non-empty memtable at `commit_watermark`; see
-    /// [`Self::flush_cf_at`] for the watermark contract.
-    pub fn flush_pending_at(&mut self, commit_watermark: u64) -> Result<Vec<SstSummary>> {
-        let cfs = self
-            .memtables
-            .iter()
-            .filter_map(|(cf, table)| (!table.is_empty()).then_some(*cf))
-            .collect::<Vec<_>>();
-        let mut summaries = Vec::with_capacity(cfs.len());
-        for cf in cfs {
-            summaries.push(self.flush_cf_at(cf, commit_watermark)?);
-        }
-        Ok(summaries)
     }
 
     pub(super) fn ensure_cf(&mut self, cf: ColumnFamily) -> Result<()> {

@@ -49,9 +49,41 @@ pub struct ExplainBreakdown {
     pub per_lens_count: usize,
     pub provenance_hex: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<HitRerankEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recurrence_boost: Option<crate::temporal::RecurrenceBoostEvidence>,
     #[serde(default)]
     pub guard_dropped: Vec<DroppedGuardHit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HitRerankMethod {
+    MetadataExact,
+    CrossEncoderBoundedPassage,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HitRerankEvidence {
+    pub method: HitRerankMethod,
+    pub fusion_score: f32,
+    pub rerank_score: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_encoder_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_coverage: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_bigram_coverage: Option<f32>,
+    pub metadata_exact: bool,
+    pub metadata_case_exact: bool,
+    pub metadata_docket_exact: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_opinion_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_date_filed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_dissent_component: Option<bool>,
+    pub passage_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +145,7 @@ impl Hit {
             strategy: strategy.into(),
             per_lens_count: self.per_lens.len(),
             provenance_hex: hex32(&self.provenance.hash),
+            rerank: None,
             recurrence_boost: None,
             guard_dropped: Vec::new(),
         });

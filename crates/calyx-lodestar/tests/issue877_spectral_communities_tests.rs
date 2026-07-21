@@ -14,10 +14,16 @@ fn partitions_planted_graph_and_ranks_inter_community_bridge() {
     let graph = graph();
     let report = spectral_community_report(&graph, &SpectralCommunityParams::default()).unwrap();
 
-    assert_eq!(report.schema_version, 1);
+    assert_eq!(report.schema_version, 2);
     assert_eq!(report.node_count, 6);
     assert_eq!(report.edge_count, 13);
     assert_eq!(report.communities.len(), 2);
+    assert_eq!(report.requested_communities, 2);
+    assert_eq!(report.embedding_dimensions, 2);
+    assert_eq!(
+        report.assignment_method,
+        "deterministic-farthest-first-lloyd-v1"
+    );
     assert!(report.spectral_gap > 0.0);
     assert!(
         report

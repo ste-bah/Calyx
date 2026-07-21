@@ -449,6 +449,8 @@ fn card(
         },
         health: LensHealth::Loaded,
         low_spread: false,
+        // upstream added execution stats to CapabilityCard; default (zeroed).
+        execution: calyx_registry::profile::ProfileExecutionStats::default(),
     }
 }
 

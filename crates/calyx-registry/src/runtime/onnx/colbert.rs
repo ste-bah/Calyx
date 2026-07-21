@@ -1,21 +1,26 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
 use ort::value::ValueType;
-use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use super::colbert_files::fetch_answerai_colbert_files;
 use super::colbert_tokens::multi_rows;
 use super::cuda_guard::CudaDropGuard;
 use super::custom::batch::{TokenBatch, max_tokens_from_config, session_inputs, token_batches};
+#[cfg(feature = "cuda")]
+use super::device_postprocess::{device_tensor, forge_error, tensor_data_ptr, tensor_shape};
 use super::io_binding::OnnxRunPlan;
 use super::session::{ManagedOnnxSession, build_session};
 use super::{OnnxModelFiles, OnnxProviderPolicy, config_invalid};
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::runtime::common::hash_files;
 use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
+
+mod files;
+
+use files::{answerai_colbert_model_id, ensure_file, model_files, validate_config};
 
 pub const DEFAULT_ANSWERAI_COLBERT_MODEL: &str = "answerdotai/answerai-colbert-small-v1";
 pub(in crate::runtime::onnx) const DEFAULT_COLBERT_ONNX: &str = "onnx/model_fp16.onnx";
@@ -50,6 +55,8 @@ struct OnnxColbertRuntime {
     tokenizer: Tokenizer,
     token_dim: u32,
     max_tokens: usize,
+    #[cfg(feature = "cuda")]
+    cuda_postprocess: Option<calyx_forge::CudaContext>,
 }
 
 impl OnnxColbertFileSpec {
@@ -159,6 +166,11 @@ impl OnnxColbertLens {
         let session = build_session(&run_label, &spec.model_file, spec.provider_policy)?;
         let session = CudaDropGuard::new(session, spec.provider_policy);
         let run_plan = OnnxRunPlan::new(spec.provider_policy, run_label)?;
+        #[cfg(feature = "cuda")]
+        let cuda_postprocess = super::device_postprocess::cuda_postprocess_context(
+            spec.provider_policy,
+            run_plan.device_id(),
+        )?;
         let token_dim = output_token_dim(session.as_ref())?;
         let shape = SlotShape::Multi { token_dim };
         if let Some(expected) = spec.expected_shape
@@ -191,6 +203,8 @@ impl OnnxColbertLens {
             tokenizer,
             token_dim,
             max_tokens,
+            #[cfg(feature = "cuda")]
+            cuda_postprocess,
         };
         Ok(Self {
             id: contract.lens_id(),
@@ -356,6 +370,17 @@ impl OnnxColbertRuntime {
             .ok_or_else(|| CalyxError::lens_unreachable("ONNX ColBERT session is unavailable"))?;
         let input_tensors = session_inputs(session.as_ref(), batch)?;
         let token_dim = self.token_dim as usize;
+        #[cfg(feature = "cuda")]
+        if let Some(cuda_postprocess) = self.cuda_postprocess.clone() {
+            return self.run_plan.run_extract_device(
+                session.as_mut(),
+                input_tensors,
+                (batch.batch, batch.seq),
+                |outputs| {
+                    colbert_rows_from_device_output(outputs, batch, token_dim, &cuda_postprocess)
+                },
+            );
+        }
         self.run_plan.run_extract(
             session.as_mut(),
             input_tensors,
@@ -371,58 +396,38 @@ impl OnnxColbertRuntime {
     }
 }
 
-fn answerai_colbert_model_id(raw: &str) -> Result<String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "answerdotai/answerai-colbert-small-v1" | "answerai-colbert-small-v1" => {
-            Ok(DEFAULT_ANSWERAI_COLBERT_MODEL.to_string())
+#[cfg(feature = "cuda")]
+fn colbert_rows_from_device_output(
+    outputs: &ort::session::SessionOutputs<'_>,
+    batch: &TokenBatch,
+    token_dim: usize,
+    ctx: &calyx_forge::CudaContext,
+) -> Result<Vec<Vec<Vec<f32>>>> {
+    let tensor = device_tensor(output_tensor(outputs)?, "ONNX ColBERT")?;
+    let shape = tensor_shape(&tensor, "ONNX ColBERT")?;
+    let ptr = tensor_data_ptr(&tensor, &shape, "ONNX ColBERT")?;
+    match shape.as_slice() {
+        [actual_batch, seq, actual_dim]
+            if positive_usize(*actual_batch) == Some(batch.batch)
+                && positive_usize(*seq) == Some(batch.seq)
+                && positive_usize(*actual_dim) == Some(token_dim) => {}
+        _ => {
+            return Err(CalyxError::lens_dim_mismatch(format!(
+                "ONNX ColBERT device output shape {shape:?} is incompatible with batch={} seq={} token_dim={token_dim}",
+                batch.batch, batch.seq
+            )));
         }
-        other => Err(CalyxError::lens_unreachable(format!(
-            "unsupported onnx-colbert model {other}; expected {DEFAULT_ANSWERAI_COLBERT_MODEL}"
-        ))),
     }
-}
-
-fn model_files(spec: &OnnxColbertFileSpec) -> OnnxModelFiles {
-    let cache_dir = spec
-        .model_file
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    OnnxModelFiles {
-        cache_dir,
-        model_code: spec.model_id.clone(),
-        model_file: spec.model_file.clone(),
-        tokenizer: spec.tokenizer.clone(),
-        config: spec.config.clone(),
-        special_tokens_map: spec.config.clone(),
-        tokenizer_config: spec.tokenizer.clone(),
-        contract_paths: spec.contract_paths.clone(),
-    }
-}
-
-fn ensure_file(label: &str, path: &Path) -> Result<()> {
-    if path.is_file() {
-        return Ok(());
-    }
-    Err(config_invalid(format!(
-        "ONNX ColBERT {label} file {} is missing",
-        path.display()
-    )))
-}
-
-fn validate_config(path: &Path) -> Result<Value> {
-    let bytes = std::fs::read(path).map_err(|err| {
-        config_invalid(format!(
-            "read ONNX ColBERT config {} failed: {err}",
-            path.display()
-        ))
-    })?;
-    serde_json::from_slice(&bytes).map_err(|err| {
-        config_invalid(format!(
-            "parse ONNX ColBERT config {} failed: {err}",
-            path.display()
-        ))
-    })
+    let rows = calyx_forge::cuda::colbert_tokens_from_external_f32(
+        ctx,
+        ptr,
+        &batch.mask,
+        batch.batch,
+        batch.seq,
+        token_dim,
+    )
+    .map_err(forge_error)?;
+    Ok(rows.rows)
 }
 
 fn output_token_dim(session: &ort::session::Session) -> Result<u32> {
@@ -441,6 +446,11 @@ fn output_token_dim(session: &ort::session::Session) -> Result<u32> {
         )));
     };
     u32::try_from(dim).map_err(|_| CalyxError::lens_dim_mismatch("ColBERT token dim exceeds u32"))
+}
+
+#[cfg(feature = "cuda")]
+fn positive_usize(value: i64) -> Option<usize> {
+    usize::try_from(value).ok().filter(|value| *value > 0)
 }
 
 fn output_tensor<'a, 'r>(

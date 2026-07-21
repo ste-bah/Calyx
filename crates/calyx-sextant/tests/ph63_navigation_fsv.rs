@@ -4,11 +4,9 @@
 //! bytes from disk (the Source of Truth), and asserts every hand-computed
 //! expectation against the *re-read* JSON, never the in-memory values.
 
-use std::collections::BTreeMap;
-use std::fs;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
 
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, VaultId,
     content_address,
@@ -22,6 +20,8 @@ use calyx_sextant::{
 };
 use serde_json::json;
 use sextant_support::{cx_u128_be as cx, dense};
+use std::collections::BTreeMap;
+use std::fs;
 
 fn slot_a() -> SlotId {
     SlotId::new(1)

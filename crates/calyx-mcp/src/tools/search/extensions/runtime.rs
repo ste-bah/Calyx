@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotVector};
+use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotShape, SlotVector, VaultStore};
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
+use calyx_search::{
+    PersistedSearchGeneration, PersistedSearchIndexes, PersistedSearchSlot, SearchError,
+};
 use calyx_sextant::{
-    HnswIndex, InvertedIndex, MaxSimIndex, SearchEngine, SkillParams, SkillTree, SlotIndexMap,
+    IndexSearchHit, IndexStats, SearchEngine, SextantIndex, SkillParams, SkillTree, SlotIndexMap,
 };
 
 use crate::server::{ToolError, ToolResult};
@@ -15,7 +19,7 @@ pub(super) struct NavRuntime {
     pub(super) path: std::path::PathBuf,
     pub(super) vault: AsterVault,
     pub(super) state: VaultPanelState,
-    pub(super) docs: BTreeMap<CxId, Constellation>,
+    pub(super) docs: Arc<BTreeMap<CxId, Constellation>>,
     pub(super) engine: SearchEngine,
 }
 
@@ -24,13 +28,24 @@ pub(super) fn load_runtime(vault: &str) -> ToolResult<NavRuntime> {
     let path = resolved.path.clone();
     let vault = engine::open_vault(&resolved)?;
     let state = load_vault_panel_state(&resolved.path)?;
-    let loaded = engine::load_docs(&vault)?;
-    let engine = build_search_engine(&loaded.docs, loaded.snapshot_seq)?;
+    let docs = Arc::new(map_search(calyx_search::load_docs(&vault))?);
+    let engine = match PersistedSearchIndexes::open(&resolved.path) {
+        Ok(indexes) => {
+            let indexes = Arc::new(indexes);
+            validate_generation(&vault, &indexes)?;
+            let generation = map_search(indexes.generation())?;
+            build_search_engine(Arc::clone(&docs), indexes, &generation)?
+        }
+        Err(error) if docs.is_empty() && is_missing_manifest(&error) => {
+            build_empty_search_engine(&docs)?
+        }
+        Err(error) => return Err(map_search_error(error)),
+    };
     Ok(NavRuntime {
         path,
         vault,
         state,
-        docs: loaded.docs,
+        docs,
         engine,
     })
 }
@@ -53,19 +68,13 @@ pub(super) fn query_vector_for_skill(
     text: &str,
 ) -> ToolResult<Option<(SlotId, SlotVector)>> {
     let slots: BTreeSet<_> = runtime.engine.indexes.slots().into_iter().collect();
-    for (slot, vector) in engine::measure_query_vectors(&runtime.state, text)? {
-        if slots.contains(&slot)
-            && !matches!(vector, SlotVector::Sparse { .. })
-            && runtime.docs.values().any(|cx| {
-                cx.slots
-                    .get(&slot)
-                    .is_some_and(|stored| engine::same_index_shape(&vector, stored))
-            })
-        {
-            return Ok(Some((slot, vector)));
-        }
-    }
-    Ok(None)
+    Ok(
+        map_search(calyx_search::measure_query_vectors(&runtime.state, text))?
+            .into_iter()
+            .find(|(slot, vector)| {
+                slots.contains(slot) && !matches!(vector, SlotVector::Sparse { .. })
+            }),
+    )
 }
 
 pub(super) fn parse_cx_id(value: &str) -> ToolResult<CxId> {
@@ -92,63 +101,102 @@ pub(super) fn score01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
-/// Builds the in-memory nav engine from docs pinned at `snapshot_seq`.
-///
-/// Every insert seq and every slot's base seq is `snapshot_seq` — the vault
-/// commit seq of the pin the docs were loaded at — so `built_at_seq ==
-/// base_seq` and the engine is fresh by construction at that pin. Per-doc
-/// `provenance.seq` values are ledger refs in a different seq domain; feeding
-/// them here made `FreshDerived` fail spuriously (or mask real staleness)
-/// whenever ledger and vault commit seqs drifted (issue #1104).
+fn validate_generation(vault: &AsterVault, indexes: &PersistedSearchIndexes) -> ToolResult<()> {
+    let snapshot = vault.snapshot();
+    map_search(
+        indexes.ensure_fresh_at_snapshot(snapshot, vault.derived_content_seq().min(snapshot)),
+    )?;
+    map_search(indexes.ensure_search_bounded())
+}
+
 fn build_search_engine(
-    docs: &BTreeMap<CxId, Constellation>,
-    snapshot_seq: u64,
+    docs: Arc<BTreeMap<CxId, Constellation>>,
+    persisted: Arc<PersistedSearchIndexes>,
+    generation: &PersistedSearchGeneration,
 ) -> ToolResult<SearchEngine> {
     let indexes = SlotIndexMap::new();
-    let samples = first_vectors(docs);
-    for (slot, vector) in &samples {
-        match vector {
-            SlotVector::Dense { dim, .. } => {
-                indexes.register(HnswIndex::new(*slot, *dim, engine::HNSW_SEED))?
-            }
-            SlotVector::Sparse { .. } => indexes.register(InvertedIndex::new(*slot))?,
-            SlotVector::Multi { token_dim, .. } => {
-                indexes.register(MaxSimIndex::new(*slot, *token_dim))?
-            }
-            SlotVector::Absent { .. } => {}
-        }
-    }
-    for cx in docs.values() {
-        for (slot, vector) in &cx.slots {
-            if samples
-                .get(slot)
-                .is_some_and(|sample| engine::same_index_shape(sample, vector))
-            {
-                indexes.insert(*slot, cx.cx_id, vector.clone(), snapshot_seq)?;
-            }
-        }
-    }
-    for slot in indexes.registered_slots() {
-        indexes.set_base_seq(slot, snapshot_seq)?;
+    for slot in &generation.slots {
+        indexes.register(PersistedSlotIndex {
+            persisted: Arc::clone(&persisted),
+            docs: Arc::clone(&docs),
+            descriptor: slot.clone(),
+            base_seq: generation.base_seq,
+        })?;
     }
     let mut search = SearchEngine::new(indexes);
     for cx in docs.values() {
         search.put_constellation(cx.clone());
     }
+    search.set_assoc_graph(association_graph(&docs)?);
+    Ok(search)
+}
+
+fn build_empty_search_engine(docs: &BTreeMap<CxId, Constellation>) -> ToolResult<SearchEngine> {
+    let mut search = SearchEngine::new(SlotIndexMap::new());
     search.set_assoc_graph(association_graph(docs)?);
     Ok(search)
 }
 
-fn first_vectors(docs: &BTreeMap<CxId, Constellation>) -> BTreeMap<SlotId, SlotVector> {
-    let mut out = BTreeMap::new();
-    for cx in docs.values() {
-        for (slot, vector) in &cx.slots {
-            if engine::indexable(vector) {
-                out.entry(*slot).or_insert_with(|| vector.clone());
-            }
+struct PersistedSlotIndex {
+    persisted: Arc<PersistedSearchIndexes>,
+    docs: Arc<BTreeMap<CxId, Constellation>>,
+    descriptor: PersistedSearchSlot,
+    base_seq: u64,
+}
+
+impl SextantIndex for PersistedSlotIndex {
+    fn slot(&self) -> SlotId {
+        self.descriptor.slot
+    }
+
+    fn shape(&self) -> SlotShape {
+        self.descriptor.shape
+    }
+
+    fn insert(&mut self, _cx_id: CxId, _vector: SlotVector, _seq: u64) -> calyx_core::Result<()> {
+        Err(read_only_error(self.descriptor.slot))
+    }
+
+    fn search(
+        &self,
+        query: &SlotVector,
+        k: usize,
+        _ef: Option<usize>,
+    ) -> calyx_core::Result<Vec<IndexSearchHit>> {
+        self.persisted
+            .search(self.descriptor.slot, query, k)
+            .map_err(CalyxError::from)
+    }
+
+    fn rebuild(&mut self) -> calyx_core::Result<()> {
+        Err(read_only_error(self.descriptor.slot))
+    }
+
+    fn vector(&self, cx_id: CxId) -> Option<SlotVector> {
+        self.docs
+            .get(&cx_id)
+            .and_then(|cx| cx.slots.get(&self.descriptor.slot))
+            .cloned()
+    }
+
+    fn set_base_seq(&mut self, _seq: u64) {}
+
+    fn stats(&self) -> IndexStats {
+        IndexStats {
+            slot: self.descriptor.slot,
+            shape: self.descriptor.shape,
+            len: self.descriptor.len,
+            built_at_seq: self.descriptor.built_at_seq,
+            base_seq: self.base_seq,
+            kind: "persisted",
         }
     }
-    out
+}
+
+fn read_only_error(slot: SlotId) -> CalyxError {
+    CalyxError::stale_derived(format!(
+        "MCP navigation slot {slot} is a read-only persisted search generation"
+    ))
 }
 
 fn association_graph(docs: &BTreeMap<CxId, Constellation>) -> ToolResult<calyx_paths::AssocGraph> {
@@ -191,4 +239,27 @@ fn association_weight(left: &Constellation, right: &Constellation) -> f32 {
     } else {
         (sum / n as f32).clamp(0.05, 1.0)
     }
+}
+
+fn map_search<T>(result: Result<T, SearchError>) -> ToolResult<T> {
+    result.map_err(map_search_error)
+}
+
+fn map_search_error(error: SearchError) -> ToolError {
+    match error {
+        SearchError::Calyx(error) => error.into(),
+        SearchError::Usage(message) => ToolError::invalid_params(message),
+        SearchError::Io(message) => {
+            CalyxError::stale_derived(format!("persisted navigation I/O failure: {message}")).into()
+        }
+    }
+}
+
+fn is_missing_manifest(error: &SearchError) -> bool {
+    matches!(
+        error,
+        SearchError::Calyx(error)
+            if error.code == "CALYX_STALE_DERIVED"
+                && error.message.contains("manifest missing")
+    )
 }

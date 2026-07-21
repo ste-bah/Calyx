@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+use calyx_aster::vault::encode::{EncodedMultiSlotVector, encode_slot_vector};
 #[cfg(test)]
 use calyx_core::Constellation;
 use calyx_core::{CalyxError, CxId, SlotId, SlotVector};
@@ -38,12 +39,14 @@ struct MultiRow {
     tokens: Vec<Vec<f32>>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(super) struct MultiSlotRows {
     pub(super) token_dim: u32,
     pub(super) rows: Vec<(CxId, Vec<Vec<f32>>)>,
 }
 
+#[cfg(test)]
 impl MultiSlotRows {
     pub(super) fn len(&self) -> usize {
         self.rows.len()
@@ -82,7 +85,11 @@ pub(super) fn collect(
     Ok(out)
 }
 
+#[cfg(feature = "cuda")]
+pub(crate) use segments::take_maxsim_cuda_detail;
+#[cfg(test)]
 pub(super) use segments::write;
+pub(super) use segments::{SegmentFlush, StreamingSegmentsWriter, ensure_streaming_row_bounded};
 
 pub(super) fn search(
     vault_dir: &Path,
@@ -312,6 +319,10 @@ mod binary;
 
 #[path = "multi/pinned.rs"]
 mod pinned;
+
+pub(super) fn predicted_pin_bytes(entry: &SearchIndexEntry, token_dim: u32) -> CliResult<u64> {
+    pinned::predicted_pin_bytes(entry, token_dim)
+}
 
 #[path = "multi/segments.rs"]
 mod segments;

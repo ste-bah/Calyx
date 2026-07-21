@@ -1,3 +1,5 @@
+// calyx-shared-module: path=novelty_recurrence_support/mod.rs alias=__calyx_shared_novelty_recurrence_support_mod_rs local=novelty_recurrence_support visibility=private
+use crate::__calyx_shared_novelty_recurrence_support_mod_rs as novelty_recurrence_support;
 use calyx_aster::dedup::EpochSecs;
 use calyx_aster::vault::AsterVault;
 use calyx_core::FixedClock;
@@ -6,11 +8,8 @@ use calyx_ward::{
     classify_novelty, novelty::surprise_score_from_counts, novelty_action_for_signal,
     overdue_recurrence_scan, surprise_bits,
 };
-use proptest::prelude::*;
-
-#[path = "novelty_recurrence_support/mod.rs"]
-mod novelty_recurrence_support;
 use novelty_recurrence_support::{append_times, cx, put_base, vault_id};
+use proptest::prelude::*;
 
 #[test]
 fn frequency_zero_and_one_are_non_recurring() {

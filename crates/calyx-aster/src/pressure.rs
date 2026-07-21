@@ -21,6 +21,12 @@ pub struct DiskSample {
     pub blocks_available: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskCapacityBytes {
+    pub total: u64,
+    pub available: u64,
+}
+
 impl DiskSample {
     pub fn used_ratio(self) -> f64 {
         if self.blocks == 0 {
@@ -53,6 +59,35 @@ impl DiskSpaceProbe for OsDiskSpaceProbe {
     fn sample(&self, path: &Path) -> Result<DiskSample> {
         os_disk_sample(path)
     }
+}
+
+/// Returns the byte capacity visible to a new allocation at `path`.
+///
+/// This is separate from the ratio-only pressure sample because rebuild
+/// admission needs an exact side-by-side byte budget before creating a vault.
+#[cfg(unix)]
+pub fn disk_capacity_bytes(path: &Path) -> Result<DiskCapacityBytes> {
+    let stat = nix::sys::statvfs::statvfs(path)
+        .map_err(|error| io_error(format!("statvfs {}: {error}", path.display())))?;
+    let block_bytes = stat.fragment_size().max(1);
+    Ok(DiskCapacityBytes {
+        total: stat
+            .blocks()
+            .checked_mul(block_bytes)
+            .ok_or_else(|| io_error("statvfs total byte capacity overflow"))?,
+        available: stat
+            .blocks_available()
+            .checked_mul(block_bytes)
+            .ok_or_else(|| io_error("statvfs available byte capacity overflow"))?,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn disk_capacity_bytes(path: &Path) -> Result<DiskCapacityBytes> {
+    Err(io_error(format!(
+        "byte-capacity statvfs unsupported on this platform for {}",
+        path.display()
+    )))
 }
 
 #[derive(Clone)]

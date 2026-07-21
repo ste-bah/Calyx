@@ -2,32 +2,39 @@
 
 mod assignment;
 mod balance;
+mod build_validation;
+mod gpu;
+mod graph_build;
 mod manifest;
 mod metric;
 mod search;
 mod sources;
 
 use std::path::Path;
+use std::time::Instant;
 
-use calyx_core::{CxId, Result, SlotId};
+use calyx_core::{CxId, Result};
 use rayon::{ThreadPoolBuilder, prelude::*};
 
 use crate::index::{
-    DiskAnnBuildBackend, DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams,
-    SpannCentroidIndex, build_centroids,
+    DiskAnnBuildBackend, DiskAnnBuildParams, DiskAnnSearchParams, SpannCentroidIndex,
+    build_centroids,
 };
 use assignment::{
     AssignmentRouting, AssignmentSink, BoundedAssignmentConfig, read_ids,
-    stream_assign_to_ids_bounded, stream_assign_to_ids_with_routing,
+    stream_assign_to_ids_bounded, stream_assign_to_ids_bounded_gpu, stream_assign_to_ids_gpu,
+    stream_assign_to_ids_with_routing,
 };
-use balance::balance_region_files;
+use balance::{balance_region_files, balance_region_files_gpu};
+use graph_build::{build_partitioned_graph, effective_region_build_parallelism};
 pub use manifest::{
-    ClosureAssignmentStats, PartitionedManifest, PartitionedManifestDbReadback, RegionMeta,
+    ClosureAssignmentStats, PartitionBuildDiagnostics, PartitionedManifest,
+    PartitionedManifestDbReadback, RegionMeta,
 };
 pub use metric::PartitionDistanceMetric;
 pub use search::{PartitionedSearch, PartitionedSearchOptions, PartitionedSearchReadback};
 use sources::normalize;
-pub use sources::{FbinSource, I8BinSource, SyntheticSource, VectorSource, gen_row};
+pub use sources::{FbinSource, I8BinSource, SyntheticSource, VectorSource, gen_row, gen_row_into};
 
 const CENTROID_DIR: &str = "idx/slot_00.sparse";
 const ROOT_GRAPH: &str = "idx/slot_00.ann/graph.cda";
@@ -111,16 +118,6 @@ impl PartitionBuildParams {
     }
 }
 
-fn effective_region_build_parallelism(requested: usize, region_count: usize) -> Result<usize> {
-    if requested == 0 {
-        return Err(crate::error::sextant_error(
-            crate::error::CALYX_INDEX_INVALID_PARAMS,
-            "region_build_parallelism must be > 0",
-        ));
-    }
-    Ok(requested.min(region_count.max(1)).max(1))
-}
-
 fn graph_rel(region: u32) -> String {
     format!("idx/region_{region:05}.ann/graph.cda")
 }
@@ -189,47 +186,17 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
     backend: DiskAnnBuildBackend,
     distance_metric: PartitionDistanceMetric,
 ) -> Result<PartitionedManifest> {
+    let build_started = Instant::now();
     let dim = source.dim();
     let n_cx = source.len();
-    if n_cx == 0 || dim == 0 || p.n_regions == 0 || p.final_assignment_probe == 0 {
-        return Err(crate::error::sextant_error(
-            crate::error::CALYX_INDEX_INVALID_PARAMS,
-            "partitioned vault requires nonzero source len, dim, n_regions, final_assignment_probe",
-        ));
-    }
-    if p.final_assignment_cap == Some(0) {
-        return Err(crate::error::sextant_error(
-            crate::error::CALYX_INDEX_INVALID_PARAMS,
-            "final_assignment_cap must be > 0 when set",
-        ));
-    }
-    if p.balance_cap == Some(0) {
-        return Err(crate::error::sextant_error(
-            crate::error::CALYX_INDEX_INVALID_PARAMS,
-            "balance_cap must be > 0 when set",
-        ));
-    }
-    if !p.assignment_boundary_epsilon.is_finite()
-        || p.assignment_boundary_epsilon < 0.0
-        || p.assignment_max_replication == 0
-        || !p.assignment_rng_factor.is_finite()
-        || p.assignment_rng_factor <= 0.0
-    {
-        return Err(crate::error::sextant_error(
-            crate::error::CALYX_INDEX_INVALID_PARAMS,
-            "assignment_boundary_epsilon must be finite and >= 0, assignment_max_replication >= 1, assignment_rng_factor finite and > 0",
-        ));
-    }
-    if p.region_build_parallelism == 0 {
-        return Err(crate::error::sextant_error(
-            crate::error::CALYX_INDEX_INVALID_PARAMS,
-            "region_build_parallelism must be > 0",
-        ));
-    }
+    build_validation::validate(n_cx, dim, &p)?;
+    let sample = p.sample.min(n_cx as usize).max(1);
+    let initial_regions =
+        gpu::initial_cluster_count(backend, n_cx, p.n_regions, p.balance_cap, sample);
+    let mut gpu = gpu::for_backend(backend, source, p.chunk, sample, initial_regions)?;
     std::fs::create_dir_all(root.join(CENTROID_DIR))
         .map_err(|e| crate::error::sextant_error(crate::error::CALYX_INDEX_IO, e.to_string()))?;
 
-    let sample = p.sample.min(n_cx as usize).max(1);
     let stride = (n_cx / sample as u64).max(1);
     let sample_rows: Vec<(u32, Vec<f32>)> = (0..sample)
         .into_par_iter()
@@ -238,8 +205,22 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
             (s as u32, source.row(idx))
         })
         .collect();
-    let centroids = build_centroids(&sample_rows, p.n_regions, p.seed);
+    let centroids = if let Some(gpu) = gpu.as_mut() {
+        gpu.fit_centroids(&sample_rows, initial_regions, p.seed)?
+    } else {
+        build_centroids(&sample_rows, p.n_regions, p.seed)
+    };
     let r = centroids.centroid_count();
+    let mean_region = (n_cx as usize).div_ceil(r.max(1));
+    let cap = p
+        .balance_cap
+        .unwrap_or_else(|| mean_region.max(MIN_REGION_CAP));
+    let final_cap_has_headroom = p
+        .final_assignment_cap
+        .map(|final_cap| gpu::has_balance_headroom(r, n_cx, final_cap))
+        .unwrap_or(true);
+    let skip_gpu_provisional =
+        gpu.is_some() && gpu::has_balance_headroom(r, n_cx, cap) && final_cap_has_headroom;
 
     const ROUTED_ASSIGN_MIN_CENTROIDS: usize = 256;
     let use_routed_assign = r > ROUTED_ASSIGN_MIN_CENTROIDS;
@@ -249,28 +230,53 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
         PartitionDistanceMetric::UnitL2 if use_routed_assign => AssignmentRouting::Hnsw,
         PartitionDistanceMetric::UnitL2 => AssignmentRouting::Exact,
     };
-    let provisional = stream_assign_to_ids_with_routing(
-        root,
-        AssignmentSink::Provisional,
-        &centroids,
-        source,
-        p.chunk,
-        provisional_routing,
-    )?;
+    let provisional_started = Instant::now();
+    let provisional = if skip_gpu_provisional {
+        Vec::new()
+    } else if let Some(gpu) = gpu.as_mut() {
+        stream_assign_to_ids_gpu(root, AssignmentSink::Provisional, &centroids, source, gpu)?
+    } else {
+        stream_assign_to_ids_with_routing(
+            root,
+            AssignmentSink::Provisional,
+            &centroids,
+            source,
+            p.chunk,
+            provisional_routing,
+        )?
+    };
+    if !skip_gpu_provisional && let Some(gpu) = gpu.as_mut() {
+        gpu.diagnostics_mut().provisional_assignment_us = provisional_started.elapsed().as_micros();
+    }
 
-    let mean_region = (n_cx as usize).div_ceil(r.max(1));
-    let cap = p
-        .balance_cap
-        .unwrap_or_else(|| mean_region.max(MIN_REGION_CAP));
-    let final_centroids = balance_region_files(
-        root,
-        &centroids,
-        &provisional,
-        source,
-        p.seed,
-        cap,
-        distance_metric,
-    )?;
+    let balance_started = Instant::now();
+    let final_centroids = if skip_gpu_provisional {
+        centroids.centroids().to_vec()
+    } else if let Some(gpu) = gpu.as_mut() {
+        balance_region_files_gpu(
+            root,
+            &centroids,
+            &provisional,
+            source,
+            p.seed,
+            cap,
+            distance_metric,
+            gpu,
+        )?
+    } else {
+        balance_region_files(
+            root,
+            &centroids,
+            &provisional,
+            source,
+            p.seed,
+            cap,
+            distance_metric,
+        )?
+    };
+    if let Some(gpu) = gpu.as_mut() {
+        gpu.diagnostics_mut().balance_us = balance_started.elapsed().as_micros();
+    }
     let centroids =
         SpannCentroidIndex::from_parts(dim as u32, final_centroids, Vec::new(), Vec::new())?;
     centroids.save(root.join(CENTROID_DIR))?;
@@ -285,22 +291,58 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
         PartitionDistanceMetric::RawL2 => AssignmentRouting::Exact,
         PartitionDistanceMetric::UnitL2 => AssignmentRouting::Hnsw,
     };
-    let (region_ids, closure_stats) = stream_assign_to_ids_bounded(
-        root,
-        AssignmentSink::Final,
-        &centroids,
-        source,
-        p.chunk,
-        BoundedAssignmentConfig {
-            cap: final_cap,
-            routing_probe: p.final_assignment_probe,
-            routing: final_routing,
-            boundary_epsilon: p.assignment_boundary_epsilon,
-            max_replication: p.assignment_max_replication,
-            apply_rng_rule: p.assignment_rng_rule,
-            rng_factor: p.assignment_rng_factor,
-        },
-    )?;
+    let effective_boundary_epsilon = if gpu.is_some() && skip_gpu_provisional {
+        gpu::supported_boundary_epsilon(
+            p.assignment_boundary_epsilon,
+            sample,
+            centroids.centroid_count(),
+            dim,
+        )
+    } else {
+        p.assignment_boundary_epsilon
+    };
+    if let Some(gpu) = gpu.as_mut() {
+        let diagnostics = gpu.diagnostics_mut();
+        diagnostics.requested_boundary_epsilon = p.assignment_boundary_epsilon;
+        diagnostics.effective_boundary_epsilon = effective_boundary_epsilon;
+        diagnostics.centroid_sample_support = sample as f32 / centroids.centroid_count() as f32;
+    }
+    let assignment_config = BoundedAssignmentConfig {
+        cap: final_cap,
+        routing_probe: p.final_assignment_probe,
+        routing: final_routing,
+        boundary_epsilon: effective_boundary_epsilon,
+        max_replication: p.assignment_max_replication,
+        apply_rng_rule: p.assignment_rng_rule,
+        rng_factor: p.assignment_rng_factor,
+    };
+    let final_assignment_started = Instant::now();
+    let (region_ids, closure_stats) = if let Some(gpu) = gpu.as_mut() {
+        stream_assign_to_ids_bounded_gpu(
+            root,
+            AssignmentSink::Final,
+            &centroids,
+            source,
+            assignment_config,
+            cap,
+            gpu,
+        )?
+    } else {
+        stream_assign_to_ids_bounded(
+            root,
+            AssignmentSink::Final,
+            &centroids,
+            source,
+            p.chunk,
+            assignment_config,
+        )?
+    };
+    if let Some(gpu) = gpu.as_mut() {
+        let diagnostics = gpu.diagnostics_mut();
+        diagnostics.final_assignment_us = final_assignment_started.elapsed().as_micros();
+        diagnostics.pre_region_build_us = build_started.elapsed().as_micros();
+        diagnostics.final_centroids = centroids.centroid_count();
+    }
     let region_build_parallelism =
         effective_region_build_parallelism(p.region_build_parallelism, region_ids.len())?;
 
@@ -389,6 +431,11 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
         distance_metric,
     )?;
 
+    let partition_build_diagnostics = gpu.as_mut().map(|gpu| {
+        gpu.diagnostics_mut().end_to_end_build_us = build_started.elapsed().as_micros();
+        gpu.diagnostics_mut().clone()
+    });
+    let gpu_routing = gpu.is_some();
     let manifest = PartitionedManifest {
         format: "calyx-partitioned-vault-v1".to_string(),
         n_cx,
@@ -400,8 +447,18 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
         distance_metric,
         region_build_parallelism,
         graph_build_backend: backend,
-        provisional_assignment_routing: provisional_routing.as_str().to_string(),
-        final_assignment_routing: final_routing.as_str().to_string(),
+        provisional_assignment_routing: if skip_gpu_provisional {
+            "skipped-cap-headroom".to_string()
+        } else if gpu_routing {
+            "cuda-cuvs-bruteforce-l2".to_string()
+        } else {
+            provisional_routing.as_str().to_string()
+        },
+        final_assignment_routing: if gpu_routing {
+            "cuda-cuvs-bruteforce-l2-balanced-primary-v1".to_string()
+        } else {
+            final_routing.as_str().to_string()
+        },
         final_assignment_probe: p.final_assignment_probe,
         final_assignment_cap: Some(final_cap),
         final_assignment_boundary_epsilon: p.assignment_boundary_epsilon,
@@ -411,6 +468,7 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
         final_assignment_closure: Some(closure_stats),
         region_balance_cap: cap,
         stored_region_members: regions.iter().map(|region| region.count).sum(),
+        partition_build_diagnostics,
         centroids_rel: format!("{CENTROID_DIR}/centroids.spn"),
         root_graph_rel: ROOT_GRAPH.to_string(),
         regions,
@@ -427,40 +485,13 @@ pub fn partitioned_manifest_db_readback(root: &Path) -> Result<PartitionedManife
     manifest::read_manifest_db_readback(root)
 }
 
-fn build_partitioned_graph(
-    graph_path: &Path,
-    rows: &[(CxId, Vec<f32>)],
-    build_params: DiskAnnBuildParams,
-    search_params: DiskAnnSearchParams,
-    backend: DiskAnnBuildBackend,
-    distance_metric: PartitionDistanceMetric,
-) -> Result<()> {
-    match distance_metric {
-        PartitionDistanceMetric::UnitL2 => {
-            DiskAnnSearch::build_without_default_raw_sidecar_with_backend(
-                SlotId::new(0),
-                graph_path,
-                rows,
-                build_params,
-                None,
-                search_params,
-                backend,
-            )?;
-        }
-        PartitionDistanceMetric::RawL2 => {
-            DiskAnnSearch::build_raw_l2_without_default_raw_sidecar_with_backend(
-                SlotId::new(0),
-                graph_path,
-                rows,
-                build_params,
-                None,
-                search_params,
-                backend,
-            )?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "partitioned/gpu_tests.rs"]
+mod gpu_tests;
+
+#[cfg(all(test, sextant_cuvs))]
+#[path = "partitioned/gpu_replay_tests.rs"]
+mod gpu_replay_tests;

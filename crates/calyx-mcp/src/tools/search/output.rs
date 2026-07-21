@@ -1,4 +1,4 @@
-use calyx_sextant::{FreshnessTag, Hit, HitGuardEvidence};
+use calyx_sextant::{FreshnessTag, Hit, HitGuardEvidence, HitRerankEvidence};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -14,6 +14,8 @@ pub(super) struct SearchHitOut {
     rank: usize,
     cx_id: String,
     score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank: Option<HitRerankEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     per_lens: Option<Vec<PerLensOut>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +59,10 @@ pub(super) fn render_hits(
             rank: hit.rank,
             cx_id: hit.cx_id.to_string(),
             score: hit.score,
+            rerank: hit
+                .explain
+                .as_ref()
+                .and_then(|explain| explain.rerank.clone()),
             per_lens: explain.then(|| {
                 hit.per_lens
                     .iter()

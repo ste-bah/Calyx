@@ -12,12 +12,22 @@ use calyx_sextant::index::{
 };
 
 use super::rebuild::RebuildProgress;
-use super::rebuild_plan::configured_diskann_build_backend;
+use super::rebuild_plan::DiskAnnBuildPolicy;
 use super::{SearchIndexEntry, SlotIdMap, rel, stale, write_json_atomic};
 use crate::error::CliResult;
 
 #[path = "dense/flat.rs"]
 mod flat;
+
+pub(super) fn gpu_serving_required(backend: Option<&str>) -> CliResult<bool> {
+    match backend {
+        Some("cuvs-cagra") => Ok(true),
+        Some("cpu-vamana") | None => Ok(false),
+        Some(other) => Err(stale(format!(
+            "persistent search manifest has unsupported diskann_build_backend {other:?}; rebuild"
+        ))),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct DenseSlotRows {
@@ -75,23 +85,13 @@ pub(super) fn collect_slot(
     out.ok_or_else(|| stale(format!("slot {target} has no dense rows")))
 }
 
-#[cfg(test)]
-pub(super) fn write(
-    vault_dir: &Path,
-    root: &Path,
-    slot: SlotId,
-    rows: DenseSlotRows,
-    base_seq: u64,
-) -> CliResult<SearchIndexEntry> {
-    write_with_progress(vault_dir, root, slot, rows, base_seq, |_| Ok(()))
-}
-
 pub(super) fn write_with_progress<F>(
     vault_dir: &Path,
     root: &Path,
     slot: SlotId,
     rows: DenseSlotRows,
     base_seq: u64,
+    build_policy: DiskAnnBuildPolicy,
     mut progress: F,
 ) -> CliResult<SearchIndexEntry>
 where
@@ -119,7 +119,7 @@ where
         build_params(rows.dim as usize),
         None,
         search_params(rows.rows.len().max(64)),
-        configured_diskann_build_backend()?,
+        build_policy.backend,
         |event| {
             progress(RebuildProgress::slot(
                 event.phase,
@@ -155,16 +155,17 @@ pub(super) fn search(
     slot: SlotId,
     query: &SlotVector,
     k: usize,
+    gpu_serving: bool,
 ) -> CliResult<Vec<IndexSearchHit>> {
     if entry.kind == "flat_dense" {
-        return flat::search(vault_dir, entry, slot, query, k, None);
+        return flat::search(vault_dir, entry, slot, query, k, None, gpu_serving);
     }
     let SlotVector::Dense { dim, .. } = query else {
         return Err(stale(format!(
             "persistent dense search slot {slot} received non-dense query"
         )));
     };
-    open(vault_dir, entry, slot, *dim, k)?
+    open(vault_dir, entry, slot, *dim, k, gpu_serving)?
         .search(query, want(k, entry.len), Some(want(k, entry.len).max(64)))
         .map_err(Into::into)
 }
@@ -176,16 +177,45 @@ pub(super) fn search_filtered(
     query: &SlotVector,
     k: usize,
     candidates: &BTreeSet<CxId>,
+    gpu_serving: bool,
 ) -> CliResult<Vec<IndexSearchHit>> {
     if entry.kind == "flat_dense" {
-        return flat::search(vault_dir, entry, slot, query, k, Some(candidates));
+        return flat::search(
+            vault_dir,
+            entry,
+            slot,
+            query,
+            k,
+            Some(candidates),
+            gpu_serving,
+        );
     }
     let SlotVector::Dense { dim, data } = query else {
         return Err(stale(format!(
             "persistent dense filtered search slot {slot} received non-dense query"
         )));
     };
-    let index = open(vault_dir, entry, slot, *dim, k)?;
+    let index = open(vault_dir, entry, slot, *dim, k, gpu_serving)?;
+    if gpu_serving {
+        let allowed = candidates
+            .iter()
+            .filter_map(|cx_id| index.local_id(*cx_id))
+            .collect::<Vec<_>>();
+        if k == 0 || allowed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scored = index
+            .search_ids_filtered_cuda(
+                data,
+                want(k, allowed.len()),
+                &search_params(k.max(64)),
+                &allowed,
+            )?
+            .into_iter()
+            .filter_map(|(id, distance)| index.cx_id(id).map(|cx_id| (cx_id, 1.0 - distance)))
+            .collect();
+        return Ok(ranked(scored));
+    }
     exact_filtered_hits(&index, data, k, candidates)
 }
 
@@ -195,6 +225,7 @@ fn open(
     slot: SlotId,
     query_dim: u32,
     k: usize,
+    gpu_serving: bool,
 ) -> CliResult<DiskAnnSearch> {
     entry.require_kind("diskann", slot)?;
     let dim = entry.require_dim(slot)?;
@@ -212,7 +243,11 @@ fn open(
         )));
     }
     let graph = vault_dir.join(entry.require_graph_rel(slot)?);
-    let mut index = DiskAnnSearch::open(slot, graph, ids, None, search_params(k.max(64)))?;
+    let mut index = if gpu_serving {
+        DiskAnnSearch::open_gpu_serving(slot, graph, ids, None, search_params(k.max(64)))?
+    } else {
+        DiskAnnSearch::open(slot, graph, ids, None, search_params(k.max(64)))?
+    };
     index.set_base_seq(entry.built_at_seq);
     Ok(index)
 }

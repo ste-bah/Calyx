@@ -17,12 +17,13 @@ pub mod tombstone;
 pub mod verify;
 
 pub use append::{
-    DirectoryLedgerStore, LedgerAppender, LedgerCfStore, LedgerRow, MemoryLedgerStore,
-    PreparedLedgerEntry, reject_delete, reject_tombstone,
+    DirectoryLedgerStore, LedgerAppender, LedgerCfStore, LedgerRow, LedgerSnapshot,
+    MemoryLedgerStore, PreparedLedgerEntry, reject_delete, reject_tombstone,
 };
 pub use audit::{
-    AnswerTrace, AnswerTraceHop, AuditFilter, QuarantineLookup, QuarantineSet, audit,
-    get_answer_trace, get_provenance,
+    AnswerTrace, AnswerTraceHop, AuditFilter, QuarantineLookup, QuarantineSet,
+    answer_trace_from_entries, audit, entry_cx_mentions, get_answer_trace,
+    get_answer_trace_from_snapshot, get_provenance, get_provenance_from_snapshot,
 };
 pub use checkpoint::{
     CHECKPOINT_TAG, CheckpointConfig, CheckpointPayload, CheckpointScheduler,
@@ -40,7 +41,7 @@ pub use merkle::{
     MERKLE_EMPTY_ROOT, MERKLE_SIGNING_DOMAIN, MerkleExportBundle, combine_hash, leaf_hash,
     merkle_root, merkle_root_of_hashes, sign_root, verify_signature,
 };
-pub use redaction::{PayloadBuilder, RedactedInput, RedactionPolicy};
+pub use redaction::{MAX_UNCLASSIFIED_TOKEN_LEN, PayloadBuilder, RedactedInput, RedactionPolicy};
 pub use reproduce::{
     ForgeBackend, FusionMode, FusionWeights, HitRef, InlineInputResolver, QueryId,
     REPRODUCE_PAYLOAD_TAG, REPRODUCE_TOLERANCE, RecordedSlot, RemeasuredSlot, ReproduceContext,
@@ -55,7 +56,9 @@ pub use tombstone::{
     ErasureScope, ErasureTombstone, find_tombstone, is_tombstoned, tombstone_from_entry,
     write_tombstone,
 };
-pub use verify::{VerifyResult, verify_chain};
+pub use verify::{
+    DecodedLedgerSnapshot, VerifyResult, verify_chain, verify_decoded_snapshot, verify_snapshot,
+};
 
 #[cfg(test)]
 mod tests {

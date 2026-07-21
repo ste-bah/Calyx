@@ -27,6 +27,8 @@ pub const CALYX_ANSWER_UNGROUNDED: &str = "CALYX_ANSWER_UNGROUNDED";
 pub const CALYX_ANSWER_SYNTHESIS_UNAVAILABLE: &str = "CALYX_ANSWER_SYNTHESIS_UNAVAILABLE";
 pub const CALYX_LENS_NOT_FOUND: &str = "CALYX_LENS_NOT_FOUND";
 pub const CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE: &str = "CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE";
+pub const CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE: &str = "CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE";
+pub const CALYX_SEXTANT_GPU_CACHE_EXHAUSTED: &str = "CALYX_SEXTANT_GPU_CACHE_EXHAUSTED";
 pub const CALYX_SEXTANT_POSTINGS_CORRUPT: &str = "CALYX_SEXTANT_POSTINGS_CORRUPT";
 pub const CALYX_SEXTANT_POSTINGS_NOT_SORTED: &str = "CALYX_SEXTANT_POSTINGS_NOT_SORTED";
 pub const CALYX_SEXTANT_PROVENANCE_MISSING: &str = "CALYX_SEXTANT_PROVENANCE_MISSING";
@@ -42,6 +44,7 @@ pub const CALYX_SEXTANT_SKILL_UNKNOWN: &str = "CALYX_SEXTANT_SKILL_UNKNOWN";
 pub const CALYX_SEXTANT_SKILL_PARAMS: &str = "CALYX_SEXTANT_SKILL_PARAMS";
 pub const CALYX_SEXTANT_SKILL_BUDGET_EXCEEDED: &str = "CALYX_SEXTANT_SKILL_BUDGET_EXCEEDED";
 pub const CALYX_SEXTANT_SKILL_PAIR_NO_OVERLAP: &str = "CALYX_SEXTANT_SKILL_PAIR_NO_OVERLAP";
+pub const CALYX_SEXTANT_SKILL_CUDA_REQUIRED: &str = "CALYX_SEXTANT_SKILL_CUDA_REQUIRED";
 pub const CALYX_TEMPORAL_WINDOW_BUDGET_EXHAUSTED: &str = "CALYX_TEMPORAL_WINDOW_BUDGET_EXHAUSTED";
 pub const CALYX_INDEX_CORRUPT: &str = "CALYX_INDEX_CORRUPT";
 pub const CALYX_INDEX_IO: &str = "CALYX_INDEX_IO";
@@ -95,6 +98,12 @@ pub fn sextant_error(code: &'static str, message: impl Into<String>) -> CalyxErr
         CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE => {
             "wire a real Forge GPU path before claiming Sextant CPU/GPU parity"
         }
+        CALYX_SEXTANT_GPU_SERVING_UNAVAILABLE => {
+            "rebuild the index with cuVS CAGRA assets on Linux --features cuda"
+        }
+        CALYX_SEXTANT_GPU_CACHE_EXHAUSTED => {
+            "raise the bounded CUDA cache cap or reduce concurrent index fanout"
+        }
         CALYX_SEXTANT_POSTINGS_CORRUPT => "discard/rebuild the sparse postings block",
         CALYX_SEXTANT_POSTINGS_NOT_SORTED => "sort postings by increasing document id",
         CALYX_SEXTANT_PROVENANCE_MISSING => {
@@ -126,6 +135,9 @@ pub fn sextant_error(code: &'static str, message: impl Into<String>) -> CalyxErr
         }
         CALYX_SEXTANT_SKILL_PAIR_NO_OVERLAP => {
             "ensure every clustered constellation shares at least one dense lens with the others"
+        }
+        CALYX_SEXTANT_SKILL_CUDA_REQUIRED => {
+            "enable the CUDA feature and restore a healthy GPU before clustering a large skill set"
         }
         CALYX_TEMPORAL_WINDOW_BUDGET_EXHAUSTED => {
             "raise max_candidates or use the exhaustive window recall policy"

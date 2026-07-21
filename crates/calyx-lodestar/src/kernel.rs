@@ -162,6 +162,32 @@ pub fn refine_kernel_with_recall_support(
     Ok(kernel)
 }
 
+/// Re-seals a completed kernel after recall and build-policy fields are final.
+///
+/// The pipeline's provisional id is useful while constructing its index, but
+/// it intentionally predates the measured recall report. Persisted generations
+/// must instead include every semantic output plus the caller's physical graph
+/// contract so two different builds can never overwrite the same id directory.
+pub fn seal_completed_kernel_identity(
+    kernel: &mut Kernel,
+    physical_contract_hash: &[u8; 32],
+) -> Result<CxId> {
+    let mut identity = kernel.clone();
+    identity.kernel_id = CxId::from_bytes([0; 16]);
+    let bytes = serde_json::to_vec(&identity).map_err(|error| {
+        crate::LodestarError::KernelArtifactCodec {
+            detail: format!("encode completed kernel identity: {error}"),
+        }
+    })?;
+    let id = CxId::from_bytes(content_address([
+        b"calyx-lodestar-completed-kernel-v1".as_slice(),
+        physical_contract_hash.as_slice(),
+        bytes.as_slice(),
+    ]));
+    kernel.kernel_id = id;
+    Ok(id)
+}
+
 fn build_kernel_pipeline_with_adjustment(
     graph: &AssocGraph,
     anchors: &[CxId],

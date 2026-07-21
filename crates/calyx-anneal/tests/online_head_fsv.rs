@@ -3,6 +3,12 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
+#[allow(dead_code)]
+// calyx-shared-module: path=support/fsv_bad_change.rs alias=__calyx_shared_support_fsv_bad_change_rs local=support visibility=private
+use crate::__calyx_shared_support_fsv_bad_change_rs as support;
 use calyx_anneal::{
     AsterHeadStorage, CALYX_ANNEAL_HEAD_TOO_LARGE, HeadKind, OnlineHead, OnlineHeadState,
     ReplayEntry, decode_online_head,
@@ -12,14 +18,8 @@ use calyx_aster::vault::AsterVault;
 use calyx_core::{
     Constellation, CxFlags, CxId, FixedClock, InputRef, LedgerRef, Modality, VaultStore,
 };
-use serde_json::{Value, json};
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
-#[allow(dead_code)]
-#[path = "support/fsv_bad_change.rs"]
-mod support;
 use fsv_support::write_json;
+use serde_json::{Value, json};
 
 const TEST_TS: u64 = 1_785_500_408;
 

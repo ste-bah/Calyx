@@ -4,6 +4,8 @@ pub mod abundance;
 pub mod agreement_graph;
 pub mod blind_spot;
 pub mod cross_term;
+pub mod cuda;
+mod cuda_validation;
 pub mod error;
 pub mod lru_cache;
 pub mod materialization;
@@ -24,6 +26,7 @@ pub use cross_term::{
     agreement_batch_gpu, agreement_scalar, agreement_weight, concat_vec, delta_vec,
     interaction_vec,
 };
+pub use cuda::{LOOM_CUDA_STRICT_ENV, LoomCudaStats, loom_cuda_strict_requested};
 pub use error::{
     CALYX_LOOM_DIM_MISMATCH, CALYX_LOOM_FORGE_UNAVAILABLE, CALYX_LOOM_NON_FINITE_VECTOR,
     CALYX_LOOM_SERIES_READ_ERROR, CALYX_LOOM_SLOT_MISSING, CALYX_LOOM_TEMPORAL_XTERM_CORRUPT,

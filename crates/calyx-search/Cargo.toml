@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "calyx-search"
 version.workspace = true
 edition.workspace = true
@@ -9,6 +10,13 @@ publish.workspace = true
 [lib]
 name = "calyx_search"
 path = "src/lib.rs"
+
+[features]
+default = []
+# Search rebuild policy needs to verify the actual cuVS CAGRA build path. The
+# resolved truth is still `calyx_sextant::CUVS_COMPILED`; this feature only
+# forwards the intended GPU build surface to sextant for explicit FSV runs.
+cuda = ["calyx-sextant/cuda"]
 
 [dependencies]
 calyx-core = { path = "../calyx-core" }
@@ -22,6 +30,7 @@ serde_json.workspace = true
 sha2.workspace = true
 rayon.workspace = true
 bincode.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -32,3 +41,11 @@ windows-sys = { version = "0.61.2", features = [
 [dev-dependencies]
 calyx-fsv = { path = "../calyx-fsv" }
 ulid = { workspace = true }
+
+# BEGIN generated integration harnesses (issue #1546)
+
+[[test]]
+name = "__calyx_integration_suite_0"
+path = "tests/__calyx_integration_suite_0.rs"
+
+# END generated integration harnesses (issue #1546)

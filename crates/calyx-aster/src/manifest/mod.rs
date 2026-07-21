@@ -1,17 +1,21 @@
 //! Atomic manifest and recovery ordering for Aster vaults.
 
+mod error;
 mod quarantine;
 
 use crate::dedup::DedupPolicy;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::timetravel::RetentionHorizon;
 use crate::wal::{ReplayRecord, TornTail, replay_dir_after};
 use calyx_core::{CalyxError, Result, TemporalPolicy};
+use calyx_ledger::QuarantineSet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+
+use error::{format_version_unsupported, storage_error};
 
 const CURRENT_FILE: &str = "CURRENT";
 const MANIFEST_FILE: &str = "MANIFEST";
@@ -19,6 +23,10 @@ const MANIFEST_PREFIX: &str = "manifest-";
 const MANIFEST_SUFFIX: &str = ".json";
 const SUPPORTED_MANIFEST_MAJOR: u16 = 1;
 const SUPPORTED_MANIFEST_MINOR: u16 = 0;
+/// Watermark model 2 tracks only the CFs consumed by the persistent search
+/// builder. Pre-versioned manifests used the broader issue-#1100 doctrine and
+/// must be physically re-derived during vault recovery (issue #1808).
+pub(crate) const PERSISTENT_SEARCH_CONTENT_MODEL: u16 = 2;
 
 pub use quarantine::QuarantineRecord;
 
@@ -113,6 +121,11 @@ pub struct VaultManifest {
     /// `durable_seq` via [`Self::effective_derived_content_seq`].
     #[serde(default)]
     pub derived_content_seq: Option<u64>,
+    /// Semantic model for `derived_content_seq`. `None` identifies manifests
+    /// written by the original broad-CF classifier and requires an exact
+    /// physical migration during recovery; unknown explicit models fail.
+    #[serde(default)]
+    pub derived_content_model: Option<u16>,
     pub panel_ref: ImmutableRef,
     #[serde(default)]
     pub registry_ref: Option<ImmutableRef>,
@@ -174,6 +187,7 @@ impl VaultManifest {
             manifest_seq,
             durable_seq,
             derived_content_seq: None,
+            derived_content_model: Some(PERSISTENT_SEARCH_CONTENT_MODEL),
             panel_ref,
             registry_ref: None,
             codebook_refs,
@@ -195,6 +209,10 @@ impl VaultManifest {
         self.derived_content_seq.unwrap_or(self.durable_seq)
     }
 
+    pub(crate) fn uses_persistent_search_content_model(&self) -> bool {
+        self.derived_content_model == Some(PERSISTENT_SEARCH_CONTENT_MODEL)
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.version.validate()?;
         if self.manifest_seq == 0 {
@@ -208,6 +226,13 @@ impl VaultManifest {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "manifest derived_content_seq {derived_content_seq} exceeds durable_seq {}; the watermark can only vouch for checkpointed seqs",
                 self.durable_seq
+            )));
+        }
+        if let Some(model) = self.derived_content_model
+            && model != PERSISTENT_SEARCH_CONTENT_MODEL
+        {
+            return Err(format_version_unsupported(format!(
+                "unsupported derived-content watermark model {model}; supported model is {PERSISTENT_SEARCH_CONTENT_MODEL}"
             )));
         }
         self.panel_ref.validate()?;
@@ -255,8 +280,9 @@ impl ManifestStore {
 
     pub fn write_current(&self, manifest: &VaultManifest) -> Result<ManifestWrite> {
         manifest.validate()?;
-        fs::create_dir_all(&self.vault_dir)
-            .map_err(|error| storage_error("create vault manifest directory", error))?;
+        fs::create_dir_all(&self.vault_dir).map_err(|error| {
+            storage_error("create vault manifest directory", &self.vault_dir, error)
+        })?;
         let pointer = manifest_filename(manifest.manifest_seq);
         let manifest_path = self.vault_dir.join(&pointer);
         let mirror_path = self.vault_dir.join(MANIFEST_FILE);
@@ -276,8 +302,9 @@ impl ManifestStore {
     }
 
     pub fn load_current(&self) -> Result<VaultManifest> {
-        let pointer_bytes = fs::read(self.vault_dir.join(CURRENT_FILE))
-            .map_err(|error| storage_error("read CURRENT", error))?;
+        let current_path = self.vault_dir.join(CURRENT_FILE);
+        let pointer_bytes = fs::read(&current_path)
+            .map_err(|error| storage_error("read CURRENT", &current_path, error))?;
         let pointer = std::str::from_utf8(&pointer_bytes)
             .map_err(|error| CalyxError::aster_corrupt_shard(format!("CURRENT utf8: {error}")))?
             .trim();
@@ -286,16 +313,18 @@ impl ManifestStore {
                 "CURRENT does not point at immutable manifest file",
             ));
         }
-        let bytes = fs::read(self.vault_dir.join(pointer))
-            .map_err(|error| storage_error("read pointed MANIFEST", error))?;
+        let manifest_path = self.vault_dir.join(pointer);
+        let bytes = fs::read(&manifest_path)
+            .map_err(|error| storage_error("read pointed MANIFEST", &manifest_path, error))?;
         let manifest = decode_manifest(&bytes)?;
         verify_immutable_refs(&self.vault_dir, &manifest)?;
         Ok(manifest)
     }
 
     pub fn current_pointer(&self) -> Result<String> {
-        let pointer = fs::read_to_string(self.vault_dir.join(CURRENT_FILE))
-            .map_err(|error| storage_error("read CURRENT", error))?;
+        let current_path = self.vault_dir.join(CURRENT_FILE);
+        let pointer = fs::read_to_string(&current_path)
+            .map_err(|error| storage_error("read CURRENT", &current_path, error))?;
         Ok(pointer.trim().to_string())
     }
 
@@ -357,7 +386,7 @@ pub fn recover_vault(vault_dir: impl AsRef<Path>) -> Result<RecoveryOutcome> {
 
 /// Reads a base CF shard through the fail-closed SST path.
 pub fn read_base_shard(path: impl AsRef<Path>, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    SstReader::open(path)?.get(key)
+    shared_reader(path.as_ref())?.get(key)
 }
 
 pub fn is_quarantined(manifest: &VaultManifest, seq: u64) -> bool {
@@ -374,6 +403,26 @@ pub fn is_vault_seq_quarantined(vault_dir: impl AsRef<Path>, seq: u64) -> Result
     }
     let manifest = ManifestStore::open(vault_dir).load_current()?;
     Ok(is_quarantined(&manifest, seq))
+}
+
+/// Loads and cryptographically validates one current manifest generation,
+/// then materializes its quarantine ranges for request-local lookups.
+///
+/// A `CURRENT` change after this function returns does not mutate the returned
+/// set; the next call observes and validates the new pointer. A vault without
+/// `CURRENT` preserves the legacy empty-quarantine behavior.
+pub fn load_vault_quarantine_snapshot(vault_dir: impl AsRef<Path>) -> Result<QuarantineSet> {
+    let vault_dir = vault_dir.as_ref();
+    if !vault_dir.join(CURRENT_FILE).exists() {
+        return Ok(QuarantineSet::default());
+    }
+    let manifest = ManifestStore::open(vault_dir).load_current()?;
+    QuarantineSet::from_ranges(
+        manifest
+            .quarantines
+            .iter()
+            .map(|record| record.range_start..record.range_end),
+    )
 }
 
 fn manifest_filename(seq: u64) -> String {
@@ -404,13 +453,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut file =
-            File::create(&tmp).map_err(|error| storage_error("create atomic temp", error))?;
+            File::create(&tmp).map_err(|error| storage_error("create atomic temp", &tmp, error))?;
         file.write_all(bytes)
-            .map_err(|error| storage_error("write atomic temp", error))?;
+            .map_err(|error| storage_error("write atomic temp", &tmp, error))?;
         file.sync_all()
-            .map_err(|error| storage_error("fsync atomic temp", error))?;
+            .map_err(|error| storage_error("fsync atomic temp", &tmp, error))?;
     }
-    fs::rename(&tmp, path).map_err(|error| storage_error("rename atomic file", error))?;
+    fs::rename(&tmp, path).map_err(|error| storage_error("rename atomic file", path, error))?;
     sync_parent(path)
 }
 
@@ -463,18 +512,6 @@ fn verify_immutable_ref(vault_dir: &Path, reference: &ImmutableRef) -> Result<()
         )));
     }
     Ok(())
-}
-
-fn storage_error(context: &str, error: io::Error) -> CalyxError {
-    CalyxError::disk_pressure(format!("{context}: {error}"))
-}
-
-fn format_version_unsupported(message: impl Into<String>) -> CalyxError {
-    CalyxError {
-        code: "CALYX_FORMAT_VERSION_UNSUPPORTED",
-        message: message.into(),
-        remediation: "refuse unknown format major; migrate through a compatible reader",
-    }
 }
 
 #[cfg(test)]

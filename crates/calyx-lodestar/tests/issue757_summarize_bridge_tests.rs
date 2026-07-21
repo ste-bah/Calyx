@@ -26,6 +26,7 @@ fn seeded_vault() -> AsterVault {
         DEFAULT_ASTER_ASSOC_COLLECTION,
         &AsterAssocMetadata {
             retention_horizon: Some(1_000),
+            ..Default::default()
         },
     )
     .unwrap();

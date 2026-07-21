@@ -68,6 +68,28 @@ impl CfRouter {
         Ok(())
     }
 
+    /// Rebuilds one CF's in-memory SST level from the files currently on
+    /// disk. Live compaction reclaims merged input SSTs from disk while the
+    /// resident level still references them; callers invoke this after
+    /// reclaim so reads stop touching deleted files. The CF's flush ordinal
+    /// counter never moves backwards, so a reload after compaction (which
+    /// deletes the flush files the counter was derived from) cannot cause
+    /// flush SST name reuse.
+    pub(crate) fn reload_cf_level(&mut self, cf: ColumnFamily) -> Result<()> {
+        let mut files = Vec::new();
+        for cf_root in self.cf_roots() {
+            let cf_dir = cf_root.join(cf.name());
+            if cf_dir.exists() {
+                files.extend(list_sst_files(&cf_dir)?);
+            }
+        }
+        let previous_next = self.next_file.get(&cf).copied().unwrap_or(1);
+        self.load_cf_level(cf, files)?;
+        let next = self.next_file.entry(cf).or_insert(1);
+        *next = (*next).max(previous_next);
+        Ok(())
+    }
+
     fn load_cf_level(&mut self, cf: ColumnFamily, mut files: Vec<PathBuf>) -> Result<()> {
         sort_ssts_by_sequence(&mut files)?;
         files.dedup();
@@ -100,7 +122,26 @@ fn load_level_for_cf(cf: ColumnFamily, files: Vec<PathBuf>) -> Result<SstLevel> 
 }
 
 fn eager_lookup_on_open(cf: ColumnFamily) -> bool {
-    matches!(cf, ColumnFamily::Base)
+    // Base and slot CFs are the high-volume point-read surfaces. Retain their
+    // exact validated key/offset indexes once so Bloom candidates never
+    // reopen and whole-file validate large immutable SSTs per requested row.
+    matches!(cf, ColumnFamily::Base) || cf.is_slot()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use calyx_core::SlotId;
+
+    #[test]
+    fn eager_exact_lookup_covers_base_and_both_slot_families_only() {
+        let slot = SlotId::new(11);
+        assert!(eager_lookup_on_open(ColumnFamily::Base));
+        assert!(eager_lookup_on_open(ColumnFamily::slot(slot)));
+        assert!(eager_lookup_on_open(ColumnFamily::slot_raw(slot)));
+        assert!(!eager_lookup_on_open(ColumnFamily::Ledger));
+        assert!(!eager_lookup_on_open(ColumnFamily::Anchors));
+    }
 }
 
 /// Lists SST files in a CF directory, failing closed on any `*.sst` file

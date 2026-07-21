@@ -12,7 +12,9 @@ use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{CalyxError, FixedClock};
 use proptest::prelude::*;
 
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use fsv_support::vault_id;
 
 #[test]

@@ -4,8 +4,16 @@
 //! out simplex cross mapping, and directional evidence from convergence plus
 //! final cross-map skill. It is not a general nonlinear causal discovery stack.
 
+use std::cmp::Ordering;
+
 use calyx_core::{CalyxError, Result};
+
+mod cuda;
+
+use self::cuda::convergent_cross_mapping_cuda_strict_impl;
 use serde::{Deserialize, Serialize};
+
+use crate::cuda_strict::strict_cuda_requested;
 
 pub const DEFAULT_CCM_EMBEDDING_DIM: usize = 3;
 pub const DEFAULT_CCM_TAU: usize = 1;
@@ -86,6 +94,9 @@ pub fn convergent_cross_mapping(
     y: &[f32],
     config: &CcmConfig,
 ) -> Result<CcmReport> {
+    if strict_cuda_requested() {
+        return convergent_cross_mapping_cuda_strict(x_name, x, y_name, y, config);
+    }
     let effective_points = validate_ccm_inputs(x_name, x, y_name, y, config)?;
     let x_to_y = cross_map_direction(
         x_name,
@@ -127,6 +138,16 @@ pub fn convergent_cross_mapping(
         y_manifold_to_x: y_to_x,
         verdict,
     })
+}
+
+pub fn convergent_cross_mapping_cuda_strict(
+    x_name: &str,
+    x: &[f32],
+    y_name: &str,
+    y: &[f32],
+    config: &CcmConfig,
+) -> Result<CcmReport> {
+    convergent_cross_mapping_cuda_strict_impl(x_name, x, y_name, y, config)
 }
 
 fn validate_ccm_inputs(
@@ -277,14 +298,34 @@ fn simplex_skill(
                 distances.push((euclidean_distance(&embedding[i], &embedding[j]), j));
             }
         }
-        distances.select_nth_unstable_by(neighbor_count - 1, |a, b| a.0.total_cmp(&b.0));
-        distances[..neighbor_count].sort_by(|a, b| a.0.total_cmp(&b.0));
+        distances.select_nth_unstable_by(neighbor_count - 1, compare_neighbor);
+        distances[..neighbor_count].sort_by(compare_neighbor);
         let nearest = &distances[..neighbor_count];
         let prediction = simplex_prediction(nearest, target)?;
         predictions.push(prediction);
         actual.push(target[i]);
     }
     pearson_r(&predictions, &actual)
+}
+
+fn compare_neighbor(left: &(f64, usize), right: &(f64, usize)) -> Ordering {
+    left.0
+        .total_cmp(&right.0)
+        .then_with(|| left.1.cmp(&right.1))
+}
+
+#[cfg(feature = "cuda")]
+fn flatten_embedding(values: &[Vec<f32>]) -> Result<Vec<f32>> {
+    let dim = values.first().map_or(0, Vec::len);
+    let len = values
+        .len()
+        .checked_mul(dim)
+        .ok_or_else(|| CalyxError::forge_vram_budget("CCM flat embedding length overflow"))?;
+    let mut flat = Vec::with_capacity(len);
+    for row in values {
+        flat.extend_from_slice(row);
+    }
+    Ok(flat)
 }
 
 fn simplex_prediction(nearest: &[(f64, usize)], target: &[f32]) -> Result<f32> {

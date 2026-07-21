@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId,
     SlotVector,
@@ -9,9 +12,6 @@ use calyx_sextant::{
 };
 use calyx_ward::{GuardPolicy, GuardProfile, NoveltyAction};
 use serde_json::json;
-
-#[path = "sextant_support/mod.rs"]
-mod sextant_support;
 use sextant_support::{
     cx_u8_fill as cx, default_vault_id as vault, dense, guarded_test_guard_id as guard_id,
     write_named_json as write_json,

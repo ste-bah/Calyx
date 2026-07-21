@@ -1,9 +1,5 @@
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-
-#[path = "fsv_support/mod.rs"]
-mod fsv_support;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
 use calyx_anneal::{
     ArtifactKey, ArtifactPtr, AsterRollbackStorage, CALYX_ANNEAL_CHANGE_COMMITTED,
     CALYX_ANNEAL_INVALID_ROLLBACK_STATE, CALYX_ANNEAL_UNKNOWN_CHANGE_ID, ChangeId, RollbackStore,
@@ -14,6 +10,9 @@ use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::FixedClock;
 use fsv_support::{hex_bytes, vault_id, write_json, write_manifest};
 use serde_json::json;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 const FSV_TS: u64 = 1_785_500_396;
 

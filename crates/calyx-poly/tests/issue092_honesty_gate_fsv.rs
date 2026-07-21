@@ -19,8 +19,8 @@ use calyx_poly::forecast_ceiling::ERR_CEILING_INPUT;
 use calyx_poly::superiority::SuperiorityTiers;
 use serde_json::{Value, json};
 
-#[path = "fsv_support.rs"]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 use support::{
     collect_files, known_healthy_market_integrity, known_healthy_oracle_risk,
     known_healthy_wash_trade, named_fsv_root, reset_dir, write_blake3sums, write_json,

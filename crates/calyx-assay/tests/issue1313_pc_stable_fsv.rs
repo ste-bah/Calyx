@@ -6,6 +6,7 @@ use calyx_assay::{PcSeries, pc_stable_gaussian};
 use calyx_aster::cf::{CfRouter, ColumnFamily};
 use serde_json::json;
 
+#[path = "issue1313_support/mod.rs"]
 mod issue1313_support;
 
 use issue1313_support::{

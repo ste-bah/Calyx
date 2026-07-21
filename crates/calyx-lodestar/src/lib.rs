@@ -42,8 +42,9 @@ pub mod vault_kernel;
 
 pub use aster_bridge::{
     ASTER_ASSOC_METADATA_KEY, AsterAssocMetadata, AsterAssocNodeProps, AsterAssocSnapshot,
-    AsterSummarizeRequest, DEFAULT_ASTER_ASSOC_COLLECTION, PhysicalAsterAssocSnapshot,
-    encode_assoc_node_props, summarize_vault_as_of, summarize_vault_latest, write_assoc_metadata,
+    AsterSummarizeRequest, DEFAULT_ASTER_ASSOC_COLLECTION, PANEL_ASTER_ASSOC_COLLECTION,
+    PhysicalAsterAssocSnapshot, encode_assoc_node_props, summarize_vault_as_of,
+    summarize_vault_latest, write_assoc_metadata,
 };
 pub use blind_spot_sweep::{
     BLIND_SPOT_SWEEP_SCHEMA_VERSION, BlindSpotCandidate, BlindSpotGateVerdict, BlindSpotNeighbor,
@@ -106,8 +107,15 @@ pub use incremental::{IncrementalKernelEval, IncrementalResult, NodeAddEdge};
 pub use kernel::{
     GroundednessReport, Kernel, KernelParams, RecallReport, build_kernel_pipeline,
     build_kernel_pipeline_with_frequency, refine_kernel_with_recall_support,
+    seal_completed_kernel_identity,
 };
-pub use kernel_answer::{AnswerHop, AnswerPath, kernel_answer, kernel_answer_with_ledger};
+pub use kernel_answer::{
+    AnswerDerivation, AnswerDerivationHop, AnswerHop, AnswerPath, AsterKernelAnswerRequest,
+    AsterPanelKernelAnswerRequest, derive_kernel_answer, derive_panel_kernel_answer, kernel_answer,
+    kernel_answer_derivation_hash, kernel_answer_derivation_hash_v2_legacy,
+    kernel_answer_with_aster_ledger, kernel_answer_with_ledger,
+    panel_kernel_answer_with_aster_ledger,
+};
 pub use kernel_graph::{
     KernelGraph, KernelGraphParams, KernelNodeScore, LpRoundParams, NodeScore,
     groundedness_distance, lp_round_kernel_graph, lp_round_kernel_graph_from_solution,
@@ -119,8 +127,12 @@ pub use kernel_health::{
     write_kernel_artifact,
 };
 pub use kernel_index::{
-    EmbeddingStore, FsKernelStore, KernelIndex, KernelStore, KernelVectorRow, build_kernel_index,
-    kernel_search, load_kernel_index, write_kernel_index,
+    EmbeddingStore, FsKernelStore, KernelIndex, KernelStore, KernelVectorRow, PANEL_RRF_K,
+    PanelFusionHit, PanelFusionLane, PanelKernelIndex, PanelKernelVectorRow, PanelVectors,
+    build_kernel_index, build_panel_kernel_index, kernel_search, load_kernel_index,
+    load_panel_kernel_index, panel_full_topk_support_set, panel_kernel_recall_gate,
+    panel_kernel_recall_test, panel_kernel_search, panel_rank_stabilization_support_set,
+    rank_panel_candidate_refs, rank_panel_candidates, write_kernel_index, write_panel_kernel_index,
 };
 pub use label_propagation::{
     CALYX_PROP_GRAPH_EMPTY, CALYX_PROP_INVALID_INPUT, CALYX_PROP_NO_KERNEL_NODES,
@@ -151,8 +163,9 @@ pub use probe_matrix::{
     ProbeResponse, ProbeVariant, build_probe_matrix, run_probe_matrix,
 };
 pub use provenance::{
-    AnswerHopEvidence, KernelBuildReceipt, append_answer_hop_entry, append_kernel_build_entry,
-    build_kernel_pipeline_with_ledger, kernel_members_hash,
+    AnswerHopEvidence, KernelAnswerRecordContext, KernelAnswerSourceEvidence,
+    KernelAnswerSourceSupport, KernelBuildReceipt, append_answer_hop_entry,
+    append_kernel_build_entry, build_kernel_pipeline_with_ledger, kernel_members_hash,
 };
 pub use ranked_hypotheses::{
     RANKED_HYPOTHESIS_SCHEMA_VERSION, RankedHypothesis, RankedHypothesisParams,

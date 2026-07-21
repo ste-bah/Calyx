@@ -9,6 +9,12 @@ use crate::frozen::NormPolicy;
 use crate::runtime::common::normalize_unit;
 use crate::runtime::onnx::PoolingPolicy;
 
+#[cfg(feature = "cuda")]
+mod device;
+
+#[cfg(feature = "cuda")]
+pub(super) use device::vectors_from_device_output;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CustomOutput {
     Dense {
@@ -88,7 +94,7 @@ pub(super) fn vectors_from_output(
     }
 }
 
-pub(in crate::runtime::onnx) fn pooling_from_config(path: &Path) -> Result<PoolingPolicy> {
+pub(crate) fn pooling_from_config(path: &Path) -> Result<PoolingPolicy> {
     let value = validate_config(path)?;
     let Some(raw) = value
         .get("pooling")

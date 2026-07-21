@@ -211,7 +211,7 @@ fn fail_closed_error_codes_are_exact() {
 
 /// manual FSV: writes the byte-readback SoT JSON. Run with
 /// `CALYX_FSV_ROOT=/var/lib/calyx/data/fsv-issue584-periodicity \
-///  cargo test -p calyx-assay --test periodicity_fsv -- --ignored --nocapture`
+///  cargo test -p calyx-assay --test __calyx_integration_isolated_periodicity_fsv periodicity_fsv -- --ignored --nocapture`
 #[test]
 #[ignore = "manual FSV writes periodicity source-of-truth readbacks"]
 fn periodicity_manual_fsv() {

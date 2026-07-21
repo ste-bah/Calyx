@@ -8,7 +8,7 @@ use crate::compaction::{
 };
 use crate::mvcc::is_tombstone_value;
 use crate::recurrence::{StoredRecurrenceRow, decode_recurrence_row};
-use crate::sst::SstReader;
+use crate::sst::{invalidate_reader, shared_reader};
 use crate::storage_names::{SstName, classify_sst};
 use calyx_core::{CalyxError, Clock, Result};
 use std::fs;
@@ -66,6 +66,10 @@ where
                 ensure_reclaim_outputs_manifest_bounded(&report.output_paths, durable_seq)?;
                 report.reclaimed_input_files = reclaim_recurrence_inputs(report)?;
                 prune_recurrence_tombstones(report)?;
+                // The resident router level still references the deleted
+                // input SSTs; rebuild it from disk so live reads stop
+                // touching reclaimed files.
+                self.rows.reload_router_cf_level(cf)?;
             }
             Ok(result)
         })
@@ -110,6 +114,9 @@ where
         }
         for cf in unique {
             purge_tombstoned_cf_once(durable.root(), durable.tiering_policy(), cf, durable_seq)?;
+            // See compact_cf_once: the reclaim above deleted input SSTs the
+            // resident router level may still reference.
+            self.rows.reload_router_cf_level(cf)?;
         }
         Ok(())
     }
@@ -208,6 +215,10 @@ fn reclaim_compaction_inputs(report: &crate::compaction::CompactionReport) -> Re
         if classify_sst(&input)?.is_none() {
             continue;
         }
+        // Drop any cached shared reader first. On Windows an active mapping
+        // keeps DeleteFile failing (fail-closed, same as before this cache);
+        // invalidating shrinks that window to reads still holding a clone.
+        invalidate_reader(&input);
         fs::remove_file(&input).map_err(|error| {
             CalyxError::disk_pressure(format!(
                 "reclaim compaction input {}: {error}",
@@ -238,6 +249,9 @@ fn reclaim_recurrence_inputs(report: &crate::compaction::CompactionReport) -> Re
         if input.extension().and_then(|value| value.to_str()) != Some("sst") {
             continue;
         }
+        // See reclaim_compaction_inputs: invalidate before delete so a live
+        // mapping cannot block reclaim beyond in-flight reads.
+        invalidate_reader(&input);
         fs::remove_file(&input).map_err(|error| {
             CalyxError::disk_pressure(format!(
                 "reclaim recurrence compaction input {}: {error}",
@@ -292,7 +306,7 @@ fn rewrite_compacted_without(
     let mut pruned = 0_u64;
     let original_outputs = report.output_paths.clone();
     for output_path in &original_outputs {
-        for entry in SstReader::open(output_path)?.iter()? {
+        for entry in shared_reader(output_path)?.iter()? {
             if should_prune(&entry.value)? {
                 pruned += 1;
             }
@@ -308,7 +322,7 @@ fn rewrite_compacted_without(
     let mut retained = 0_u64;
     let mut logical_bytes = 0_u64;
     for output_path in &original_outputs {
-        for entry in SstReader::open(output_path)?.iter()? {
+        for entry in shared_reader(output_path)?.iter()? {
             if should_prune(&entry.value)? {
                 continue;
             }
@@ -320,6 +334,10 @@ fn rewrite_compacted_without(
     let summaries = writer.finish(retained == 0)?;
 
     for output_path in &original_outputs {
+        // These pre-rewrite outputs may have been opened via the shared reader
+        // cache (e.g. by a concurrent read); invalidate before deleting so a
+        // live mapping cannot block the rewrite's reclaim.
+        invalidate_reader(output_path);
         fs::remove_file(output_path).map_err(|error| {
             CalyxError::disk_pressure(format!(
                 "remove {reason} compaction file {}: {error}",

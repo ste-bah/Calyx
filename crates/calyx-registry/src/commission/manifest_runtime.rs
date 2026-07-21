@@ -4,7 +4,8 @@ use calyx_core::{CalyxError, Result};
 
 use super::algorithmic_manifest::algorithmic_kind;
 use super::manifest::{LensForgeManifest, VerifiedFile, modality_token};
-use crate::spec::{FastembedBgem3Output, LensRuntime};
+use crate::runtime::qwen3::DEFAULT_QWEN3_MAX_TOKENS;
+use crate::spec::{Bgem3Engine, FastembedBgem3Output, LensRuntime};
 
 pub(super) fn runtime_from_manifest(
     manifest: &LensForgeManifest,
@@ -38,16 +39,37 @@ pub(super) fn runtime_from_manifest(
             manifest,
             files,
             FastembedBgem3Output::Dense,
+            Bgem3Engine::FastembedCpu,
         )),
         "fastembed-bgem3-sparse" => Ok(fastembed_bgem3_runtime(
             manifest,
             files,
             FastembedBgem3Output::Sparse,
+            Bgem3Engine::FastembedCpu,
         )),
         "fastembed-bgem3-colbert" => Ok(fastembed_bgem3_runtime(
             manifest,
             files,
             FastembedBgem3Output::Colbert,
+            Bgem3Engine::FastembedCpu,
+        )),
+        "onnx-bgem3-dense" => Ok(fastembed_bgem3_runtime(
+            manifest,
+            files,
+            FastembedBgem3Output::Dense,
+            Bgem3Engine::OnnxCuda,
+        )),
+        "onnx-bgem3-sparse" => Ok(fastembed_bgem3_runtime(
+            manifest,
+            files,
+            FastembedBgem3Output::Sparse,
+            Bgem3Engine::OnnxCuda,
+        )),
+        "onnx-bgem3-colbert" => Ok(fastembed_bgem3_runtime(
+            manifest,
+            files,
+            FastembedBgem3Output::Colbert,
+            Bgem3Engine::OnnxCuda,
         )),
         "fastembed-reranker" => Ok(LensRuntime::FastembedReranker {
             model_id: manifest.source_hf_id.clone(),
@@ -57,6 +79,7 @@ pub(super) fn runtime_from_manifest(
             model_id: manifest.source_hf_id.clone(),
             files,
             dtype: manifest.dtype.clone(),
+            max_tokens: manifest.max_tokens.unwrap_or(DEFAULT_QWEN3_MAX_TOKENS),
         }),
         "candle" | "candle-fp16" | "candle-local" => Ok(LensRuntime::CandleLocal {
             model_id: manifest.source_hf_id.clone(),
@@ -105,11 +128,13 @@ fn fastembed_bgem3_runtime(
     manifest: &LensForgeManifest,
     files: Vec<PathBuf>,
     output: FastembedBgem3Output,
+    engine: Bgem3Engine,
 ) -> LensRuntime {
     LensRuntime::FastembedBgem3 {
         model_id: manifest.source_hf_id.clone(),
         files,
         output,
+        engine,
     }
 }
 

@@ -1,8 +1,10 @@
 #![cfg(target_os = "linux")]
 
-mod fsv_support;
-#[path = "soak_ph58/serving.rs"]
-mod ph58_serving;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
+
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
+// calyx-shared-module: path=soak_ph58/serving.rs alias=__calyx_shared_soak_ph58_serving_rs local=ph58_serving visibility=private
+use crate::__calyx_shared_soak_ph58_serving_rs as ph58_serving;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::gc::{

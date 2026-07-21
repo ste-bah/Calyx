@@ -1,8 +1,7 @@
 //! Issue #73 - per-domain Loom + Graph CF build job.
 
-#[path = "fsv_support.rs"]
-#[allow(dead_code)]
-mod support;
+// calyx-shared-module: path=fsv_support.rs alias=__calyx_shared_fsv_support_rs local=support visibility=private
+use crate::__calyx_shared_fsv_support_rs as support;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -370,10 +369,11 @@ fn clock() -> FixedClock {
 }
 
 fn issue73_root() -> PathBuf {
-    if let Some(path) = std::env::var_os("POLY_ISSUE73_FSV_ROOT") {
-        return PathBuf::from(path);
-    }
-    repo_root().join("target/fsv/issue73_domain_graph_build_job_20260707")
+    calyx_fsv::fsv_root_or_target(
+        "POLY_ISSUE73_FSV_ROOT",
+        "issue73-domain-graph-build-job",
+        || repo_root().join("target/fsv/issue73_domain_graph_build_job_20260707"),
+    )
 }
 
 fn repo_root() -> PathBuf {

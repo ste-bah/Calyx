@@ -9,8 +9,8 @@ use calyx_core::{
 };
 use calyx_sextant::index::spann::centroids::SpannCentroidIndex;
 
-#[path = "../sextant_support/mod.rs"]
-mod sextant_support;
+// calyx-shared-module: path=sextant_support/mod.rs alias=__calyx_shared_sextant_support_mod_rs local=sextant_support visibility=private
+use crate::__calyx_shared_sextant_support_mod_rs as sextant_support;
 pub(crate) use sextant_support::{cx_usize_be, hex};
 
 pub(crate) fn fsv_roots() -> (PathBuf, Option<PathBuf>) {

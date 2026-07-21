@@ -64,7 +64,9 @@ pub use temporal::{
     RecurrenceBoostConfig, SequenceDirection, SequenceOptions, TemporalPolicy,
 };
 pub use time::{Clock, FixedClock, Seq, SystemClock, Ts};
-pub use traits::{Estimator, Index, Input, Lens, VaultStore};
+pub use traits::{
+    Estimator, GroupedLensRequest, Index, Input, Lens, MeasurementGroupKey, VaultStore,
+};
 
 #[cfg(test)]
 mod tests {

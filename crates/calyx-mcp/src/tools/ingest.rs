@@ -33,6 +33,7 @@ use self::input_retention::{input_hash, retained_text_input};
 use self::report::constellation_report;
 use super::vault::now_ms;
 use super::vault::store::{ResolvedVault, home_dir, resolve_vault_info, vault_salt};
+use crate::tools::search_generation::publish_search_generation;
 
 const DEFAULT_ANCHOR_SOURCE: &str = "calyx-mcp";
 
@@ -128,6 +129,11 @@ impl Tool for AnchorTool {
         validate_confidence(anchor.confidence)?;
         let ledger_seq = append_anchor_ledger(&vault, cx_id, &kind, anchor)?;
         vault.flush()?;
+        publish_search_generation(
+            &resolved.path,
+            &vault,
+            &load_vault_panel_state(&resolved.path)?,
+        )?;
         Ok(json!({
             "status": "anchored",
             "cx_id": cx_id.to_string(),
@@ -290,6 +296,7 @@ fn ingest_prepared_inputs(
         });
     }
     vault.flush()?;
+    publish_search_generation(&resolved.path, &vault, &state)?;
     Ok(reports)
 }
 

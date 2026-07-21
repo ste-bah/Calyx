@@ -40,6 +40,8 @@ models:
     norm: l2
     dim: 768
     license: apache-2.0
+    provider: cuda_fail_loud
+    max_batch: 32
 
   - name: audio-clap-htsat-adapter
     hf_id: laion/clap-htsat-unfused
@@ -49,6 +51,8 @@ models:
     norm: l2
     dim: 512
     license: apache-2.0
+    provider: cuda_fail_loud
+    max_batch: 32
 
   - name: protein-esm2-t6-8m-adapter
     hf_id: facebook/esm2_t6_8M_UR50D
@@ -58,6 +62,8 @@ models:
     norm: l2
     dim: 320
     license: mit
+    provider: cuda_fail_loud
+    max_batch: 32
 
   - name: dna-dnabert2-117m-adapter
     hf_id: zhihan1996/DNABERT-2-117M
@@ -67,6 +73,8 @@ models:
     norm: l2
     dim: 768
     license: apache-2.0
+    provider: cuda_fail_loud
+    max_batch: 32
 
   - name: molecule-chemberta-zinc-adapter
     hf_id: seyonec/ChemBERTa-zinc-base-v1
@@ -76,3 +84,5 @@ models:
     norm: l2
     dim: 768
     license: mit
+    provider: cuda_fail_loud
+    max_batch: 32

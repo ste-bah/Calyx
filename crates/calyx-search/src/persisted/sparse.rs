@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,8 +16,13 @@ use super::pinned::{self, PinKey};
 use super::{SearchIndexEntry, rel, sha256_hex, stale, write_json_atomic_hashed};
 use crate::error::CliResult;
 
+#[path = "sparse/cuda.rs"]
+mod cuda;
+
 const SPARSE_FORMAT: &str = "calyx-search-sparse-index-v2";
 const PIN_KIND: &str = "sparse_inverted";
+const DEFAULT_CUDA_MIN_DOCS: usize = 16_384;
+const CUDA_MIN_DOCS_ENV: &str = "CALYX_SEARCH_SPARSE_CUDA_MIN_DOCS";
 
 #[derive(Clone, Debug)]
 pub(super) struct SparseSlotRows {
@@ -149,7 +155,31 @@ pub(super) fn search(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
+    if (index.rows.len() >= cuda_min_docs() || cuda::strict_mode())
+        && let Some(scored) =
+            cuda::score_cuda_topk(vault_dir, entry, slot, &index, entries, k, candidates)?
+    {
+        crate::engine_slot_fanout::record_slot_serving_detail(format!(
+            "slot_backend=cuda-sparse-bm25 slot_compute_placement=cuda:0 source_rows={} candidate_rows={}",
+            index.rows.len(),
+            candidates.map_or(index.rows.len(), BTreeSet::len)
+        ));
+        return Ok(ranked(scored));
+    }
+    crate::engine_slot_fanout::record_slot_serving_detail(format!(
+        "slot_backend=sparse-bm25-cpu-v2 slot_compute_placement=cpu:bounded-bm25 source_rows={} candidate_rows={}",
+        index.rows.len(),
+        candidates.map_or(index.rows.len(), BTreeSet::len)
+    ));
     Ok(ranked(top_k(score(&index, entries, candidates)?, k)))
+}
+
+fn cuda_min_docs() -> usize {
+    env::var(CUDA_MIN_DOCS_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CUDA_MIN_DOCS)
 }
 
 type SparsePinCache = Mutex<BTreeMap<(String, u16), (String, Arc<SparseIndex>)>>;

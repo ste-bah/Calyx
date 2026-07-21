@@ -16,8 +16,8 @@ use super::support::{SearchReadSnapshot, index_freshness_tag};
 use super::{SearchBudget, SearchFreshness};
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
-    vault: &AsterVault,
+pub(super) fn hydrate_hit_docs_with_bounded_readbacks<'a>(
+    vault: &'a AsterVault,
     vault_dir: &Path,
     indexes: &PersistedSearchIndexes,
     hits: &[Hit],
@@ -25,45 +25,22 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
     hydrate_hit_slots: bool,
     trace: &mut SearchTracer<'_>,
     budget: &mut SearchBudget<'_>,
-) -> CliResult<(BTreeMap<CxId, Constellation>, FreshnessTag)> {
+) -> CliResult<(
+    BTreeMap<CxId, Constellation>,
+    FreshnessTag,
+    SearchReadSnapshot<'a>,
+)> {
+    let read = pin_search_readback(vault, trace, "search_hit_readback", None, 0);
     if hits.is_empty() {
         budget.check("empty_hit_set", 0)?;
-        let read = pin_search_readback(vault, trace, "empty_hit_set", None, 0);
         let freshness_tag = verify_index_freshness(indexes, &read, freshness, trace)?;
-        return Ok((BTreeMap::new(), freshness_tag));
+        return Ok((BTreeMap::new(), freshness_tag, read));
     }
 
     let mut docs = BTreeMap::new();
-    let mut expected_seq = None;
-    let mut freshness_tag = None;
+    let freshness_tag = verify_index_freshness(indexes, &read, freshness, trace)?;
     for (hit_index, hit) in hits.iter().enumerate() {
         budget.check("before_hit_doc_hydration", hit_index)?;
-        let read = pin_search_readback(
-            vault,
-            trace,
-            "hit_doc_hydration",
-            Some(hit.cx_id),
-            hit_index + 1,
-        );
-        if let Some(seq) = expected_seq {
-            if read.seq() != seq {
-                return Err(calyx_core::CalyxError::stale_derived(format!(
-                    "vault advanced during search hit hydration: initial pinned seq {seq}, \
-                     hit_index={hit_index}, cx_id={}, new pinned seq {}, search index base seq {}; \
-                     refusing to mix index hits with a newer Base snapshot",
-                    hit.cx_id,
-                    read.seq(),
-                    indexes.base_seq()
-                ))
-                .into());
-            }
-        } else {
-            expected_seq = Some(read.seq());
-        }
-        let tag = verify_index_freshness(indexes, &read, freshness, trace)?;
-        if freshness_tag.is_none() {
-            freshness_tag = Some(tag);
-        }
         trace.emit_detail(
             "hit_doc.hydrate.start",
             None,
@@ -117,13 +94,7 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
             )),
         );
     }
-
-    let tag = freshness_tag.ok_or_else(|| {
-        calyx_core::CalyxError::stale_derived(
-            "search hydration produced hits but no verified freshness tag",
-        )
-    })?;
-    Ok((docs, tag))
+    Ok((docs, freshness_tag, read))
 }
 
 fn hit_slots_key(hit: &Hit) -> String {

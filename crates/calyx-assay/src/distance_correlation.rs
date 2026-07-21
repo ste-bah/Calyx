@@ -24,6 +24,12 @@ use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(feature = "cuda"))]
+use crate::cuda_strict::cuda_unavailable;
+#[cfg(feature = "cuda")]
+use crate::cuda_strict::deterministic_permutations;
+use crate::cuda_strict::strict_cuda_requested;
+
 /// Minimum paired observations for a defined dCor permutation test.
 pub const MIN_DCOR_SAMPLES: usize = 4;
 /// Default permutation count for the dCor independence test.
@@ -72,12 +78,18 @@ pub struct DcorTest {
 
 /// Distance correlation point estimate over paired samples.
 pub fn distance_correlation(x: &[f32], y: &[f32]) -> Result<DcorReport> {
+    if strict_cuda_requested() {
+        return distance_correlation_cuda_strict(x, y);
+    }
     let (report, _, _) = distance_correlation_inner(x, y)?;
     Ok(report)
 }
 
 /// Distance correlation with a permutation-test p-value for independence.
 pub fn distance_correlation_test(x: &[f32], y: &[f32], config: DcorPermConfig) -> Result<DcorTest> {
+    if strict_cuda_requested() {
+        return distance_correlation_test_cuda_strict(x, y, config);
+    }
     if config.permutations == 0 {
         return Err(CalyxError::assay_insufficient_samples(
             "dCor permutation test requires permutations > 0",
@@ -118,6 +130,87 @@ pub fn distance_correlation_test(x: &[f32], y: &[f32], config: DcorPermConfig) -
         seed: config.seed,
         n_samples: n,
     })
+}
+
+/// Strict CUDA dCor point estimate. This never falls back to CPU.
+pub fn distance_correlation_cuda_strict(x: &[f32], y: &[f32]) -> Result<DcorReport> {
+    distance_correlation_cuda_strict_impl(x, y)
+}
+
+/// Strict CUDA dCor permutation test. This never falls back to CPU.
+pub fn distance_correlation_test_cuda_strict(
+    x: &[f32],
+    y: &[f32],
+    config: DcorPermConfig,
+) -> Result<DcorTest> {
+    if config.permutations == 0 {
+        return Err(CalyxError::assay_insufficient_samples(
+            "dCor permutation test requires permutations > 0",
+        ));
+    }
+    distance_correlation_test_cuda_strict_impl(x, y, config)
+}
+
+#[cfg(feature = "cuda")]
+fn distance_correlation_cuda_strict_impl(x: &[f32], y: &[f32]) -> Result<DcorReport> {
+    let backend = calyx_forge::CudaBackend::new()
+        .map_err(|err| crate::cuda_strict::forge_to_calyx("dCor", err))?;
+    let result = calyx_forge::dcor_1d_host(backend.context(), x, y, None)
+        .map_err(|err| crate::cuda_strict::forge_to_calyx("dCor", err))?;
+    Ok(DcorReport {
+        dcor: result.dcor,
+        dcov2: result.dcov2,
+        dvar_x: result.dvar_x,
+        dvar_y: result.dvar_y,
+        n_samples: result.n_samples,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn distance_correlation_cuda_strict_impl(_x: &[f32], _y: &[f32]) -> Result<DcorReport> {
+    Err(cuda_unavailable("dCor"))
+}
+
+#[cfg(feature = "cuda")]
+fn distance_correlation_test_cuda_strict_impl(
+    x: &[f32],
+    y: &[f32],
+    config: DcorPermConfig,
+) -> Result<DcorTest> {
+    if x.len() != y.len() {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "dCor requires paired samples: x={} y={}",
+            x.len(),
+            y.len()
+        )));
+    }
+    let permutations = deterministic_permutations(x.len(), config.permutations, config.seed)?;
+    let backend = calyx_forge::CudaBackend::new()
+        .map_err(|err| crate::cuda_strict::forge_to_calyx("dCor", err))?;
+    let result = calyx_forge::dcor_1d_host(backend.context(), x, y, Some(&permutations))
+        .map_err(|err| crate::cuda_strict::forge_to_calyx("dCor", err))?;
+    let ge_count = result.ge_count.ok_or_else(|| {
+        CalyxError::forge_numerical_invariant("dCor CUDA did not return ge_count")
+    })?;
+    let p_value = (1.0 + ge_count as f64) / (1.0 + config.permutations as f64);
+    Ok(DcorTest {
+        dcor: result.dcor,
+        dcov2: result.dcov2,
+        p_value: p_value as f32,
+        permutations: config.permutations,
+        ge_count,
+        seed: config.seed,
+        n_samples: result.n_samples,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn distance_correlation_test_cuda_strict_impl(
+    _x: &[f32],
+    _y: &[f32],
+    _config: DcorPermConfig,
+) -> Result<DcorTest> {
+    Err(cuda_unavailable("dCor permutation test"))
 }
 
 /// Shared core: returns the report plus the double-centred distance matrices

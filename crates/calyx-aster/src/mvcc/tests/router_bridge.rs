@@ -105,6 +105,28 @@ fn latest_readback_merges_router_sst_with_wal_overlay_and_blocks_history() {
         end: None,
     };
     let physical_snapshot = latest_physical.pin_snapshot(Freshness::FreshDerived, &clock, 1_000);
+    let physical_reads = [
+        CfRead::new(ColumnFamily::Base, b"a".to_vec()),
+        CfRead::new(ColumnFamily::Base, b"missing".to_vec()),
+        CfRead::new(ColumnFamily::Base, b"gone".to_vec()),
+        CfRead::new(ColumnFamily::Base, b"a".to_vec()),
+    ];
+    let phases_before = latest_physical.batch_read_phase_counts();
+    assert_eq!(
+        latest_physical
+            .read_batch(physical_snapshot, &physical_reads, &clock)
+            .unwrap(),
+        [
+            Some(b"sst-a".to_vec()),
+            None,
+            Some(b"sst-gone".to_vec()),
+            Some(b"sst-a".to_vec()),
+        ]
+    );
+    let phases_after = latest_physical.batch_read_phase_counts();
+    assert_eq!(phases_after.0 - phases_before.0, 1);
+    assert_eq!(phases_after.1 - phases_before.1, 1);
+    assert_eq!(phases_after.2 - phases_before.2, 1);
     let physical_first = latest_physical
         .scan_cf_range_page_at(
             physical_snapshot,
@@ -209,6 +231,17 @@ fn latest_readback_merges_router_sst_with_wal_overlay_and_blocks_history() {
         .read_at(historical, ColumnFamily::Base, b"a", &clock)
         .unwrap_err();
     assert_eq!(error.code, "CALYX_ASTER_LATEST_ONLY_HISTORY_UNAVAILABLE");
+    let batch_error = latest
+        .read_batch(
+            historical,
+            &[CfRead::new(ColumnFamily::Base, b"missing".to_vec())],
+            &clock,
+        )
+        .unwrap_err();
+    assert_eq!(
+        batch_error.code,
+        "CALYX_ASTER_LATEST_ONLY_HISTORY_UNAVAILABLE"
+    );
     cleanup(dir);
 }
 
@@ -306,6 +339,56 @@ fn scan_cf_pages_matches_router_sst_only_scan() {
 
     assert_eq!(streamed, materialized);
     assert_eq!(streamed.len(), 3);
+    cleanup(dir);
+}
+
+#[test]
+fn latest_paging_does_not_stop_after_overlay_tombstones_exhaust_a_router_page() {
+    let dir = test_dir("router-page-overlay-tombstones");
+    let writer =
+        VersionedCfStore::new_with_router(0, CfRouter::open(&dir, 8 * 1024 * 1024).unwrap());
+    writer
+        .commit_batch([
+            (ColumnFamily::Base, b"a".to_vec(), vec![1; 2 * 1024 * 1024]),
+            (ColumnFamily::Base, b"b".to_vec(), vec![2; 2 * 1024 * 1024]),
+            (ColumnFamily::Base, b"c".to_vec(), vec![3; 2 * 1024 * 1024]),
+        ])
+        .unwrap();
+    writer.flush_all_cfs().unwrap();
+
+    let store = VersionedCfStore::new_with_router_latest_readback(
+        2,
+        CfRouter::open(&dir, 8 * 1024 * 1024).unwrap(),
+    );
+    store
+        .restore_batch(
+            2,
+            [
+                (ColumnFamily::Base, b"a".to_vec(), tombstone_value()),
+                (ColumnFamily::Base, b"aa".to_vec(), b"overlay-aa".to_vec()),
+                (ColumnFamily::Base, b"b".to_vec(), tombstone_value()),
+            ],
+        )
+        .unwrap();
+    let clock = FixedClock::new(100);
+    let snapshot = store.pin_snapshot(Freshness::FreshDerived, &clock, 1_000);
+
+    let pages = collect_cf_pages(&store, snapshot, &clock, 1);
+
+    assert_eq!(
+        pages,
+        [
+            (b"aa".to_vec(), b"overlay-aa".to_vec()),
+            (b"c".to_vec(), vec![3; 2 * 1024 * 1024]),
+        ]
+    );
+    eprintln!(
+        "ISSUE1799_PAGED_OVERLAY rows={} page_limit=1 first={} last={} large_value_bytes={}",
+        pages.len(),
+        String::from_utf8_lossy(&pages[0].0),
+        String::from_utf8_lossy(&pages[1].0),
+        pages[1].1.len()
+    );
     cleanup(dir);
 }
 

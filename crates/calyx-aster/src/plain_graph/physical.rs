@@ -52,6 +52,14 @@ impl PhysicalPlainGraph {
             .filter(|value| !is_tombstone_value(value)))
     }
 
+    /// Reads a graph metadata row from the latest physical SST/WAL view.
+    pub fn get_metadata(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .router
+            .get(ColumnFamily::Graph, &self.keys.metadata_key(name)?)?
+            .filter(|value| !is_tombstone_value(value)))
+    }
+
     pub fn get_edge(&self, src: CxId, edge_type: &str, dst: CxId) -> Result<Option<Vec<u8>>> {
         let key = self.keys.edge_out_key(src, edge_type, dst)?;
         Ok(self

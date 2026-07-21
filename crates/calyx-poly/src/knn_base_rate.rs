@@ -1,18 +1,17 @@
 //! kNN-of-resolved base rate (issue #81).
 //!
-//! For a live market, find its nearest **resolved** lookalikes in the Sextant vector index and read
-//! off their empirical YES-rate — the base rate a similar-market prior would assign. This composes
-//! the real `calyx_sextant::HnswIndex` (cosine similarity). The base rate uses the index's exact
-//! `brute_force` cosine kNN so the result is deterministic and free of ANN approximation error (the
-//! same index also serves the approximate `search` path in production). Fail closed on an empty
-//! corpus, a corpus smaller than `k`, a dimension mismatch, or a non-finite query.
+//! For a live market, find its nearest **resolved** lookalikes and read off their empirical
+//! YES-rate. CUDA builds use the shared bounded cuVS exact-kNN path; non-CUDA builds retain the
+//! deterministic reference implementation for parity tests.
 
-use calyx_core::{CxId, SlotId, SlotVector};
-use calyx_sextant::{HnswIndex, SextantIndex};
+use calyx_core::CxId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::error::{PolyError, Result};
+use crate::exact_knn::{
+    EXACT_KNN_MAX_DEVICE_K, EXACT_KNN_RERANK_GUARD_ROWS, ExactKnnExecution, exact_cosine_top_k,
+};
 
 /// The corpus was empty.
 pub const ERR_KNN_EMPTY_CORPUS: &str = "CALYX_POLY_KNN_EMPTY_CORPUS";
@@ -66,6 +65,15 @@ pub struct KnnNeighbor {
 
 /// Computes the kNN-of-resolved base rate for `query` over `corpus`.
 pub fn knn_base_rate(corpus: &[ResolvedExemplar], query: &[f32], k: usize) -> Result<KnnBaseRate> {
+    knn_base_rate_with_execution(corpus, query, k).map(|result| result.0)
+}
+
+/// Computes the base rate and returns exact-kNN execution telemetry for FSV/readback.
+pub fn knn_base_rate_with_execution(
+    corpus: &[ResolvedExemplar],
+    query: &[f32],
+    k: usize,
+) -> Result<(KnnBaseRate, ExactKnnExecution)> {
     if corpus.is_empty() {
         return Err(PolyError::diagnostics(
             ERR_KNN_EMPTY_CORPUS,
@@ -98,10 +106,8 @@ pub fn knn_base_rate(corpus: &[ResolvedExemplar], query: &[f32], k: usize) -> Re
         ));
     }
 
-    // Build the real Sextant index over the resolved corpus, and an id→outcome map.
-    let mut index = HnswIndex::new(SlotId::new(0), dim as u32, 0xB17E_5EED);
-    let mut outcome_by_id: BTreeMap<CxId, bool> = BTreeMap::new();
-    for (seq, ex) in corpus.iter().enumerate() {
+    let mut unique_by_id: BTreeMap<CxId, &ResolvedExemplar> = BTreeMap::new();
+    for ex in corpus {
         if ex.vector.len() != dim {
             return Err(PolyError::diagnostics(
                 ERR_KNN_DIM,
@@ -114,41 +120,50 @@ pub fn knn_base_rate(corpus: &[ResolvedExemplar], query: &[f32], k: usize) -> Re
                 format!("exemplar {} vector contains a non-finite value", ex.cx_id),
             ));
         }
-        index
-            .insert(
-                ex.cx_id,
-                SlotVector::Dense {
-                    dim: dim as u32,
-                    data: ex.vector.clone(),
-                },
-                seq as u64 + 1,
-            )
-            .map_err(|err| {
-                PolyError::diagnostics(ERR_KNN_DIM, format!("index insert failed: {err}"))
-            })?;
-        outcome_by_id.insert(ex.cx_id, ex.outcome_yes);
+        unique_by_id.insert(ex.cx_id, ex);
     }
 
-    // Exact cosine kNN (deterministic, no ANN error).
-    let hits = index.brute_force(query, k);
+    // HNSW insert replaced duplicate CxIds. Preserve that contract while avoiding an index build.
+    let ordered = unique_by_id.values().copied().collect::<Vec<_>>();
+    let needed = k.min(ordered.len());
+    let candidate_k = if needed > EXACT_KNN_MAX_DEVICE_K {
+        needed
+    } else {
+        needed
+            .saturating_add(EXACT_KNN_RERANK_GUARD_ROWS)
+            .min(ordered.len())
+            .min(EXACT_KNN_MAX_DEVICE_K)
+    };
+    let corpus_vectors = ordered
+        .iter()
+        .map(|row| row.vector.as_slice())
+        .collect::<Vec<_>>();
+    let query_vectors = [query];
+    let mut exact = exact_cosine_top_k(&corpus_vectors, &query_vectors, candidate_k, None)?;
+    exact.execution.shortlist_cpu_similarity_evaluations = exact.rankings[0].len() as u64;
+    let mut hits = exact.rankings[0]
+        .iter()
+        .map(|idx| (ordered[*idx], cosine(query, &ordered[*idx].vector)))
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cx_id.to_string().cmp(&right.0.cx_id.to_string()))
+    });
+    hits.truncate(needed);
     let mut neighbors = Vec::with_capacity(hits.len());
     let mut yes = 0usize;
     let mut sim_sum = 0.0f64;
-    for (cx_id, sim) in &hits {
-        let outcome = *outcome_by_id.get(cx_id).ok_or_else(|| {
-            PolyError::diagnostics(
-                ERR_KNN_MISSING_OUTCOME,
-                format!("neighbor {cx_id} has no outcome in the corpus map"),
-            )
-        })?;
-        if outcome {
+    for (row, sim) in &hits {
+        if row.outcome_yes {
             yes += 1;
         }
         sim_sum += (*sim as f64).clamp(0.0, 1.0);
         neighbors.push(KnnNeighbor {
-            cx_id: cx_id.to_string(),
+            cx_id: row.cx_id.to_string(),
             similarity: *sim,
-            outcome_yes: outcome,
+            outcome_yes: row.outcome_yes,
         });
     }
     let k_used = neighbors.len();
@@ -158,14 +173,33 @@ pub fn knn_base_rate(corpus: &[ResolvedExemplar], query: &[f32], k: usize) -> Re
     let count_sat = (k_used as f64 / 20.0).min(1.0);
     let reliability = (mean_similarity * count_sat).clamp(0.0, 1.0);
 
-    Ok(KnnBaseRate {
-        p_yes,
-        k: k_used,
-        n_corpus: corpus.len(),
-        neighbors,
-        mean_similarity,
-        reliability,
-    })
+    Ok((
+        KnnBaseRate {
+            p_yes,
+            k: k_used,
+            n_corpus: corpus.len(),
+            neighbors,
+            mean_similarity,
+            reliability,
+        },
+        exact.execution,
+    ))
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+    for (left, right) in a.iter().zip(b) {
+        dot += left * right;
+        norm_a += left * left;
+        norm_b += right * right;
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a.sqrt() * norm_b.sqrt())
+    }
 }
 
 #[cfg(test)]

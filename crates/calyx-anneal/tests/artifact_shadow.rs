@@ -9,8 +9,8 @@ use calyx_core::{CalyxError, FixedClock, Result};
 use calyx_ledger::MemoryLedgerStore;
 
 #[allow(dead_code)]
-#[path = "support/fsv_bad_change.rs"]
-mod support;
+// calyx-shared-module: path=support/fsv_bad_change.rs alias=__calyx_shared_support_fsv_bad_change_rs local=support visibility=private
+use crate::__calyx_shared_support_fsv_bad_change_rs as support;
 use support::{
     TEST_TS, artifact_key, budget_config, candidate_ptr, install_prior, memory_substrate, prior_ptr,
 };

@@ -1,10 +1,12 @@
 #![cfg(target_os = "linux")]
 
-mod fsv_support;
-#[path = "soak_ph58/serving.rs"]
-mod ph58_serving;
+// calyx-shared-module: path=fsv_support/mod.rs alias=__calyx_shared_fsv_support_mod_rs local=fsv_support visibility=private
 
-mod soak_ph58 {
+use crate::__calyx_shared_fsv_support_mod_rs as fsv_support;
+// calyx-shared-module: path=soak_ph58/serving.rs alias=__calyx_shared_soak_ph58_serving_rs local=ph58_serving visibility=private
+use crate::__calyx_shared_soak_ph58_serving_rs as ph58_serving;
+
+mod tests {
     use calyx_aster::cf::{CfRouter, ColumnFamily};
     use calyx_aster::gc::{
         CompactionGcReclaimer, GcRateLimit, VaultCompactionGcTarget, scan_tombstone_inventory,
@@ -17,39 +19,16 @@ mod soak_ph58 {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use super::fsv_support::{fsv_root_os, reset_dir};
-    use super::ph58_serving::live_base_readback_count;
+    use super::ph58_serving::{self, SharedClock, live_base_readback_count};
 
     const START_TS: Ts = 1_800_000_000_000;
     const BATCH: usize = 1_000;
     const FSV_MEMTABLE_BYTES: usize = 64 * 1024 * 1024;
-
-    #[derive(Clone, Debug)]
-    struct SharedClock {
-        now: Arc<AtomicU64>,
-    }
-
-    impl SharedClock {
-        fn new(now: Ts) -> Self {
-            Self {
-                now: Arc::new(AtomicU64::new(now)),
-            }
-        }
-
-        fn set(&self, now: Ts) {
-            self.now.store(now, Ordering::Relaxed);
-        }
-    }
-
-    impl Clock for SharedClock {
-        fn now(&self) -> Ts {
-            self.now.load(Ordering::Relaxed)
-        }
-    }
+    const JANITOR_HARNESS: &str = "__calyx_integration_suite_1";
+    const JANITOR_FILTER: &str = "issue486_janitor_fsv::issue486_janitor_manual_fsv_bytes";
 
     #[test]
     fn long_reader() {
@@ -76,6 +55,15 @@ mod soak_ph58 {
             "PH58_TOMBSTONE_ROOT={} elapsed_ms={}",
             root.display(),
             started.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    fn janitor_child_harness_matches_migration_map() {
+        ph58_serving::assert_janitor_harness_contract(
+            &repo_root(),
+            JANITOR_HARNESS,
+            JANITOR_FILTER,
         );
     }
 
@@ -233,10 +221,13 @@ mod soak_ph58 {
                 "-p",
                 "calyx-anneal",
                 "--test",
-                "issue486_janitor_fsv",
+                JANITOR_HARNESS,
+                JANITOR_FILTER,
                 "--",
                 "--ignored",
+                "--exact",
                 "--nocapture",
+                "--test-threads=1",
             ])
             .output()
             .expect("run calyx-anneal janitor FSV");
@@ -419,10 +410,15 @@ mod soak_ph58 {
     fn write_artifact(name: &str, value: &Value) {
         let root = fsv_root_os("CALYX_FSV_ROOT", "calyx-soak-ph58");
         fs::create_dir_all(&root).expect("create FSV root");
-        fs::write(root.join(name), serde_json::to_vec_pretty(value).unwrap()).unwrap();
-        let target = repo_root().join("target");
+        let bytes = serde_json::to_vec_pretty(value).unwrap();
+        fs::write(root.join(name), &bytes).unwrap();
+        let target = calyx_fsv::fsv_root_or_target(
+            "CALYX_PH58_ARTIFACT_ROOT",
+            "ph58-soak-artifacts",
+            || repo_root().join("target"),
+        );
         fs::create_dir_all(&target).expect("create target dir");
-        fs::write(target.join(name), serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        fs::write(target.join(name), bytes).unwrap();
     }
 
     fn tree_bytes(path: &Path) -> u64 {

@@ -1,6 +1,6 @@
 //! Slot vector representations.
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -80,7 +80,8 @@ fn validate_sparse(dim: u32, entries: &[SparseEntry]) -> Result<()> {
             "sparse slot dim must be greater than zero",
         ));
     }
-    let mut seen = BTreeSet::new();
+    let mut previous = None;
+    let mut strictly_increasing = true;
     for entry in entries {
         if entry.idx >= dim {
             return Err(record_schema_error(format!(
@@ -88,15 +89,31 @@ fn validate_sparse(dim: u32, entries: &[SparseEntry]) -> Result<()> {
                 entry.idx
             )));
         }
-        if !seen.insert(entry.idx) {
+        if previous == Some(entry.idx) {
             return Err(record_schema_error(format!(
                 "sparse slot index {} is duplicated",
                 entry.idx
             )));
         }
+        if previous.is_some_and(|index| index > entry.idx) {
+            strictly_increasing = false;
+        }
+        previous = Some(entry.idx);
         if !entry.val.is_finite() {
             return Err(record_schema_error(format!(
                 "sparse slot index {} is non-finite",
+                entry.idx
+            )));
+        }
+    }
+    if strictly_increasing {
+        return Ok(());
+    }
+    let mut seen = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        if !seen.insert(entry.idx) {
+            return Err(record_schema_error(format!(
+                "sparse slot index {} is duplicated",
                 entry.idx
             )));
         }

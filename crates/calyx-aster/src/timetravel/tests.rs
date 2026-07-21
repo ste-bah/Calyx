@@ -1,6 +1,7 @@
 use super::*;
 use crate::cf::ColumnFamily;
 use crate::timetravel::time_index::encode_key;
+use crate::vault::VaultOptions;
 use calyx_core::{
     Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, SlotVector, Ts,
     VaultId, VaultStore,
@@ -269,19 +270,20 @@ fn dropped_snapshot_releases_its_pin() {
 fn corrupt_time_index_key_fails_closed() {
     let vault = vault_at(0);
     ingest(&vault, b"c1", 1.0, 1000);
-    // Inject a malformed key directly into the CF. It is longer than a valid
-    // key, but sorts inside the as_of(1000) range so resolve must fail closed.
-    vault
+    let before = time_index::read_all(&vault).expect("read valid index");
+    // Raw TimeIndex mutation is forbidden at the commit boundary. This keeps
+    // malformed logical rows out of the source of truth rather than relying on
+    // every optimized reader to rediscover corruption later.
+    let error = vault
         .write_cf(
             ColumnFamily::TimeIndex,
-            vec![0u8; 17],
+            vec![0xff; 15],
             time_index::SENTINEL.to_vec(),
         )
-        .expect("inject corrupt key");
-    let err = time_index::read_all(&vault).unwrap_err();
-    assert_eq!(err.code, "CALYX_ASTER_CORRUPT_SHARD");
-    let err = vault.as_of(1000).unwrap_err();
-    assert_eq!(err.code, "CALYX_ASTER_CORRUPT_SHARD");
+        .expect_err("reserved TimeIndex mutation must fail closed");
+    assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
+    assert_eq!(time_index::read_all(&vault).unwrap(), before);
+    assert!(vault.as_of(u64::MAX).is_ok());
 }
 
 #[test]
@@ -295,4 +297,141 @@ fn time_index_has_one_entry_per_committed_seq() {
     assert_eq!(entries[1].millis, 2000);
     // Each entry's seqno resolves to a real snapshot.
     assert_eq!(encode_key(entries[0].millis, entries[0].seqno).len(), 16);
+}
+
+#[test]
+#[ignore = "manual full-state verification for issue #1533"]
+fn issue1533_manual_fsv_reads_bounded_predecessor_after_cold_reopen() {
+    let root = std::env::var_os("CALYX_ISSUE1533_FSV_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("set CALYX_ISSUE1533_FSV_ROOT to a fresh path");
+    assert!(!root.exists(), "FSV root must be fresh: {}", root.display());
+
+    let vault = AsterVault::new_durable_with_clock(
+        &root,
+        vault_id(),
+        b"issue1533-bounded-predecessor-fsv".to_vec(),
+        VaultOptions::default(),
+        StepClock::new(0),
+    )
+    .expect("open durable FSV vault");
+    let before = serde_json::json!({
+        "latest_seq": vault.latest_seq(),
+        "time_index_rows": read_all(&vault).expect("read empty index").len(),
+    });
+
+    let before_first_error = vault.as_of(0).expect_err("empty index has no predecessor");
+    let edge_empty_after = serde_json::json!({
+        "error_code": before_first_error.code,
+        "latest_seq": vault.latest_seq(),
+        "time_index_rows": read_all(&vault).expect("empty index remains readable").len(),
+    });
+
+    let c1 = ingest(&vault, b"issue1533-c1", 1.0, 1_000);
+    let before_boundary_error = vault
+        .as_of(999)
+        .expect_err("one millisecond before first commit has no predecessor");
+    let exact = vault
+        .as_of(1_000)
+        .expect("exact boundary resolves first row");
+    assert!(exact.get_cx(c1).is_ok());
+    let edge_boundary_after = serde_json::json!({
+        "before_error_code": before_boundary_error.code,
+        "exact_seq": exact.seqno(),
+        "exact_contains_c1": exact.get_cx(c1).is_ok(),
+        "time_index_rows": read_all(&vault).expect("read one row").len(),
+    });
+    drop(exact);
+
+    let c2 = ingest(&vault, b"issue1533-c2", 2.0, 2_000);
+    let middle = vault.as_of(1_500).expect("floor resolves first row");
+    assert!(middle.get_cx(c1).is_ok());
+    assert!(middle.get_cx(c2).is_err());
+    let committed_time_index = read_all(&vault)
+        .expect("read committed index")
+        .into_iter()
+        .map(|entry| serde_json::json!({ "millis": entry.millis, "seqno": entry.seqno }))
+        .collect::<Vec<_>>();
+    let happy_after = serde_json::json!({
+        "resolved_seq": middle.seqno(),
+        "contains_c1": middle.get_cx(c1).is_ok(),
+        "contains_c2": middle.get_cx(c2).is_ok(),
+        "time_index": committed_time_index,
+    });
+    drop(middle);
+
+    let max = vault
+        .as_of(u64::MAX)
+        .expect("maximum timestamp uses a non-overflowing predecessor target");
+    assert!(max.get_cx(c1).is_ok());
+    assert!(max.get_cx(c2).is_ok());
+    let edge_max_after = serde_json::json!({
+        "resolved_seq": max.seqno(),
+        "contains_c1": max.get_cx(c1).is_ok(),
+        "contains_c2": max.get_cx(c2).is_ok(),
+    });
+    drop(max);
+    vault
+        .flush()
+        .expect("flush time-index rows to physical SSTs");
+    drop(vault);
+
+    let reopened = AsterVault::open_with_clock(
+        &root,
+        vault_id(),
+        b"issue1533-bounded-predecessor-fsv".to_vec(),
+        VaultOptions::default(),
+        StepClock::new(2_001),
+    )
+    .expect("cold reopen durable FSV vault");
+    let reopened_snapshot = reopened
+        .as_of(1_500)
+        .expect("cold reopened predecessor resolves first row");
+    assert!(reopened_snapshot.get_cx(c1).is_ok());
+    assert!(reopened_snapshot.get_cx(c2).is_err());
+    let physical_time_index_files = std::fs::read_dir(root.join("cf").join("time_index"))
+        .expect("read physical TimeIndex directory")
+        .map(|entry| {
+            entry
+                .expect("physical TimeIndex entry")
+                .path()
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(!physical_time_index_files.is_empty());
+
+    let reopened_time_index = read_all(&reopened)
+        .expect("read cold reopened index")
+        .into_iter()
+        .map(|entry| serde_json::json!({ "millis": entry.millis, "seqno": entry.seqno }))
+        .collect::<Vec<_>>();
+    let report = serde_json::json!({
+        "issue": 1533,
+        "source_of_truth": root.display().to_string(),
+        "before": before,
+        "edge_empty_after": edge_empty_after,
+        "edge_boundary_after": edge_boundary_after,
+        "happy_after": happy_after,
+        "edge_max_after": edge_max_after,
+        "cold_reopen_after": {
+            "resolved_seq": reopened_snapshot.seqno(),
+            "contains_c1": reopened_snapshot.get_cx(c1).is_ok(),
+            "contains_c2": reopened_snapshot.get_cx(c2).is_ok(),
+            "time_index": reopened_time_index,
+        },
+        "physical_time_index_files": physical_time_index_files,
+    });
+    let report_path = root.join("issue1533-fsv.json");
+    std::fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&report).expect("encode FSV report"),
+    )
+    .expect("persist FSV report");
+    let readback: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&report_path).expect("read FSV report from source of truth"),
+    )
+    .expect("decode FSV report readback");
+    assert_eq!(readback, report);
+    eprintln!("ISSUE1533_FSV={report}");
 }

@@ -286,6 +286,8 @@ fn slot_kind(slot: &SlotVector) -> &'static str {
 }
 
 fn fsv_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../target/fsv/issue039_poly_panel_registry_20260705_001")
+    calyx_fsv::fsv_root_or_target("CALYX_FSV_ROOT", "issue039-poly-panel-registry", || {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/fsv/issue039_poly_panel_registry_20260705_001")
+    })
 }

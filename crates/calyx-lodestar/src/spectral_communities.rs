@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
 
 use calyx_core::CxId;
-use calyx_mincut::{eigenvector_centrality, laplacian_eigenmaps_with_max_iter, spectral_gap};
+use calyx_mincut::{
+    eigenvector_centrality, normalized_laplacian_eigenmaps_with_max_iter, spectral_gap,
+};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 
 use crate::{LodestarError, Result};
 
-pub const SPECTRAL_COMMUNITY_SCHEMA_VERSION: u32 = 1;
+mod clustering;
+
+pub const SPECTRAL_COMMUNITY_SCHEMA_VERSION: u32 = 2;
 const EDGE_WEIGHT: f32 = 0.50;
 const BRIDGE_CENTRALITY_WEIGHT: f32 = 0.35;
 const BRIDGE_FREQUENCY_WEIGHT: f32 = 0.15;
@@ -19,6 +23,8 @@ const CENTRALITY_FREQUENCY_WEIGHT: f32 = 0.10;
 pub struct SpectralCommunityParams {
     pub eigen_k: usize,
     pub eigen_max_iter: usize,
+    pub community_count: usize,
+    pub cluster_max_iter: usize,
     pub centrality_max_iter: usize,
     pub centrality_tol: f32,
     pub max_bridge_candidates: usize,
@@ -30,6 +36,8 @@ impl Default for SpectralCommunityParams {
         Self {
             eigen_k: 3,
             eigen_max_iter: 256,
+            community_count: 2,
+            cluster_max_iter: 100,
             centrality_max_iter: 128,
             centrality_tol: 1.0e-6,
             max_bridge_candidates: 32,
@@ -85,6 +93,11 @@ pub struct SpectralCommunityReport {
     pub schema_version: u32,
     pub node_count: usize,
     pub edge_count: usize,
+    pub assignment_method: String,
+    pub requested_communities: usize,
+    pub embedding_dimensions: usize,
+    pub cluster_iterations: usize,
+    pub cluster_inertia: f32,
     pub spectral_gap: f32,
     pub fiedler_eigenvalue: f32,
     pub eigenvalues: Vec<f32>,
@@ -100,12 +113,19 @@ pub fn spectral_community_report(
 ) -> Result<SpectralCommunityReport> {
     validate_params(params)?;
     let eigenmaps =
-        laplacian_eigenmaps_with_max_iter(graph, params.eigen_k, params.eigen_max_iter)?;
+        normalized_laplacian_eigenmaps_with_max_iter(graph, params.eigen_k, params.eigen_max_iter)?;
     if eigenmaps.len() < 2 {
         return Err(LodestarError::Graph {
             code: "CALYX_SPECTRAL_GRAPH_TOO_SMALL",
             message: "spectral community report requires at least two eigenmaps".to_string(),
         });
+    }
+    if graph.node_count() < params.community_count {
+        return invalid_params(format!(
+            "community_count {} exceeds graph node count {}",
+            params.community_count,
+            graph.node_count()
+        ));
     }
     let centrality = centrality_map(eigenvector_centrality(
         graph,
@@ -116,7 +136,19 @@ pub fn spectral_community_report(
     let max_frequency = max_frequency(graph);
     let degree_counts = degree_counts(graph);
     let max_degree = max_degree(&degree_counts);
-    let members = community_members(graph, &fiedler.eigenvector, &centrality, &degree_counts)?;
+    let clustering = clustering::deterministic_spectral_clusters(
+        graph,
+        &eigenmaps,
+        params.community_count,
+        params.cluster_max_iter,
+    )?;
+    let members = community_members(
+        graph,
+        &fiedler.eigenvector,
+        &clustering.assignments,
+        &centrality,
+        &degree_counts,
+    )?;
     let community_by_id = members
         .iter()
         .map(|member| (member.cx_id, member.community))
@@ -135,6 +167,11 @@ pub fn spectral_community_report(
         schema_version: SPECTRAL_COMMUNITY_SCHEMA_VERSION,
         node_count: graph.node_count(),
         edge_count: graph.edge_count(),
+        assignment_method: "normalized-laplacian-row-l2-farthest-first-lloyd-v2".to_string(),
+        requested_communities: params.community_count,
+        embedding_dimensions: params.community_count,
+        cluster_iterations: clustering.iterations,
+        cluster_inertia: clustering.inertia,
         spectral_gap: spectral_gap(&eigenmaps),
         fiedler_eigenvalue: fiedler.eigenvalue,
         eigenvalues: eigenmaps.iter().map(|pair| pair.eigenvalue).collect(),
@@ -148,11 +185,15 @@ pub fn spectral_community_report(
 fn community_members(
     graph: &AssocGraph,
     fiedler: &[f32],
+    assignments: &[u8],
     centrality: &BTreeMap<CxId, f32>,
     degree_counts: &BTreeMap<CxId, usize>,
 ) -> Result<Vec<SpectralCommunityMember>> {
     if fiedler.len() != graph.node_count() {
         return invalid_params("fiedler vector length must match graph node count");
+    }
+    if assignments.len() != graph.node_count() {
+        return invalid_params("cluster assignment length must match graph node count");
     }
     let mut members = Vec::with_capacity(graph.node_count());
     for (index, fiedler_value) in fiedler.iter().copied().enumerate() {
@@ -162,7 +203,7 @@ fn community_members(
         })?;
         members.push(SpectralCommunityMember {
             cx_id,
-            community: if fiedler_value >= 0.0 { 0 } else { 1 },
+            community: assignments[index],
             fiedler_value,
             centrality_score: centrality.get(&cx_id).copied().unwrap_or(0.0),
             frequency_weight: graph.node_weight(cx_id)?,
@@ -305,10 +346,14 @@ fn max_degree(counts: &BTreeMap<CxId, usize>) -> usize {
 }
 
 fn validate_params(params: &SpectralCommunityParams) -> Result<()> {
-    if params.eigen_k < 2 {
-        return invalid_params("eigen_k must be at least two to include a Fiedler vector");
+    if params.community_count < 2 || params.community_count > usize::from(u8::MAX) + 1 {
+        return invalid_params("community_count must be between 2 and 256");
     }
-    if params.eigen_max_iter == 0 || params.centrality_max_iter == 0 {
+    if params.eigen_k < params.community_count {
+        return invalid_params("eigen_k must be at least community_count");
+    }
+    if params.eigen_max_iter == 0 || params.cluster_max_iter == 0 || params.centrality_max_iter == 0
+    {
         return invalid_params("spectral iteration counts must be greater than zero");
     }
     if !params.centrality_tol.is_finite() || params.centrality_tol <= 0.0 {

@@ -157,6 +157,9 @@ pub(super) fn weave_within_doc<C: Clock>(
 
             let props = AsterAssocNodeProps {
                 embedding: Some(knn_vec.clone()),
+                // upstream added per-slot embeddings; this legacy path sets only
+                // the single knn embedding above, so leave the per-slot map empty.
+                embeddings: Default::default(),
                 ts: Some(cx.created_at),
                 anchors: cx
                     .anchors

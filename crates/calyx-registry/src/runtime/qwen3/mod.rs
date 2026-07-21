@@ -60,13 +60,31 @@ impl FastembedQwen3Lens {
         device_policy: CandleDevicePolicy,
         precision: CandlePrecision,
     ) -> Result<Self> {
+        Self::from_model_id_with_policy_and_max_tokens(
+            name,
+            model_id,
+            cache_dir,
+            device_policy,
+            precision,
+            DEFAULT_QWEN3_MAX_TOKENS,
+        )
+    }
+
+    pub fn from_model_id_with_policy_and_max_tokens(
+        name: impl Into<String>,
+        model_id: &str,
+        cache_dir: PathBuf,
+        device_policy: CandleDevicePolicy,
+        precision: CandlePrecision,
+        max_tokens: usize,
+    ) -> Result<Self> {
         let model_id = qwen3_model_id(model_id)?;
         let files = files::fetch_files(&cache_dir, &model_id)?;
         Self::from_files(Qwen3FileSpec {
             name: name.into(),
             model_id,
             files,
-            max_tokens: DEFAULT_QWEN3_MAX_TOKENS,
+            max_tokens,
             device_policy,
             precision,
             expected_shape: None,
@@ -146,16 +164,20 @@ impl FastembedQwen3Lens {
             model_id,
             files,
             dtype,
+            max_tokens,
         } = &spec.runtime
         else {
             return Err(config_invalid("LensSpec runtime is not fastembed-qwen3"));
         };
+        if *max_tokens == 0 {
+            return Err(config_invalid("fastembed-qwen3 max_tokens must be > 0"));
+        }
         let model_id = qwen3_model_id(model_id)?;
         Self::from_files(Qwen3FileSpec {
             name: spec.name.clone(),
             model_id: model_id.clone(),
             files: Qwen3ModelFiles::from_paths(model_id, files.clone())?,
-            max_tokens: DEFAULT_QWEN3_MAX_TOKENS,
+            max_tokens: *max_tokens,
             device_policy: CandleDevicePolicy::CudaFailLoud { ordinal: 0 },
             precision: CandlePrecision::parse(dtype)?,
             expected_shape: Some(spec.output),
@@ -194,6 +216,7 @@ impl FastembedQwen3Lens {
                 model_id: self.files.model_id.clone(),
                 files: self.files.artifact_paths(),
                 dtype: self.precision.as_str().to_string(),
+                max_tokens: self.max_tokens,
             },
             output: self.contract.shape(),
             modality: self.contract.modality(),

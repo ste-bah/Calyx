@@ -4,7 +4,7 @@ use super::{
     SstShard, WRITE_AMP_SCALE,
 };
 use crate::cf::ColumnFamily;
-use crate::sst::{SstReader, SstSummary, write_sst};
+use crate::sst::{SstStreamingReader, SstSummary, write_sst};
 use crate::storage_names::{SstName, classify_sst};
 use calyx_core::{CalyxError, Result};
 use std::cmp::Ordering as CmpOrdering;
@@ -118,7 +118,7 @@ pub(super) fn compact_shards_with_target(
 }
 
 struct SstCursor {
-    reader: SstReader,
+    reader: SstStreamingReader,
     position: usize,
     precedence: usize,
 }
@@ -126,7 +126,7 @@ struct SstCursor {
 impl SstCursor {
     fn open(shard: &SstShard, precedence: usize) -> Result<Self> {
         Ok(Self {
-            reader: SstReader::open(&shard.path)?,
+            reader: SstStreamingReader::open(&shard.path)?,
             position: 0,
             precedence,
         })

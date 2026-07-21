@@ -191,7 +191,7 @@ where
         if real_ledger {
             let tombstone =
                 ledger::tombstone_for(vault, &scope, targets.records_deleted, vault.clock_now())?;
-            let ledger_ref = vault.commit_rows_with_ledger_entry_locked(
+            let ledger_ref = vault.commit_erasure_rows_with_ledger_entry_locked(
                 rows,
                 EntryKind::Erase,
                 ledger::tombstone_subject(&tombstone),
@@ -201,7 +201,7 @@ where
             debug_assert_eq!(ledger_ref.seq, tombstone.seq);
             ledger_tombstone = Some(tombstone);
         } else {
-            vault.commit_rows_locked(&rows)?;
+            vault.commit_erasure_rows_locked(&rows)?;
         }
         if rows_tombstoned > 0 {
             vault.purge_tombstoned_cfs_locked(&affected)?;
@@ -269,7 +269,7 @@ where
                 value: tombstone.clone(),
             })
             .collect::<Vec<_>>();
-        vault.commit_rows_locked(&rows)?;
+        vault.commit_erasure_rows_locked(&rows)?;
         vault.purge_tombstoned_cfs_locked(&affected_cfs(&targets.rows))?;
         Ok(EraseWriteSummary {
             records_deleted: targets.records_deleted,
