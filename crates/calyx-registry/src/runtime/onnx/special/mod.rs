@@ -254,7 +254,9 @@ impl Lens for FastembedSparseLens {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        if self.provider_policy == OnnxProviderPolicy::CudaFailLoud {
+        if self.provider_policy == OnnxProviderPolicy::CudaFailLoud
+            && !super::cpu_fallback_audit::gpu_strict_gates_advisory()
+        {
             return Err(super::fastembed_runtime::device_postprocess_unavailable(
                 "fastembed-sparse",
             ));
@@ -286,7 +288,10 @@ impl Lens for FastembedRerankerLens {
     }
 
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
-        if self.provider_policy == OnnxProviderPolicy::CudaFailLoud && !inputs.is_empty() {
+        if self.provider_policy == OnnxProviderPolicy::CudaFailLoud
+            && !inputs.is_empty()
+            && !super::cpu_fallback_audit::gpu_strict_gates_advisory()
+        {
             return Err(super::fastembed_runtime::device_postprocess_unavailable(
                 "fastembed-reranker",
             ));

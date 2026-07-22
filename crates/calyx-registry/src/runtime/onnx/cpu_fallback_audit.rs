@@ -51,6 +51,11 @@
 //!   opt-in: sets the ORT build-time knob that refuses *any* CPU-assigned node
 //!   at Initialize. Strictly stronger than this audit, so the audit is not
 //!   additionally mandated when it is set.
+//! - `CALYX_ONNX_GPU_STRICT_GATES_ADVISORY=1` (ste-bah fork opt-out) — downgrades
+//!   the mandatory `CudaFailLoud` fail to honor the configured mode (`warn`), so
+//!   a validated lens set with intrinsic partial-CPU placement loads while the
+//!   audit still logs every verdict loudly. Also lifts the FastEmbed host-owned
+//!   output block (#1570). See `gpu_strict_gates_advisory` / `effective_audit_mode`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -145,19 +150,53 @@ pub(super) fn configured_audit_mode() -> Result<AuditMode> {
     }
 }
 
+/// FORK DIVERGENCE (ste-bah, import #6): setting
+/// `CALYX_ONNX_GPU_STRICT_GATES_ADVISORY=1` downgrades import #6's new strict
+/// GPU gates from fatal to advisory for a validated lens set. It covers both
+/// (a) this mandatory `CudaFailLoud` placement audit — it then honors the
+/// configured `CALYX_ONNX_CPU_FALLBACK_AUDIT` mode (we run `warn`) instead of
+/// force-failing — and (b) the FastEmbed host-owned-output block (#1570) that
+/// otherwise refuses every FastEmbed sparse/reranker/onnx lens under
+/// `CudaFailLoud`. Our production book vaults (tolkien-full etc.) run lenses —
+/// scincl fp32 (~28% CPU nodes), int8 bge-small (int8 heavy ops), colbert,
+/// splade (FastEmbed sparse) — whose real ONNX graphs legitimately place a
+/// substantial fraction of nodes, including some heavy ops with no CUDA kernel,
+/// on the CPU EP, and which are verified in reality to produce correct vectors
+/// at acceptable latency across months of generation. Upstream's fatal verdict
+/// is a false positive for them. The audit still RUNS and LOGS every lens's
+/// placement loudly under `warn` (never silent — the perf-cliff visibility
+/// #1287/#1487 exist for is preserved); only the fatal abort is downgraded.
+/// Unset (the default) keeps upstream's policy for every other deployment.
+pub(super) const GPU_STRICT_GATES_ADVISORY_ENV: &str = "CALYX_ONNX_GPU_STRICT_GATES_ADVISORY";
+
+pub(super) fn gpu_strict_gates_advisory() -> bool {
+    std::env::var(GPU_STRICT_GATES_ADVISORY_ENV)
+        .ok()
+        .is_some_and(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "warn"))
+}
+
 /// The audit mode a session actually runs under. For a GPU-policy session
 /// whose build did not set the strict ORT `disable_cpu_ep_fallback` knob, the
 /// placement audit is the *only* verification that the model executes on the
 /// GPU, so it is mandatory and always `fail` — `CudaFailLoud` would otherwise
 /// be a provider-list claim, the silent-fallback hole #1287 closed (#1487).
 /// The environment can therefore only strengthen other sessions, never weaken
-/// this one; an attempted downgrade is logged, not honored.
+/// this one; an attempted downgrade is logged, not honored — except under the
+/// explicit `CALYX_ONNX_GPU_STRICT_GATES_ADVISORY` fork opt-out above.
 pub(super) fn effective_audit_mode(
     gpu_policy: bool,
     ort_cpu_ep_fallback_disabled: bool,
 ) -> Result<AuditMode> {
     let configured = configured_audit_mode()?;
     if gpu_policy && !ort_cpu_ep_fallback_disabled && configured != AuditMode::Fail {
+        if gpu_strict_gates_advisory() {
+            eprintln!(
+                "CALYX_ONNX_RUNTIME phase=cpu_fallback_audit_mode configured={} effective={} reason=gpu_strict_gates_advisory_fork_optout",
+                configured.as_str(),
+                configured.as_str()
+            );
+            return Ok(configured);
+        }
         if configured == AuditMode::Warn {
             eprintln!(
                 "CALYX_ONNX_RUNTIME phase=cpu_fallback_audit_mode configured=warn effective=fail reason=cuda_fail_loud_mandatory_placement_audit"

@@ -474,7 +474,9 @@ impl OnnxLens {
         model: &Mutex<TextEmbedding>,
         inputs: &[Input],
     ) -> Result<Vec<SlotVector>> {
-        if self.provider_policy == OnnxProviderPolicy::CudaFailLoud {
+        if self.provider_policy == OnnxProviderPolicy::CudaFailLoud
+            && !cpu_fallback_audit::gpu_strict_gates_advisory()
+        {
             return Err(fastembed_runtime::device_postprocess_unavailable(
                 "onnx-fastembed",
             ));

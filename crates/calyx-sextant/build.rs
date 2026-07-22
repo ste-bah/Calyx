@@ -15,7 +15,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CUDA_PATH_DEFAULT: &str = "/usr/local/cuda-13.3";
+/// Upstream develops on GB10 (sm_120). Our resident runs on a local RTX 4090
+/// (sm_89); an sm_120 `-cubin` has no SASS for sm_89 and load fails with
+/// CUDA_ERROR_NO_BINARY_FOR_GPU (the sextant kernels compile to `-cubin`, i.e.
+/// SASS only, no PTX/JIT). `CALYX_CUDA_ARCH` overrides the compile target
+/// without editing this upstream const on every import (mirrors the CUDA_PATH
+/// override). Set `CALYX_CUDA_ARCH=sm_89` in `_build_cuda.sh` for the 4090.
 const CUDA_ARCH: &str = "sm_120";
+
+fn cuda_arch() -> String {
+    std::env::var("CALYX_CUDA_ARCH")
+        .ok()
+        .map(|arch| arch.trim().to_string())
+        .filter(|arch| !arch.is_empty())
+        .unwrap_or_else(|| CUDA_ARCH.to_string())
+}
 const MERGE_SOURCE: &str = "src/index/kernels/chunked_exact_merge.cu";
 const MERGE_CUBIN_ENV: &str = "SEXTANT_CHUNKED_EXACT_MERGE_CUBIN_PATH";
 const MAXSIM_SOURCE: &str = "src/index/kernels/maxsim.cu";
@@ -56,7 +70,9 @@ fn main() {
 
 fn compile_cuda_kernel(source: &str, output: &str, output_env: &str) {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=CALYX_CUDA_ARCH");
     println!("cargo:rerun-if-changed={source}");
+    let cuda_arch = cuda_arch();
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let source = manifest.join(source);
     assert!(
@@ -71,7 +87,7 @@ fn compile_cuda_kernel(source: &str, output: &str, output_env: &str) {
         .join("bin/nvcc");
     assert!(nvcc.is_file(), "nvcc missing: {}", nvcc.display());
     let args = [
-        format!("-arch={CUDA_ARCH}"),
+        format!("-arch={cuda_arch}"),
         "-O3".to_string(),
         "--ftz=false".to_string(),
         "--prec-div=true".to_string(),
